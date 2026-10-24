@@ -9,6 +9,14 @@ mod rpc;
 mod server;
 mod tools;
 
+// Ties the build to `tag-changelog/vX.Y.Z.md` of the version being built (see rack::release).
+const _: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tag-changelog/v",
+    env!("CARGO_PKG_VERSION"),
+    ".md"
+));
+
 use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;

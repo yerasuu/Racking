@@ -3,4 +3,5 @@
 
 pub mod ask;
 pub mod client;
+pub mod release;
 pub mod text;

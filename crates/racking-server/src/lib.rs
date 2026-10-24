@@ -8,6 +8,7 @@ pub mod config;
 mod dist;
 mod error;
 mod presence;
+pub mod release;
 mod store;
 mod types;
 
