@@ -276,6 +276,8 @@ pub struct NewJob {
     pub outcome: Option<Outcome>,
     pub priority: Priority,
     pub expects_reply: bool,
+    /// The model the sender suggests, already lowercased and checked; a hint, never an order.
+    pub model: Option<String>,
 }
 
 pub struct Attachment {
@@ -319,6 +321,7 @@ pub struct Job {
     pub updated_seq: i64,
     pub priority: Priority,
     pub expects_reply: bool,
+    pub model: Option<String>,
     pub attachments: Vec<Attachment>,
 }
 
@@ -342,6 +345,7 @@ impl Job {
             "body_size": self.body_size,
             "priority": self.priority.as_str(),
             "expects_reply": self.expects_reply,
+            "model": self.model,
         });
         if let Some(obj) = v.as_object_mut() {
             let mut insert = |k: &str, value: Value| obj.insert(k.to_owned(), value);
@@ -464,13 +468,13 @@ impl Changes {
 
 const JOB_COLUMNS: &str = "id, from_agent, to_agent, kind, title, body, length(CAST(body AS BLOB)), tags, origin, \
                            reply_to, outcome, reason, state, created_at, updated_at, seq, updated_seq, priority, \
-                           expects_reply";
+                           expects_reply, model";
 /// The body column must agree with `Kind::inlines`, `limits::INLINE_BYTES` and `limits::PREVIEW_CHARS`.
 const SUMMARY_COLUMNS: &str = "id, from_agent, to_agent, kind, title, \
                                CASE WHEN kind IN ('message', 'notice') AND length(CAST(body AS BLOB)) <= 4096 \
                                THEN body ELSE substr(body, 1, 200) END, length(CAST(body AS BLOB)), \
                                tags, origin, reply_to, outcome, reason, state, created_at, updated_at, seq, updated_seq, \
-                               priority, expects_reply";
+                               priority, expects_reply, model";
 
 const SCHEMA: &str = "
 PRAGMA journal_mode = WAL;
@@ -494,7 +498,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     seq INTEGER NOT NULL,
     updated_seq INTEGER NOT NULL,
     priority TEXT NOT NULL DEFAULT 'normal',
-    expects_reply INTEGER NOT NULL DEFAULT 0
+    expects_reply INTEGER NOT NULL DEFAULT 0,
+    model TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS jobs_inbox ON jobs (to_agent, seq);
 CREATE INDEX IF NOT EXISTS jobs_outbox ON jobs (from_agent, updated_seq);
@@ -530,7 +535,8 @@ CREATE TABLE IF NOT EXISTS agents (
     last_seen INTEGER,
     about TEXT,
     rack_version TEXT,
-    os TEXT
+    os TEXT,
+    capabilities TEXT
 ) STRICT;
 ";
 
@@ -559,6 +565,7 @@ impl Store {
         conn.execute_batch(SCHEMA)
             .map_err(|e| format!("cannot set up the schema: {e}"))?;
         add_reply_columns(&conn).map_err(|e| format!("cannot add the priority columns: {e}"))?;
+        add_hint_columns(&conn).map_err(|e| format!("cannot add the model and capabilities columns: {e}"))?;
         Ok(Self {
             conn: Mutex::new(conn),
             files,
@@ -651,8 +658,8 @@ impl Store {
         let outcome = (new.kind == Kind::Result).then(|| new.outcome.unwrap_or(Outcome::Done).state().as_str());
         tx.execute(
             "INSERT INTO jobs (from_agent, to_agent, kind, title, body, tags, origin, reply_to, outcome, state, \
-             created_at, updated_at, seq, updated_seq, priority, expects_reply) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'sent', ?10, ?10, ?11, ?12, ?13, ?14)",
+             created_at, updated_at, seq, updated_seq, priority, expects_reply, model) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'sent', ?10, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 me.as_str(),
                 new.to.as_str(),
@@ -667,7 +674,8 @@ impl Store {
                 seq,
                 updated_seq,
                 new.priority.as_str(),
-                new.expects_reply
+                new.expects_reply,
+                new.model
             ],
         )?;
         let id = JobId::new(tx.last_insert_rowid());
@@ -1053,7 +1061,7 @@ impl Store {
     pub fn load_agents(&self) -> Result<Vec<presence::Stored>, String> {
         let conn = self.db();
         let mut stmt = conn
-            .prepare("SELECT name, last_seen, about, rack_version, os FROM agents")
+            .prepare("SELECT name, last_seen, about, rack_version, os, capabilities FROM agents")
             .map_err(|e| format!("cannot read the agents table: {e}"))?;
         let rows = stmt
             .query_map([], |row| {
@@ -1064,6 +1072,10 @@ impl Store {
                         about: row.get(2)?,
                         rack_version: row.get(3)?,
                         os: row.get(4)?,
+                        capabilities: row
+                            .get::<_, Option<JsonCol<Vec<String>>>>(5)?
+                            .map(|c| c.0)
+                            .unwrap_or_default(),
                     },
                 })
             })
@@ -1084,10 +1096,14 @@ impl Store {
     }
 
     pub fn save_agent_info(&self, agent: &AgentName, info: &presence::Info) -> ApiResult<()> {
+        let capabilities = (!info.capabilities.is_empty())
+            .then(|| serde_json::to_string(&info.capabilities))
+            .transpose()
+            .map_err(|e| ApiError::internal("encode capabilities", &e))?;
         self.db().execute(
-            "INSERT INTO agents (name, about, rack_version, os) VALUES (?1, ?2, ?3, ?4) \
-             ON CONFLICT (name) DO UPDATE SET about = ?2, rack_version = ?3, os = ?4",
-            params![agent.as_str(), info.about, info.rack_version, info.os],
+            "INSERT INTO agents (name, about, rack_version, os, capabilities) VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT (name) DO UPDATE SET about = ?2, rack_version = ?3, os = ?4, capabilities = ?5",
+            params![agent.as_str(), info.about, info.rack_version, info.os, capabilities],
         )?;
         Ok(())
     }
@@ -1332,6 +1348,22 @@ fn add_reply_columns(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// Databases made before the model hint and capabilities lack those columns.
+/// Both are nullable and null means "none", so old rows need no update.
+fn add_hint_columns(conn: &Connection) -> rusqlite::Result<()> {
+    for (table, column) in [("jobs", "model"), ("agents", "capabilities")] {
+        let present: i64 = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info(?1) WHERE name = ?2",
+            [table, column],
+            |row| row.get(0),
+        )?;
+        if present == 0 {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT;"))?;
+        }
+    }
+    Ok(())
+}
+
 fn bump_counter(conn: &Connection, name: &str) -> ApiResult<i64> {
     Ok(conn.query_row(
         "INSERT INTO counters (name, value) VALUES (?1, 1) \
@@ -1414,6 +1446,7 @@ fn job_from_row(row: &Row<'_>) -> rusqlite::Result<Job> {
         updated_seq: row.get(16)?,
         priority: row.get::<_, Parsed<Priority>>(17)?.0,
         expects_reply: row.get(18)?,
+        model: row.get(19)?,
         attachments: Vec::new(),
     })
 }
@@ -1468,6 +1501,7 @@ mod tests {
             outcome: None,
             priority: Priority::Normal,
             expects_reply: true,
+            model: None,
         }
     }
 
@@ -1699,6 +1733,50 @@ mod tests {
         let s = Store::open(&dir.0).expect("open");
         let job = s.get_job(&agent("linux"), JobId::new(1)).expect("job");
         assert_eq!((job.priority, job.expects_reply), (Priority::Normal, true));
+        assert_eq!(job.model, None);
+        drop(s);
+        Store::open(&dir.0).expect("opening twice is fine");
+    }
+
+    #[test]
+    fn old_databases_gain_the_model_and_capabilities_columns() {
+        let dir = TempDir::new();
+        fs::create_dir_all(&dir.0).expect("dir");
+        let conn = Connection::open(dir.0.join("racking.db")).expect("db");
+        conn.execute_batch(
+            "CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, from_agent TEXT NOT NULL, \
+             to_agent TEXT NOT NULL, kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, \
+             tags TEXT NOT NULL, origin TEXT, reply_to INTEGER, outcome TEXT, reason TEXT, state TEXT NOT NULL, \
+             created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, seq INTEGER NOT NULL, \
+             updated_seq INTEGER NOT NULL, priority TEXT NOT NULL DEFAULT 'normal', \
+             expects_reply INTEGER NOT NULL DEFAULT 0) STRICT;
+             INSERT INTO jobs VALUES (1, 'linux', 'windows', 'task', 't', 'b', '[]', NULL, NULL, NULL, NULL, \
+             'sent', 0, 0, 1, 1, 'high', 1);
+             CREATE TABLE agents (name TEXT PRIMARY KEY, last_seen INTEGER, about TEXT, rack_version TEXT, \
+             os TEXT) STRICT;
+             INSERT INTO agents VALUES ('windows', 100, 'desk PC', '0.1.0', 'windows');",
+        )
+        .expect("schema before the model hint");
+        drop(conn);
+        let s = Store::open(&dir.0).expect("open");
+        let (linux, windows) = (agent("linux"), agent("windows"));
+        let old = s.get_job(&linux, JobId::new(1)).expect("old job");
+        assert_eq!((old.priority, old.model.as_deref()), (Priority::High, None));
+        assert_eq!(old.to_json(View::Full)["model"], Value::Null);
+        let rows = s.load_agents().expect("agents");
+        let row = rows.iter().find(|r| r.name == "windows").expect("row");
+        assert_eq!(
+            (row.info.about.as_deref(), row.info.capabilities.len()),
+            (Some("desk PC"), 0)
+        );
+        let new = NewJob {
+            model: Some("opus".to_owned()),
+            ..task("windows")
+        };
+        let job = s.create_job(&linux, new).expect("job with a model");
+        assert_eq!(job.to_json(View::Full)["model"], "opus");
+        let inbox = s.inbox(&windows, Seq::new(0), None, 10).expect("inbox").to_json();
+        assert_eq!(inbox["jobs"][1]["model"], "opus", "summaries carry it too");
         drop(s);
         Store::open(&dir.0).expect("opening twice is fine");
     }
@@ -1978,6 +2056,7 @@ mod tests {
             about: Some("desk PC".to_owned()),
             rack_version: Some("0.1.0".to_owned()),
             os: None,
+            capabilities: vec!["kb".to_owned(), "nvidia".to_owned()],
         };
         s.save_agent_info(&windows, &info).expect("info");
         let rows = s.load_agents().expect("load");
@@ -1991,5 +2070,14 @@ mod tests {
             ),
             (Some("desk PC"), Some("0.1.0"), None)
         );
+        assert_eq!(row.info.capabilities, ["kb", "nvidia"]);
+        let cleared = presence::Info {
+            capabilities: Vec::new(),
+            ..info
+        };
+        s.save_agent_info(&windows, &cleared).expect("clear");
+        let rows = s.load_agents().expect("load");
+        let row = rows.iter().find(|r| r.name == "windows").expect("row");
+        assert!(row.info.capabilities.is_empty());
     }
 }

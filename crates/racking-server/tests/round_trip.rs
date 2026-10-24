@@ -712,3 +712,87 @@ fn presence_follows_requests_and_waits() {
     let w = windows_entry(&s);
     assert_eq!((w["online"].clone(), w["idle_secs"].clone()), (json!(false), json!(91)));
 }
+
+#[test]
+fn model_hint_and_capabilities() {
+    let s = Server::start();
+    let task = |model: Value| json!({"to": "windows", "title": "Profile the GPU path", "model": model});
+    let (status, job) = s.call("POST", "/jobs", Some(LINUX), Some(task(json!("Opus"))));
+    assert_eq!((status, job["model"].as_str()), (201, Some("opus")), "{job}");
+    let (status, plain) = s.call(
+        "POST",
+        "/jobs",
+        Some(LINUX),
+        Some(json!({"to": "windows", "title": "t"})),
+    );
+    assert_eq!((status, plain["model"].clone()), (201, Value::Null), "{plain}");
+    let (_, inbox) = s.call("GET", "/inbox?since=0", Some(WINDOWS), None);
+    assert_eq!(inbox["jobs"][0]["model"], "opus", "summaries carry the hint");
+    assert_eq!(inbox["jobs"][1]["model"], Value::Null);
+    let (_, full) = s.call("GET", "/jobs/j1", Some(WINDOWS), None);
+    assert_eq!(full["model"], "opus");
+
+    let say = json!({"to": "windows", "kind": "message", "body": "hi", "model": "haiku"});
+    let (status, msg) = s.call("POST", "/jobs", Some(LINUX), Some(say));
+    assert_eq!((status, msg["model"].as_str()), (201, Some("haiku")), "{msg}");
+    for (body, needle) in [
+        (task(json!("gpt 5")), "model:"),
+        (task(json!("x".repeat(41))), "model:"),
+        (task(json!(7)), "JSON body"),
+        (
+            json!({"to": "windows", "kind": "notice", "body": "hi", "model": "opus"}),
+            "carries no model",
+        ),
+    ] {
+        let (status, err) = s.call("POST", "/jobs", Some(LINUX), Some(body));
+        assert_eq!(status, 400, "{err}");
+        let message = err["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains(needle), "{err}");
+    }
+
+    let put = |token, body| s.call("PUT", "/agents/me", Some(token), Some(body));
+    let (status, me) = put(WINDOWS, json!({"capabilities": ["Windows", "nvidia", "kb", "nvidia"]}));
+    assert_eq!(status, 200, "{me}");
+    assert_eq!(me["capabilities"], json!(["windows", "nvidia", "kb"]));
+    let (status, me) = put(WINDOWS, json!({"about": "GPU box"}));
+    assert_eq!(
+        (status, me["capabilities"].clone()),
+        (200, json!(["windows", "nvidia", "kb"])),
+        "left out is kept"
+    );
+    let too_many = (0..17).map(|i| format!("c{i}")).collect::<Vec<_>>();
+    for bad in [json!({ "capabilities": too_many }), json!({"capabilities": ["a b"]})] {
+        let (status, err) = put(WINDOWS, bad);
+        assert_eq!(
+            (status, err["error"]["code"].as_str()),
+            (400, Some("bad_request")),
+            "{err}"
+        );
+    }
+    let (status, _) = s.call(
+        "PUT",
+        "/agents/windows",
+        Some(LINUX),
+        Some(json!({"capabilities": ["hijacked"]})),
+    );
+    assert_eq!(status, 404, "only your own entry");
+
+    let (_, all) = s.call("GET", "/agents", Some(LINUX), None);
+    let entry = |all: &Value, name: &str| {
+        all["agents"]
+            .as_array()
+            .and_then(|a| a.iter().find(|e| e["name"] == name).cloned())
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        entry(&all, "windows")["capabilities"],
+        json!(["windows", "nvidia", "kb"])
+    );
+    assert_eq!(entry(&all, "linux")["capabilities"], json!([]));
+    let (status, me) = put(WINDOWS, json!({"capabilities": []}));
+    assert_eq!(
+        (status, me["capabilities"].clone()),
+        (200, json!([])),
+        "an empty list clears"
+    );
+}

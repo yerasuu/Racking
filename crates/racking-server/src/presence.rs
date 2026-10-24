@@ -1,8 +1,8 @@
 //! Who is online. Activity, and the `rack_version` and `os` that clients send as
 //! headers on every request, are kept in memory per agent and written to SQLite
 //! at most once every `FLUSH_SECS` per agent, so serving a request never costs a
-//! write; a restart loses at most that much. `about` (`PUT /agents/me`) is rare
-//! and written at once.
+//! write; a restart loses at most that much. `about` and `capabilities`
+//! (`PUT /agents/me`) are rare and written at once.
 
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::{PoisonError, RwLock};
@@ -24,14 +24,18 @@ pub struct Info {
     pub about: Option<String>,
     pub rack_version: Option<String>,
     pub os: Option<String>,
+    /// What the agent says it has; empty when it published nothing.
+    pub capabilities: Vec<String>,
 }
 
 /// A change to `Info`, per field: `None` keeps it, `Some(None)` clears it.
+/// `capabilities` is replaced whole; an empty list clears it.
 #[derive(Default)]
 pub struct InfoUpdate {
     pub about: Option<Option<String>>,
     pub rack_version: Option<Option<String>>,
     pub os: Option<Option<String>>,
+    pub capabilities: Option<Vec<String>>,
 }
 
 impl Info {
@@ -40,6 +44,7 @@ impl Info {
             about: change.about.unwrap_or_else(|| self.about.clone()),
             rack_version: change.rack_version.unwrap_or_else(|| self.rack_version.clone()),
             os: change.os.unwrap_or_else(|| self.os.clone()),
+            capabilities: change.capabilities.unwrap_or_else(|| self.capabilities.clone()),
         }
     }
 }
@@ -213,6 +218,7 @@ fn entry(slot: &Slot, now: i64) -> Value {
         "rack_version": info.rack_version,
         "os": info.os,
         "about": info.about,
+        "capabilities": info.capabilities,
     })
 }
 
@@ -353,6 +359,19 @@ mod tests {
         };
         let e = p.update_info(linux, clear, |_| Ok(())).expect("update");
         assert_eq!((e["about"].clone(), e["os"].clone()), (Value::Null, json!("linux")));
+        assert_eq!(e["capabilities"], json!([]), "none published yet");
+        let caps = |list: &[&str]| InfoUpdate {
+            capabilities: Some(list.iter().map(|c| (*c).to_owned()).collect()),
+            ..InfoUpdate::default()
+        };
+        let e = p
+            .update_info(linux, caps(&["kb", "nvidia"]), |_| Ok(()))
+            .expect("update");
+        assert_eq!(e["capabilities"], json!(["kb", "nvidia"]));
+        let e = p.update_info(linux, InfoUpdate::default(), |_| Ok(())).expect("update");
+        assert_eq!(e["capabilities"], json!(["kb", "nvidia"]), "left out is kept");
+        let e = p.update_info(linux, caps(&[]), |_| Ok(())).expect("update");
+        assert_eq!(e["capabilities"], json!([]), "an empty list clears");
         let failed = InfoUpdate {
             os: Some(None),
             ..InfoUpdate::default()

@@ -296,6 +296,64 @@ impl FromStr for Label {
     }
 }
 
+/// Lowercases `s` and checks it is 1 to `max` of `[a-z0-9._-]`: a short name
+/// other agents read, never parsed further.
+fn short_name(s: &str, max: usize, what: &str) -> Result<String, String> {
+    let s = s.trim().to_ascii_lowercase();
+    let ok = (1..=max).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'));
+    if ok {
+        Ok(s)
+    } else {
+        Err(format!(
+            "{what} `{}` must be 1 to {max} of a-z0-9._-",
+            truncate(&s, max + 10)
+        ))
+    }
+}
+
+/// The model a sender suggests for a job (`opus`, `sonnet`, ...). Free-form
+/// because model names change; it is a hint for the receiver, never an order.
+pub struct Model(String);
+
+impl Model {
+    pub const MAX_CHARS: usize = 40;
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl FromStr for Model {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        short_name(s, Self::MAX_CHARS, "model").map(Self)
+    }
+}
+
+/// Something an agent says it has (`windows`, `nvidia`, `kb`), published in `GET /agents`.
+pub struct Capability(String);
+
+impl Capability {
+    pub const MAX_CHARS: usize = 32;
+    /// Items per agent, so the list stays a glance in `GET /agents`.
+    pub const MAX_ITEMS: usize = 16;
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl FromStr for Capability {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        short_name(s, Self::MAX_CHARS, "capability").map(Self)
+    }
+}
+
 pub fn hex(bytes: &[u8]) -> String {
     use fmt::Write;
     bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut out, b| {
@@ -417,5 +475,22 @@ mod tests {
         assert!("a;b".parse::<Label>().is_err());
         assert!("1.0.0+build".parse::<Label>().is_err());
         assert!("x".repeat(Label::MAX_CHARS + 1).parse::<Label>().is_err());
+    }
+
+    #[test]
+    fn models_and_capabilities() {
+        assert_eq!(" Opus ".parse::<Model>().map(Model::into_inner), Ok("opus".to_owned()));
+        assert!("claude-sonnet-4.5_x".parse::<Model>().is_ok());
+        assert!("m".repeat(Model::MAX_CHARS).parse::<Model>().is_ok());
+        assert!("m".repeat(Model::MAX_CHARS + 1).parse::<Model>().is_err());
+        for bad in ["", "gpt 5", "opus;rm", "ópus", "a/b"] {
+            assert!(bad.parse::<Model>().is_err(), "{bad}");
+        }
+        assert_eq!(
+            "Intel-GPU".parse::<Capability>().map(Capability::into_inner),
+            Ok("intel-gpu".to_owned())
+        );
+        assert!("c".repeat(Capability::MAX_CHARS + 1).parse::<Capability>().is_err());
+        assert!("two words".parse::<Capability>().is_err());
     }
 }
