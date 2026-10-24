@@ -479,6 +479,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "racking-mcp"
+version = "0.1.0"
+dependencies = [
+ "rack",
+ "racking-server",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "racking-server"
 version = "0.1.0"
 dependencies = [
