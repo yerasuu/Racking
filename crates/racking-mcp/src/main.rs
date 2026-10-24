@@ -58,9 +58,7 @@ fn main() -> ExitCode {
         }
     };
     tracing::info!(target: "racking_mcp", root = %ctx.root.path().display(), "serving MCP on stdio");
-    let ctx = Arc::new(ctx);
-    announce(&ctx);
-    match server::serve(io::stdin().lock(), io::stdout(), ctx) {
+    match server::serve(io::stdin().lock(), io::stdout(), Arc::new(ctx)) {
         // The writer thread is not joined: once the client closes stdin, nobody reads the replies.
         Ok(_writer) => ExitCode::SUCCESS,
         Err(e) => {
@@ -70,23 +68,13 @@ fn main() -> ExitCode {
     }
 }
 
-/// Publishes this server's version and OS for `racking_agents` once, on a
-/// thread of its own so a slow or old Racking server never delays the handshake.
-fn announce(ctx: &Arc<Ctx>) {
-    let ctx = Arc::clone(ctx);
-    let spawned = std::thread::Builder::new()
-        .name("announce".to_owned())
-        .spawn(move || ctx.client.announce(env!("CARGO_PKG_VERSION")));
-    if let Err(e) = spawned {
-        tracing::warn!(target: "racking_mcp", error = %e, "cannot start the announce thread; presence info not sent");
-    }
-}
-
 fn config() -> Result<Ctx, String> {
     let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
     let url = var("RACK_URL").ok_or("set RACK_URL, e.g. http://127.0.0.1:7878")?;
     let token = var("RACK_TOKEN").ok_or("set RACK_TOKEN to this agent's token (ask the server owner)")?;
-    let client = Client::new(&url, &token).map_err(|e| tools::describe(&e))?;
+    let client = Client::new(&url, &token)
+        .map_err(|e| tools::describe(&e))?
+        .identified(env!("CARGO_PKG_VERSION"));
     // Claude Code sets CLAUDE_PROJECT_DIR in a stdio server's environment and does
     // not document the working directory it starts the server in.
     let root_dir = match ["RACK_MCP_ROOT", "CLAUDE_PROJECT_DIR"]

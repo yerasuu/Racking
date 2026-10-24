@@ -265,11 +265,15 @@ impl FromStr for About {
 }
 
 /// A short label an agent reports about its own software (`rack_version`, `os`):
-/// 1 to `MAX_CHARS` of `A-Za-z0-9._+-` and spaces.
+/// 1 to `MAX_CHARS` of `A-Za-z0-9._-` and spaces.
 pub struct Label(String);
 
 impl Label {
     pub const MAX_CHARS: usize = 40;
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 
     pub fn into_inner(self) -> String {
         self.0
@@ -283,11 +287,11 @@ impl FromStr for Label {
         let s = s.trim();
         let ok = (1..=Self::MAX_CHARS).contains(&s.len())
             && s.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-' | b' '));
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b' '));
         if ok {
             Ok(Self(s.to_owned()))
         } else {
-            Err(format!("1 to {} of A-Za-z0-9._+- and spaces", Self::MAX_CHARS))
+            Err(format!("1 to {} of A-Za-z0-9._- and spaces", Self::MAX_CHARS))
         }
     }
 }
@@ -411,6 +415,7 @@ mod tests {
         assert!("windows x86_64".parse::<Label>().is_ok());
         assert!("".parse::<Label>().is_err());
         assert!("a;b".parse::<Label>().is_err());
+        assert!("1.0.0+build".parse::<Label>().is_err());
         assert!("x".repeat(Label::MAX_CHARS + 1).parse::<Label>().is_err());
     }
 }

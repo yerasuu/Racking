@@ -136,6 +136,8 @@ pub struct Client {
     http: ureq::Agent,
     base: String,
     auth: String,
+    /// `rack_version` sent as `X-Rack-Version` (with `X-Rack-Os`) on every request, once set.
+    version: Option<String>,
 }
 
 impl Client {
@@ -155,11 +157,31 @@ impl Client {
             http,
             base,
             auth: format!("Bearer {token}"),
+            version: None,
         })
     }
 
+    /// Makes every request carry `X-Rack-Version: version` and `X-Rack-Os`, which the
+    /// server shows in `GET /agents`; riding on requests already made costs no extra round trip.
+    #[must_use]
+    pub fn identified(mut self, version: &str) -> Self {
+        self.version = Some(version.to_owned());
+        self
+    }
+
+    /// The headers every request carries: the token and, once `identified`, version and OS.
+    fn headers<B>(&self, req: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
+        let req = req.header("Authorization", &self.auth);
+        match &self.version {
+            Some(v) => req
+                .header("X-Rack-Version", v)
+                .header("X-Rack-Os", std::env::consts::OS),
+            None => req,
+        }
+    }
+
     pub fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let resp = self.retry(|| self.http.get(self.url(path)).header("Authorization", &self.auth).call())?;
+        let resp = self.retry(|| self.headers(self.http.get(self.url(path))).call())?;
         read_json(resp)
     }
 
@@ -168,9 +190,7 @@ impl Client {
         let key = new_key();
         let resp = self.retry(|| {
             let req = self
-                .http
-                .post(self.url(path))
-                .header("Authorization", &self.auth)
+                .headers(self.http.post(self.url(path)))
                 .header("Idempotency-Key", &key);
             match body {
                 Some(b) => req.send_json(b),
@@ -183,9 +203,7 @@ impl Client {
     pub fn put_json<T: DeserializeOwned>(&self, path: &str, body: &Value) -> Result<T> {
         let key = new_key();
         let resp = self.retry(|| {
-            self.http
-                .put(self.url(path))
-                .header("Authorization", &self.auth)
+            self.headers(self.http.put(self.url(path)))
                 .header("Idempotency-Key", &key)
                 .send_json(body)
         })?;
@@ -205,9 +223,7 @@ impl Client {
         let resp = self.retry(|| {
             let f = File::open(file).map_err(ureq::Error::Io)?;
             let mut req = self
-                .http
-                .put(self.url(path))
-                .header("Authorization", &self.auth)
+                .headers(self.http.put(self.url(path)))
                 .header("Idempotency-Key", &key)
                 .header("X-Sha256", &sha)
                 .header("Content-Type", "application/octet-stream");
@@ -229,7 +245,7 @@ impl Client {
     /// Like `download` for any path that answers a file with `X-Sha256`. With
     /// `max_bytes`, a longer answer is cut off as an error instead of filling the disk.
     pub fn download_path(&self, path: &str, dest: &Path, max_bytes: Option<u64>) -> Result<Downloaded> {
-        let mut resp = self.retry(|| self.http.get(self.url(path)).header("Authorization", &self.auth).call())?;
+        let mut resp = self.retry(|| self.headers(self.http.get(self.url(path))).call())?;
         if !resp.status().is_success() {
             return Err(api_error(resp));
         }
@@ -292,21 +308,6 @@ impl Client {
             }),
             other => other,
         }
-    }
-
-    /// Publishes this program's version and OS with `PUT /agents/me`: one attempt
-    /// of at most a few seconds, every failure ignored (an older server answers
-    /// 404), because presence must never fail or slow down the real command.
-    pub fn announce(&self, program_version: &str) {
-        let body = serde_json::json!({"rack_version": program_version, "os": std::env::consts::OS});
-        let _ = self
-            .http
-            .put(self.url("/agents/me"))
-            .config()
-            .timeout_global(Some(Duration::from_secs(3)))
-            .build()
-            .header("Authorization", &self.auth)
-            .send_json(&body);
     }
 
     /// Accept needs `received`; receiving first makes accept work on a job never read.

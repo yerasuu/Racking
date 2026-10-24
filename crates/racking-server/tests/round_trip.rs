@@ -649,6 +649,31 @@ fn presence_follows_requests_and_waits() {
         (Some("Windows PC, GPU tests"), Some("0.1.0"), Some("windows"))
     );
 
+    // Any request may name the client software in headers; an invalid value is ignored, never refused.
+    let whoami_with = |version: &str, os: &str| {
+        s.http
+            .get(format!("{}/whoami", s.base))
+            .header("Authorization", format!("Bearer {WINDOWS}"))
+            .header("X-Rack-Version", version)
+            .header("X-Rack-Os", os)
+            .call()
+            .expect("whoami")
+            .status()
+            .as_u16()
+    };
+    assert_eq!(whoami_with("0.2.0", "windows 11"), 200);
+    let w = windows_entry(&s);
+    assert_eq!(
+        (w["rack_version"].as_str(), w["os"].as_str()),
+        (Some("0.2.0"), Some("windows 11"))
+    );
+    assert_eq!(whoami_with("0.3.0;rm", &"x".repeat(41)), 200);
+    let w = windows_entry(&s);
+    assert_eq!(
+        (w["rack_version"].as_str(), w["os"].as_str(), w["about"].as_str()),
+        (Some("0.2.0"), Some("windows 11"), Some("Windows PC, GPU tests"))
+    );
+
     clock.advance(600);
     assert_eq!(windows_entry(&s)["online"], false, "idle 10 min");
 

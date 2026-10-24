@@ -1072,11 +1072,13 @@ impl Store {
             .map_err(|e| format!("cannot read the agents table: {e}"))
     }
 
-    pub fn save_last_seen(&self, agent: &AgentName, at: i64) -> ApiResult<()> {
+    /// Writes what `Presence::touch` found due: `last_seen` (never moved back) and the client software.
+    pub fn save_seen(&self, agent: &AgentName, seen: &presence::Flush) -> ApiResult<()> {
         self.db().execute(
-            "INSERT INTO agents (name, last_seen) VALUES (?1, ?2) \
-             ON CONFLICT (name) DO UPDATE SET last_seen = max(coalesce(last_seen, ?2), ?2)",
-            params![agent.as_str(), at],
+            "INSERT INTO agents (name, last_seen, rack_version, os) VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT (name) DO UPDATE SET last_seen = max(coalesce(last_seen, ?2), ?2), \
+             rack_version = ?3, os = ?4",
+            params![agent.as_str(), seen.at, seen.rack_version, seen.os],
         )?;
         Ok(())
     }
@@ -1965,8 +1967,13 @@ mod tests {
     fn presence_rows_round_trip() {
         let (_dir, s) = store();
         let windows = agent("windows");
-        s.save_last_seen(&windows, 100).expect("seen");
-        s.save_last_seen(&windows, 50).expect("older write");
+        let seen = |at, os: Option<&str>| presence::Flush {
+            at,
+            rack_version: Some("0.1.0".to_owned()),
+            os: os.map(str::to_owned),
+        };
+        s.save_seen(&windows, &seen(100, Some("windows"))).expect("seen");
+        s.save_seen(&windows, &seen(50, None)).expect("older write");
         let info = presence::Info {
             about: Some("desk PC".to_owned()),
             rack_version: Some("0.1.0".to_owned()),

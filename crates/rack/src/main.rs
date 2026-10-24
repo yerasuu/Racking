@@ -183,9 +183,7 @@ fn connect() -> Result<Client> {
     }
     let url = url.ok_or_else(|| RackError::Usage("set RACK_URL (e.g. http://127.0.0.1:7878)".to_owned()))?;
     let token = token.ok_or_else(|| RackError::Usage("set RACK_TOKEN (ask the server owner)".to_owned()))?;
-    let client = Client::new(&url, &token)?;
-    client.announce(env!("CARGO_PKG_VERSION"));
-    Ok(client)
+    Ok(Client::new(&url, &token)?.identified(env!("CARGO_PKG_VERSION")))
 }
 
 fn run(all_args: &[String]) -> Result<()> {

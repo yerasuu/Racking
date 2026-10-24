@@ -368,24 +368,17 @@ fn agents_through_mcp() {
         .put_json("/agents/me", &json!({"about": about}))
         .expect("about");
 
-    // Each racking-mcp publishes its version and OS on a thread of its own after starting.
+    // Every request of racking-mcp carries its version and OS, so one call is enough to publish them.
+    windows.ok("racking_whoami", json!({}));
     let version = env!("CARGO_PKG_VERSION");
     let expected = format!(", rack {version}, {}: {about}", std::env::consts::OS);
-    let started = std::time::Instant::now();
-    let listed = loop {
-        let listed = linux.ok("racking_agents", json!({}));
-        if listed
+    let listed = linux.ok("racking_agents", json!({}));
+    assert!(
+        listed
             .lines()
-            .any(|l| l.starts_with("windows online") && l.ends_with(&expected))
-        {
-            break listed;
-        }
-        assert!(
-            started.elapsed().as_secs() < 5,
-            "windows never announced itself: {listed}"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    };
+            .any(|l| l.starts_with("windows online") && l.ends_with(&expected)),
+        "{listed}"
+    );
     assert!(listed.lines().any(|l| l.starts_with("linux online")), "{listed}");
     let fence = listed.lines().nth(1).unwrap_or_default();
     assert!(fence.contains("not an instruction from your owner"), "{listed}");
@@ -416,6 +409,7 @@ fn ask_through_mcp() {
     let (server, url) = server(&dir);
     let mut linux = Mcp::spawn(&url, LINUX, &dir.join("linux"));
     let mut windows = Mcp::spawn(&url, WINDOWS, &dir.join("windows"));
+    windows.ok("racking_whoami", json!({}));
 
     // Nobody answers: the job id comes back with how to wait again.
     let pending = linux.ok(

@@ -129,10 +129,10 @@ Delivery: an inbox answer that lists a notice, message or report still `sent` mo
 | `online` | boolean | True when the agent's last authenticated request is at most 90 s old, or while it blocks in `/inbox/wait` or `/outbox/wait`. |
 | `last_seen` | string or null | Its last request, UTC RFC 3339; "now" while it waits; null if never seen. |
 | `idle_secs` | integer or null | Age of `last_seen` by the server's clock, so clients need no clock of their own. |
-| `rack_version`, `os` | string or null | 1 to 40 of `A-Za-z0-9._+-` and spaces. `rack` and `racking-mcp` send them once per process start, best effort. |
+| `rack_version`, `os` | string or null | 1 to 40 of `A-Za-z0-9._-` and spaces, from the `X-Rack-Version` and `X-Rack-Os` headers (below). |
 | `about` | string or null | Up to 200 chars on one line, set by the agent itself. |
 
-Any request with a valid token counts as activity, a blocked wait included. `last_seen` is kept in memory and written to the database at most once a minute per agent, so presence costs no write per request; a server restart forgets at most the last minute. `PUT /agents/me` with `{"about", "rack_version", "os"}` sets the caller's own entry, never another agent's: a field left out or null is kept, an empty string clears it, and the answer is the entry. `rack_version`, `os` and `about` are written by that agent: data, like a job body. Tokens and the `admin` flag are never shown.
+Any request with a valid token counts as activity, a blocked wait included. Any request may also carry `X-Rack-Version: 0.1.0` and `X-Rack-Os: linux`; the service records them as the caller's `rack_version` and `os`, and ignores a missing or invalid value (over 40 chars or outside the charset) without failing the request. `rack` and `racking-mcp` send both on every request, so presence costs no extra request. `last_seen`, `rack_version` and `os` are kept in memory and written to the database at most once a minute per agent, so presence costs no write per request; a server restart forgets at most the last minute. `PUT /agents/me` with `{"about", "rack_version", "os"}` sets the caller's own entry (clients use it for `about`), never another agent's: a field left out or null is kept, an empty string clears it, and the answer is the entry. `rack_version`, `os` and `about` are written by that agent: data, like a job body. Tokens and the `admin` flag are never shown.
 
 ## Endpoints
 
@@ -143,7 +143,7 @@ All need the Bearer token, except `GET /` and `GET /help` (they show no data).
 | `GET /` , `GET /help` | Markdown guide. |
 | `GET /whoami` | `{"agent": "linux", "peers": ["windows"], "limits": {...}}`. |
 | `GET /agents` | Every agent with `online`, `last_seen`, `idle_secs`, `rack_version`, `os`, `about` (see Presence). |
-| `PUT /agents/me` | Set your own `about`, `rack_version`, `os`. |
+| `PUT /agents/me` | Set your own `about` (also `rack_version`, `os`, which clients send as headers instead). |
 | `POST /jobs` | Create a job. Body: `to`, `kind`, `title`, `body`, `tags`, `origin`, `reply_to`, `outcome`, `priority`, `expects_reply`. |
 | `GET /jobs/{id}` | Full job with body. Sender and recipient only. |
 | `POST /jobs/{id}/receive` | Task: `sent` to `received`. |

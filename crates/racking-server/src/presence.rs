@@ -1,7 +1,8 @@
-//! Who is online. Activity is kept in memory per agent and written to SQLite at
-//! most once every `FLUSH_SECS` per agent, so serving a request never costs a
-//! write; a restart loses at most that much of `last_seen`. What agents publish
-//! about themselves (`PUT /agents/me`) is rare and written at once.
+//! Who is online. Activity, and the `rack_version` and `os` that clients send as
+//! headers on every request, are kept in memory per agent and written to SQLite
+//! at most once every `FLUSH_SECS` per agent, so serving a request never costs a
+//! write; a restart loses at most that much. `about` (`PUT /agents/me`) is rare
+//! and written at once.
 
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::{PoisonError, RwLock};
@@ -10,7 +11,7 @@ use serde_json::{Value, json};
 
 use crate::clock::{self, Clock};
 use crate::error::ApiResult;
-use crate::types::AgentName;
+use crate::types::{AgentName, Label};
 
 /// An agent is online when its last request is at most this old, or while it is inside a wait.
 pub const ONLINE_SECS: i64 = 90;
@@ -43,6 +44,20 @@ impl Info {
     }
 }
 
+/// The client software a request named in `X-Rack-Version` and `X-Rack-Os`, already validated.
+#[derive(Default)]
+pub struct Software {
+    pub rack_version: Option<Label>,
+    pub os: Option<Label>,
+}
+
+/// What `touch` hands the caller to write to the store, when a write is due.
+pub struct Flush {
+    pub at: i64,
+    pub rack_version: Option<String>,
+    pub os: Option<String>,
+}
+
 /// An agent's row as the store kept it across a restart.
 pub struct Stored {
     pub name: String,
@@ -57,7 +72,8 @@ struct Slot {
     flushed: AtomicI64,
     /// Waits in progress: counted, not flagged, since one agent may run several at once.
     waiting: AtomicU32,
-    /// Read on every `GET /agents`, written only by `PUT /agents/me`.
+    /// Read on every request and `GET /agents`; written only by `PUT /agents/me` and
+    /// when a request names different software, so reads dominate.
     info: RwLock<Info>,
 }
 
@@ -91,20 +107,46 @@ impl Presence {
         self.slots.iter().find(|s| &s.name == agent)
     }
 
-    /// Records activity of `agent` now. Returns the time to write to the store
-    /// when its last write is `FLUSH_SECS` old; only one caller gets it.
+    /// Records activity of `agent` now, and the software it named if that changed.
+    /// Returns what to write to the store when its last write is `FLUSH_SECS`
+    /// old; only one caller gets it.
     #[must_use]
-    pub fn touch(&self, agent: &AgentName) -> Option<i64> {
+    pub fn touch(&self, agent: &AgentName, software: Software) -> Option<Flush> {
         let slot = self.slot(agent)?;
         let now = self.clock.now();
         slot.last_seen.fetch_max(now, Ordering::Relaxed);
+        let changed = |new: &Option<Label>, old: &Option<String>| {
+            new.as_ref().is_some_and(|n| old.as_deref() != Some(n.as_str()))
+        };
+        let stale = {
+            let info = slot.info.read().unwrap_or_else(PoisonError::into_inner);
+            changed(&software.rack_version, &info.rack_version) || changed(&software.os, &info.os)
+        };
+        // The write lock is taken only when the software changed, so the usual request only reads.
+        if stale {
+            let mut info = slot.info.write().unwrap_or_else(PoisonError::into_inner);
+            if let Some(v) = software.rack_version {
+                info.rack_version = Some(v.into_inner());
+            }
+            if let Some(os) = software.os {
+                info.os = Some(os.into_inner());
+            }
+        }
         let flushed = slot.flushed.load(Ordering::Relaxed);
         let due = now.saturating_sub(flushed) >= FLUSH_SECS
             && slot
                 .flushed
                 .compare_exchange(flushed, now, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok();
-        due.then_some(now)
+        if !due {
+            return None;
+        }
+        let info = slot.info.read().unwrap_or_else(PoisonError::into_inner);
+        Some(Flush {
+            at: now,
+            rack_version: info.rack_version.clone(),
+            os: info.os.clone(),
+        })
     }
 
     pub fn begin_wait(&self, agent: &AgentName) {
@@ -115,11 +157,11 @@ impl Presence {
 
     /// Ends a wait started with `begin_wait`; the end counts as activity, as `touch`.
     #[must_use]
-    pub fn end_wait(&self, agent: &AgentName) -> Option<i64> {
+    pub fn end_wait(&self, agent: &AgentName) -> Option<Flush> {
         if let Some(slot) = self.slot(agent) {
             slot.waiting.fetch_sub(1, Ordering::Relaxed);
         }
-        self.touch(agent)
+        self.touch(agent, Software::default())
     }
 
     /// Applies `change` to the agent's info once `save` stored the result. The
@@ -185,6 +227,17 @@ mod tests {
             .collect()
     }
 
+    fn at(flush: Option<Flush>) -> Option<i64> {
+        flush.map(|f| f.at)
+    }
+
+    fn software(version: &str, os: &str) -> Software {
+        Software {
+            rack_version: version.parse().ok(),
+            os: os.parse().ok(),
+        }
+    }
+
     fn online(p: &Presence, agent: &AgentName) -> (bool, Value) {
         let e = p.agent_json(agent);
         (e["online"] == true, e["idle_secs"].clone())
@@ -199,7 +252,11 @@ mod tests {
         assert_eq!(online(&p, win), (false, Value::Null), "never seen");
         assert_eq!(p.agent_json(win)["last_seen"], Value::Null);
 
-        assert_eq!(p.touch(win), Some(1_000_000), "first activity is written");
+        assert_eq!(
+            at(p.touch(win, Software::default())),
+            Some(1_000_000),
+            "first activity is written"
+        );
         clock.advance(ONLINE_SECS);
         assert_eq!(online(&p, win), (true, json!(ONLINE_SECS)));
         clock.advance(1);
@@ -213,7 +270,7 @@ mod tests {
         let names = names();
         let p = Presence::new(names.iter(), Vec::new(), clock.clone());
         let win = &names[1];
-        let _ = p.touch(win);
+        let _ = p.touch(win, Software::default());
         p.begin_wait(win);
         p.begin_wait(win);
         clock.advance(600);
@@ -244,12 +301,35 @@ mod tests {
         let p = Presence::new(names.iter(), stored, clock.clone());
         let win = &names[1];
         assert_eq!(p.agent_json(win)["about"], "kept");
-        assert_eq!(p.touch(win), None, "written 10 s ago");
+        assert_eq!(at(p.touch(win, Software::default())), None, "written 10 s ago");
         clock.advance(49);
-        assert_eq!(p.touch(win), None);
+        assert_eq!(at(p.touch(win, software("0.2.0", "windows"))), None);
+        assert_eq!(
+            p.agent_json(win)["rack_version"],
+            "0.2.0",
+            "memory is current before the write"
+        );
         clock.advance(1);
-        assert_eq!(p.touch(win), Some(1_000_050));
-        assert_eq!(p.touch(win), None);
+        let flush = p.touch(win, Software::default()).expect("due");
+        assert_eq!(
+            (flush.at, flush.rack_version.as_deref(), flush.os.as_deref()),
+            (1_000_050, Some("0.2.0"), Some("windows"))
+        );
+        assert_eq!(at(p.touch(win, Software::default())), None);
+    }
+
+    #[test]
+    fn requests_without_software_keep_it() {
+        let names = names();
+        let p = Presence::new(names.iter(), Vec::new(), Clock::manual(0));
+        let linux = &names[0];
+        let _ = p.touch(linux, software("0.1.0", "linux"));
+        let _ = p.touch(linux, Software::default());
+        let e = p.agent_json(linux);
+        assert_eq!(
+            (e["rack_version"].clone(), e["os"].clone()),
+            (json!("0.1.0"), json!("linux"))
+        );
     }
 
     #[test]
