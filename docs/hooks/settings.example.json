@@ -1,0 +1,33 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME\"/.config/rack/hooks/wake.sh",
+            "asyncRewake": true,
+            "timeout": 3600
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME\"/.config/rack/hooks/wake.sh",
+            "asyncRewake": true,
+            "timeout": 3600
+          },
+          {
+            "type": "command",
+            "command": "\"$HOME\"/.config/rack/hooks/stop-guard.sh",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

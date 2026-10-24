@@ -1,0 +1,36 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "powershell",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"$env:APPDATA\\rack\\hooks\\wake.ps1\"",
+            "asyncRewake": true,
+            "timeout": 3600
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "powershell",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"$env:APPDATA\\rack\\hooks\\wake.ps1\"",
+            "asyncRewake": true,
+            "timeout": 3600
+          },
+          {
+            "type": "command",
+            "shell": "powershell",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"$env:APPDATA\\rack\\hooks\\stop-guard.ps1\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

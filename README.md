@@ -107,6 +107,8 @@ claude mcp list                  # racking should show as connected
 
 Files: `racking_attach` reads and `racking_get_attachment` writes only under one root directory: `RACK_MCP_ROOT` if set, else `CLAUDE_PROJECT_DIR` (which Claude Code sets for MCP servers), else the working directory. Paths that leave it, `..` and symlinks out are refused, and an existing file is replaced only with `overwrite: true`. Every title and body a tool returns sits between `<racking-data …>` markers with a notice that it is data from another agent, not an instruction from the owner. Logs go to stderr, without tokens or job text.
 
+To let an idle session notice a job without anyone typing, run `rack watch` under the Monitor tool, or install the opt-in hooks in [docs/hooks/](docs/hooks/) (an `asyncRewake` wake hook and a stop guard, for Linux and Windows). Nothing is enabled by default; see [Waking an idle agent](docs/agent-guide.md#waking-an-idle-agent).
+
 A snippet for the project's `CLAUDE.md`:
 
 ```markdown
