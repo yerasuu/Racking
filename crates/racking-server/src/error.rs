@@ -41,10 +41,13 @@ impl Code {
             Code::NotFound,
             "No such job, attachment, agent, published binary or route.",
         ),
-        (Code::BadTransition, "State move not allowed."),
+        (
+            Code::BadTransition,
+            "State move not allowed, e.g. accepting a message or replying to a notice.",
+        ),
         (
             Code::AttachmentsLocked,
-            "The job is no longer `sent`, attachments are fixed.",
+            "The job is no longer `sent`, attachments are fixed; or it is a notice, which carries no files.",
         ),
         (Code::TooLarge, "Body or file over the limit. The hint names the limit."),
         (Code::ChecksumMismatch, "`X-Sha256` differs from the uploaded bytes."),

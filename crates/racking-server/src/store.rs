@@ -18,11 +18,20 @@ use sha2::{Digest, Sha256};
 
 use crate::clock;
 use crate::error::{ApiError, ApiResult, Code};
-use crate::types::{AgentName, AttachmentName, JobId, Seq, Sha256Hex, hex};
+use crate::types::{AgentName, AttachmentName, JobId, Seq, Sha256Hex, hex, truncate};
 
 pub mod limits {
     pub const TITLE_CHARS: usize = 200;
     pub const BODY_BYTES: usize = 64 * 1024;
+    /// A notice is a heads-up, so it stays short enough to read in one glance.
+    pub const NOTICE_BYTES: usize = 1024;
+    /// A report is a document to read later, so it may be long; it never comes inline.
+    pub const REPORT_BYTES: usize = 1024 * 1024;
+    /// Notices and messages up to this size come whole in `/inbox`; longer ones as a preview.
+    pub const INLINE_BYTES: usize = 4 * 1024;
+    /// Title the server derives from the first line of a message or notice.
+    pub const DERIVED_TITLE_CHARS: usize = 80;
+    pub const PREVIEW_CHARS: usize = 200;
     pub const TAGS: usize = 16;
     pub const TAG_CHARS: usize = 40;
     pub const FILE_BYTES: u64 = 64 * 1024 * 1024;
@@ -48,6 +57,9 @@ pub enum Kind {
     Task,
     Comment,
     Result,
+    Message,
+    Notice,
+    Report,
 }
 
 impl Kind {
@@ -56,7 +68,21 @@ impl Kind {
             Kind::Task => "task",
             Kind::Comment => "comment",
             Kind::Result => "result",
+            Kind::Message => "message",
+            Kind::Notice => "notice",
+            Kind::Report => "report",
         }
+    }
+
+    /// Messages, notices and reports are delivered, not worked on: they have no
+    /// accept, reject or result, and the inbox read that hands them over receives them.
+    pub fn is_delivery(self) -> bool {
+        matches!(self, Kind::Message | Kind::Notice | Kind::Report)
+    }
+
+    /// Whether `/inbox` carries the whole body instead of a preview.
+    fn inlines(self, body_size: i64) -> bool {
+        matches!(self, Kind::Message | Kind::Notice) && body_size <= limits::INLINE_BYTES as i64
     }
 }
 
@@ -68,7 +94,12 @@ impl FromStr for Kind {
             "task" => Ok(Kind::Task),
             "comment" => Ok(Kind::Comment),
             "result" => Ok(Kind::Result),
-            other => Err(format!("kind `{other}` must be task, comment or result")),
+            "message" => Ok(Kind::Message),
+            "notice" => Ok(Kind::Notice),
+            "report" => Ok(Kind::Report),
+            other => Err(format!(
+                "kind `{other}` must be task, message, notice, report, comment or result"
+            )),
         }
     }
 }
@@ -81,6 +112,8 @@ pub enum State {
     Rejected,
     Done,
     Failed,
+    /// A message or report that expected a reply got one from its recipient.
+    Answered,
 }
 
 impl State {
@@ -92,6 +125,7 @@ impl State {
             State::Rejected => "rejected",
             State::Done => "done",
             State::Failed => "failed",
+            State::Answered => "answered",
         }
     }
 }
@@ -107,9 +141,41 @@ impl FromStr for State {
             "rejected" => Ok(State::Rejected),
             "done" => Ok(State::Done),
             "failed" => Ok(State::Failed),
+            "answered" => Ok(State::Answered),
             other => Err(format!(
-                "state `{other}` must be sent, received, accepted, rejected, done or failed"
+                "state `{other}` must be sent, received, accepted, rejected, done, failed or answered"
             )),
+        }
+    }
+}
+
+/// Shown to the recipient; the service never orders or filters by it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Priority {
+    Low,
+    Normal,
+    High,
+}
+
+impl Priority {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Priority::Low => "low",
+            Priority::Normal => "normal",
+            Priority::High => "high",
+        }
+    }
+}
+
+impl FromStr for Priority {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "low" => Ok(Priority::Low),
+            "normal" => Ok(Priority::Normal),
+            "high" => Ok(Priority::High),
+            other => Err(format!("priority `{other}` must be low, normal or high")),
         }
     }
 }
@@ -207,6 +273,8 @@ pub struct NewJob {
     pub origin: Option<Origin>,
     pub reply_to: Option<JobId>,
     pub outcome: Option<Outcome>,
+    pub priority: Priority,
+    pub expects_reply: bool,
 }
 
 pub struct Attachment {
@@ -234,7 +302,8 @@ pub struct Job {
     pub to: String,
     pub kind: Kind,
     pub title: String,
-    /// The whole body for `View::Full`, the first 200 chars for `View::Summary`.
+    /// The whole body for `View::Full`; for `View::Summary`, the whole body of a
+    /// message or notice that `Kind::inlines`, else the first 200 chars.
     pub body: String,
     pub body_size: i64,
     pub tags: Vec<String>,
@@ -247,6 +316,8 @@ pub struct Job {
     pub updated_at: i64,
     pub seq: i64,
     pub updated_seq: i64,
+    pub priority: Priority,
+    pub expects_reply: bool,
     pub attachments: Vec<Attachment>,
 }
 
@@ -268,12 +339,26 @@ impl Job {
             "seq": self.seq,
             "updated_seq": self.updated_seq,
             "body_size": self.body_size,
+            "priority": self.priority.as_str(),
+            "expects_reply": self.expects_reply,
         });
         if let Some(obj) = v.as_object_mut() {
+            let mut insert = |k: &str, value: Value| obj.insert(k.to_owned(), value);
             match view {
-                View::Full => obj.insert("body".to_owned(), Value::from(self.body.as_str())),
-                View::Summary => obj.insert("body_preview".to_owned(), Value::from(self.body.as_str())),
-            };
+                View::Full => {
+                    insert("body", Value::from(self.body.as_str()));
+                    insert("body_truncated", Value::from(false));
+                }
+                View::Summary if self.kind.inlines(self.body_size) => {
+                    insert("body", Value::from(self.body.as_str()));
+                    insert("body_preview", Value::from(truncate(&self.body, limits::PREVIEW_CHARS)));
+                    insert("body_truncated", Value::from(false));
+                }
+                View::Summary => {
+                    insert("body_preview", Value::from(self.body.as_str()));
+                    insert("body_truncated", Value::from(self.body_size > self.body.len() as i64));
+                }
+            }
             if let Some(outcome) = &self.outcome {
                 obj.insert("outcome".to_owned(), Value::from(outcome.as_str()));
             }
@@ -377,9 +462,14 @@ impl Changes {
 }
 
 const JOB_COLUMNS: &str = "id, from_agent, to_agent, kind, title, body, length(CAST(body AS BLOB)), tags, origin, \
-                           reply_to, outcome, reason, state, created_at, updated_at, seq, updated_seq";
-const SUMMARY_COLUMNS: &str = "id, from_agent, to_agent, kind, title, substr(body, 1, 200), length(CAST(body AS BLOB)), \
-                               tags, origin, reply_to, outcome, reason, state, created_at, updated_at, seq, updated_seq";
+                           reply_to, outcome, reason, state, created_at, updated_at, seq, updated_seq, priority, \
+                           expects_reply";
+/// The body column must agree with `Kind::inlines`, `limits::INLINE_BYTES` and `limits::PREVIEW_CHARS`.
+const SUMMARY_COLUMNS: &str = "id, from_agent, to_agent, kind, title, \
+                               CASE WHEN kind IN ('message', 'notice') AND length(CAST(body AS BLOB)) <= 4096 \
+                               THEN body ELSE substr(body, 1, 200) END, length(CAST(body AS BLOB)), \
+                               tags, origin, reply_to, outcome, reason, state, created_at, updated_at, seq, updated_seq, \
+                               priority, expects_reply";
 
 const SCHEMA: &str = "
 PRAGMA journal_mode = WAL;
@@ -401,7 +491,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     seq INTEGER NOT NULL,
-    updated_seq INTEGER NOT NULL
+    updated_seq INTEGER NOT NULL,
+    priority TEXT NOT NULL DEFAULT 'normal',
+    expects_reply INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 CREATE INDEX IF NOT EXISTS jobs_inbox ON jobs (to_agent, seq);
 CREATE INDEX IF NOT EXISTS jobs_outbox ON jobs (from_agent, updated_seq);
@@ -458,6 +550,7 @@ impl Store {
             .map_err(|e| e.to_string())?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| format!("cannot set up the schema: {e}"))?;
+        add_reply_columns(&conn).map_err(|e| format!("cannot add the priority columns: {e}"))?;
         Ok(Self {
             conn: Mutex::new(conn),
             files,
@@ -497,6 +590,35 @@ impl Store {
                     new.to
                 )));
             }
+            match (original.kind, new.kind) {
+                (Kind::Notice, _) => {
+                    return Err(ApiError::new(
+                        Code::BadTransition,
+                        format!("job {reply_id} is a notice, which takes no reply"),
+                        "Send a message instead: kind \"message\" without reply_to.",
+                    ));
+                }
+                (Kind::Message | Kind::Report, Kind::Comment | Kind::Result) => {
+                    return Err(ApiError::new(
+                        Code::BadTransition,
+                        format!(
+                            "job {reply_id} is a {}, which takes no comment or result",
+                            original.kind.as_str()
+                        ),
+                        format!(
+                            "It needs no reply protocol; answer with a message: kind \"message\", reply_to {reply_id}."
+                        ),
+                    ));
+                }
+                _ => {}
+            }
+            if original.kind.is_delivery()
+                && original.expects_reply
+                && original.to == me.as_str()
+                && matches!(original.state, State::Sent | State::Received)
+            {
+                set_state(&tx, original.id, State::Answered, None, now)?;
+            }
             if new.kind == Kind::Result {
                 if original.to != me.as_str() {
                     return Err(ApiError::new(
@@ -521,7 +643,8 @@ impl Store {
         let outcome = (new.kind == Kind::Result).then(|| new.outcome.unwrap_or(Outcome::Done).state().as_str());
         tx.execute(
             "INSERT INTO jobs (from_agent, to_agent, kind, title, body, tags, origin, reply_to, outcome, state, \
-             created_at, updated_at, seq, updated_seq) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'sent', ?10, ?10, ?11, ?12)",
+             created_at, updated_at, seq, updated_seq, priority, expects_reply) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'sent', ?10, ?10, ?11, ?12, ?13, ?14)",
             params![
                 me.as_str(),
                 new.to.as_str(),
@@ -534,7 +657,9 @@ impl Store {
                 outcome,
                 now,
                 seq,
-                updated_seq
+                updated_seq,
+                new.priority.as_str(),
+                new.expects_reply
             ],
         )?;
         let id = JobId::new(tx.last_insert_rowid());
@@ -546,7 +671,7 @@ impl Store {
     }
 
     /// Reading a job as its recipient marks it `received`, as the protocol's
-    /// "implicit on first full read" asks.
+    /// "implicit on first full read" asks; for a message, notice or report that is delivery.
     pub fn get_job(&self, me: &AgentName, id: JobId) -> ApiResult<Job> {
         let mut conn = self.db();
         let tx = conn.transaction()?;
@@ -578,6 +703,20 @@ impl Store {
                 Code::NotYours,
                 format!("only the recipient {} can {} {id}", job.to, mv.verb()),
                 format!("As the sender you can cancel while it is sent: POST /jobs/{id}/cancel."),
+            ));
+        }
+        if job.kind.is_delivery() {
+            let hint = match job.kind {
+                Kind::Notice => "A notice needs nothing back; reading your inbox already received it.".to_owned(),
+                _ => format!(
+                    "A {} needs no reply protocol; answer with a message (kind \"message\", reply_to {id}) if you want.",
+                    job.kind.as_str()
+                ),
+            };
+            return Err(ApiError::new(
+                Code::BadTransition,
+                format!("job {id} is a {}, it cannot {}", job.kind.as_str(), mv.verb()),
+                hint,
             ));
         }
         let changed = apply_move(&tx, &job, mv, reason, clock::now())?;
@@ -712,21 +851,38 @@ impl Store {
         })
     }
 
+    /// Lists the caller's inbox. The answer hands over the messages, notices and
+    /// reports in it, so those still `sent` become `received` here, where their
+    /// sender's outbox sees it.
     pub fn inbox(&self, me: &AgentName, since: Seq, state: Option<State>, limit: u32) -> ApiResult<Listing> {
-        let conn = self.db();
-        let mut stmt = conn.prepare_cached(&format!(
-            "SELECT {SUMMARY_COLUMNS} FROM jobs WHERE to_agent = ?1 AND seq > ?2 \
-             AND (?3 IS NULL OR state = ?3) ORDER BY seq LIMIT ?4"
-        ))?;
-        let rows = stmt.query_map(
-            params![me.as_str(), since.get(), state.map(State::as_str), limit],
-            job_from_row,
-        )?;
-        let mut jobs = Vec::new();
-        for row in rows {
-            let mut job = row?;
-            job.attachments = load_attachments(&conn, job.id)?;
-            jobs.push(job);
+        let mut conn = self.db();
+        let tx = conn.transaction()?;
+        let mut jobs = {
+            let mut stmt = tx.prepare_cached(&format!(
+                "SELECT {SUMMARY_COLUMNS} FROM jobs WHERE to_agent = ?1 AND seq > ?2 \
+                 AND (?3 IS NULL OR state = ?3) ORDER BY seq LIMIT ?4"
+            ))?;
+            let rows = stmt.query_map(
+                params![me.as_str(), since.get(), state.map(State::as_str), limit],
+                job_from_row,
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let now = clock::now();
+        let mut delivered = false;
+        for job in &mut jobs {
+            job.attachments = load_attachments(&tx, job.id)?;
+            if job.kind.is_delivery() && job.state == State::Sent {
+                job.updated_seq = set_state(&tx, job.id, State::Received, None, now)?;
+                job.state = State::Received;
+                job.updated_at = now;
+                delivered = true;
+            }
+        }
+        tx.commit()?;
+        drop(conn);
+        if delivered {
+            self.changes.bump();
         }
         let next = jobs.last().map_or(since.get(), |j| j.seq);
         Ok(Listing { jobs, next })
@@ -919,8 +1075,11 @@ impl Store {
             [now - limits::IDEMPOTENCY_TTL_SECS],
         )?;
         let ids = {
+            // A delivered notice, message or report that asked for no reply is as closed as a done task.
             let mut stmt = tx.prepare(
-                "DELETE FROM jobs WHERE state IN ('done', 'rejected', 'failed') AND updated_at <= ?1 RETURNING id",
+                "DELETE FROM jobs WHERE updated_at <= ?1 AND (state IN ('done', 'rejected', 'failed', 'answered') \
+                 OR (state = 'received' AND kind IN ('message', 'notice', 'report') AND expects_reply = 0)) \
+                 RETURNING id",
             )?;
             let rows = stmt.query_map([now - limits::CLOSED_JOB_TTL_SECS], |row| row.get(0).map(JobId::new))?;
             rows.collect::<Result<Vec<_>, _>>()?
@@ -1005,6 +1164,13 @@ fn check_upload(job: &Job, me: &AgentName, name: &AttachmentName) -> ApiResult<B
             "Send your files on a reply job instead: kind \"result\" or \"comment\".",
         ));
     }
+    if job.kind == Kind::Notice {
+        return Err(ApiError::new(
+            Code::AttachmentsLocked,
+            format!("job {} is a notice, which carries no files", job.id),
+            "Send a message instead (kind \"message\") and attach the files to it while it is sent.",
+        ));
+    }
     if job.state != State::Sent {
         return Err(ApiError::new(
             Code::AttachmentsLocked,
@@ -1078,14 +1244,41 @@ fn apply_move(tx: &Transaction<'_>, job: &Job, mv: Move, reason: Option<&str>, n
             ))
         }
         Step::To(state) => {
-            let updated_seq = bump_counter(tx, "updated")?;
-            tx.execute(
-                "UPDATE jobs SET state = ?2, updated_at = ?3, updated_seq = ?4, reason = coalesce(?5, reason) WHERE id = ?1",
-                params![job.id.get(), state.as_str(), now, updated_seq, reason],
-            )?;
+            set_state(tx, job.id, state, reason, now)?;
             Ok(true)
         }
     }
+}
+
+/// Stores a new state and bumps `updated_seq`, which wakes the sender's outbox
+/// wait. Returns the new `updated_seq`.
+fn set_state(tx: &Transaction<'_>, id: JobId, state: State, reason: Option<&str>, now: i64) -> ApiResult<i64> {
+    let updated_seq = bump_counter(tx, "updated")?;
+    tx.execute(
+        "UPDATE jobs SET state = ?2, updated_at = ?3, updated_seq = ?4, reason = coalesce(?5, reason) WHERE id = ?1",
+        params![id.get(), state.as_str(), now, updated_seq, reason],
+    )?;
+    Ok(updated_seq)
+}
+
+/// Databases made before notices, messages and reports lack `priority` and
+/// `expects_reply`. Their tasks expected a reply all along, so they get `expects_reply = 1`.
+fn add_reply_columns(conn: &Connection) -> rusqlite::Result<()> {
+    let present: i64 = conn.query_row(
+        "SELECT count(*) FROM pragma_table_info('jobs') WHERE name = 'priority'",
+        [],
+        |row| row.get(0),
+    )?;
+    if present > 0 {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "BEGIN;
+         ALTER TABLE jobs ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal';
+         ALTER TABLE jobs ADD COLUMN expects_reply INTEGER NOT NULL DEFAULT 0;
+         UPDATE jobs SET expects_reply = 1 WHERE kind = 'task';
+         COMMIT;",
+    )
 }
 
 fn bump_counter(conn: &Connection, name: &str) -> ApiResult<i64> {
@@ -1168,6 +1361,8 @@ fn job_from_row(row: &Row<'_>) -> rusqlite::Result<Job> {
         updated_at: row.get(14)?,
         seq: row.get(15)?,
         updated_seq: row.get(16)?,
+        priority: row.get::<_, Parsed<Priority>>(17)?.0,
+        expects_reply: row.get(18)?,
         attachments: Vec::new(),
     })
 }
@@ -1220,7 +1415,241 @@ mod tests {
             }),
             reply_to: None,
             outcome: None,
+            priority: Priority::Normal,
+            expects_reply: true,
         }
+    }
+
+    fn delivery(kind: Kind, to: &str, body: &str) -> NewJob {
+        NewJob {
+            kind,
+            title: "Hello".to_owned(),
+            body: body.to_owned(),
+            origin: None,
+            expects_reply: false,
+            ..task(to)
+        }
+    }
+
+    fn state_in_outbox(s: &Store, me: &AgentName, id: JobId) -> Option<State> {
+        let out = s.outbox(me, Seq::new(0), 50).expect("outbox");
+        out.jobs.iter().find(|j| j.id == id).map(|j| j.state)
+    }
+
+    #[test]
+    fn delivery_kinds_end_received_on_inbox_read() {
+        let (_dir, s) = store();
+        let (linux, windows) = (agent("linux"), agent("windows"));
+        let m = s
+            .create_job(&linux, delivery(Kind::Message, "windows", "hi\nthere"))
+            .expect("message");
+        let n = s
+            .create_job(&linux, delivery(Kind::Notice, "windows", "build is red"))
+            .expect("notice");
+        let r = s
+            .create_job(&linux, delivery(Kind::Report, "windows", &"r".repeat(300)))
+            .expect("report");
+        assert_eq!((m.state, n.state, r.state), (State::Sent, State::Sent, State::Sent));
+        let before = s.outbox(&linux, Seq::new(0), 50).expect("outbox").next;
+
+        let inbox = s.inbox(&windows, Seq::new(0), None, 50).expect("inbox");
+        assert!(inbox.jobs.iter().all(|j| j.state == State::Received));
+        let json = inbox.to_json();
+        assert_eq!(json["jobs"][0]["body"], "hi\nthere", "a short message comes whole");
+        assert_eq!(json["jobs"][0]["body_truncated"], false);
+        assert_eq!(json["jobs"][1]["body"], "build is red");
+        assert!(
+            json["jobs"][2].get("body").is_none(),
+            "a report comes as a summary only"
+        );
+        assert_eq!(json["jobs"][2]["body_truncated"], true);
+        assert_eq!(json["jobs"][2]["body_preview"].as_str().map(str::len), Some(200));
+        assert_eq!(json["jobs"][2]["priority"], "normal");
+
+        let after = s.outbox(&linux, Seq::new(before), 50).expect("outbox");
+        assert_eq!(after.jobs.len(), 3, "the sender's outbox cursor moves on delivery");
+        let again = s.inbox(&windows, Seq::new(0), None, 50).expect("inbox");
+        assert_eq!(
+            again.jobs.iter().map(|j| j.updated_seq).collect::<Vec<_>>(),
+            inbox.jobs.iter().map(|j| j.updated_seq).collect::<Vec<_>>(),
+            "a repeated read changes nothing"
+        );
+        assert!(
+            s.outbox(&linux, Seq::new(after.next), 50)
+                .expect("outbox")
+                .jobs
+                .is_empty()
+        );
+
+        for id in [m.id, n.id, r.id] {
+            for mv in [Move::Receive, Move::Accept, Move::Reject, Move::Finish(Outcome::Done)] {
+                let err = s.move_job(&windows, id, mv, Some("no")).err().map(|e| e.code);
+                assert_eq!(err, Some(Code::BadTransition), "{id} {mv:?}");
+            }
+        }
+        let err = s.cancel_job(&linux, m.id).err().map(|e| e.code);
+        assert_eq!(err, Some(Code::BadTransition), "delivered, too late to cancel");
+        let fresh = s
+            .create_job(&linux, delivery(Kind::Message, "windows", "oops"))
+            .expect("message");
+        s.cancel_job(&linux, fresh.id).expect("cancel while sent");
+
+        s.db()
+            .execute(
+                "UPDATE jobs SET updated_at = updated_at - ?1",
+                [limits::CLOSED_JOB_TTL_SECS + 1],
+            )
+            .expect("age jobs");
+        let purged = s.purge(clock::now()).expect("purge");
+        assert_eq!(purged.len(), 3, "delivered jobs without a reply expected are closed");
+    }
+
+    #[test]
+    fn replies_to_delivery_kinds() {
+        let (_dir, s) = store();
+        let (linux, windows) = (agent("linux"), agent("windows"));
+        let ask = NewJob {
+            expects_reply: true,
+            ..delivery(Kind::Message, "windows", "which branch?")
+        };
+        let ask = s.create_job(&linux, ask).expect("message");
+        let plain = s
+            .create_job(&linux, delivery(Kind::Message, "windows", "fyi"))
+            .expect("message");
+        let notice = s
+            .create_job(&linux, delivery(Kind::Notice, "windows", "deploying"))
+            .expect("notice");
+        s.inbox(&windows, Seq::new(0), None, 50).expect("deliver");
+
+        for kind in [Kind::Comment, Kind::Result] {
+            let reply = NewJob {
+                reply_to: Some(ask.id),
+                ..delivery(kind, "linux", "x")
+            };
+            let err = s.create_job(&windows, reply).err().map(|e| e.code);
+            assert_eq!(err, Some(Code::BadTransition), "{kind:?} to a message");
+        }
+        let reply = NewJob {
+            reply_to: Some(notice.id),
+            ..delivery(Kind::Message, "linux", "ok")
+        };
+        let err = s.create_job(&windows, reply).err().map(|e| e.code);
+        assert_eq!(err, Some(Code::BadTransition), "a notice takes no reply");
+
+        let follow_up = NewJob {
+            reply_to: Some(ask.id),
+            ..delivery(Kind::Message, "windows", "also: main")
+        };
+        s.create_job(&linux, follow_up)
+            .expect("the sender may add to its own message");
+        assert_eq!(state_in_outbox(&s, &linux, ask.id), Some(State::Received));
+
+        let before = s.outbox(&linux, Seq::new(0), 50).expect("outbox").next;
+        let answer = NewJob {
+            reply_to: Some(ask.id),
+            ..delivery(Kind::Message, "linux", "main")
+        };
+        s.create_job(&windows, answer).expect("answer");
+        let woke = s.outbox(&linux, Seq::new(before), 50).expect("outbox");
+        assert_eq!(
+            woke.jobs.first().map(|j| (j.id, j.state)),
+            Some((ask.id, State::Answered))
+        );
+
+        let answer = NewJob {
+            reply_to: Some(plain.id),
+            ..delivery(Kind::Message, "linux", "thanks")
+        };
+        s.create_job(&windows, answer).expect("answer");
+        assert_eq!(
+            state_in_outbox(&s, &linux, plain.id),
+            Some(State::Received),
+            "no reply was expected, so it stays received"
+        );
+    }
+
+    #[test]
+    fn attachments_by_kind() {
+        let (_dir, s) = store();
+        let (linux, windows) = (agent("linux"), agent("windows"));
+        let name: AttachmentName = "a.txt".parse().expect("name");
+        let sha = Sha256Hex::of_digest(&Sha256::digest(b"hi"));
+        let upload = |id| {
+            s.put_attachment(&linux, id, &name, &mut &b"hi"[..], &sha, None)
+                .err()
+                .map(|e| e.code)
+        };
+        let notice = s
+            .create_job(&linux, delivery(Kind::Notice, "windows", "n"))
+            .expect("notice");
+        assert_eq!(upload(notice.id), Some(Code::AttachmentsLocked));
+        let message = s
+            .create_job(&linux, delivery(Kind::Message, "windows", "m"))
+            .expect("message");
+        let report = s
+            .create_job(&linux, delivery(Kind::Report, "windows", "r"))
+            .expect("report");
+        assert_eq!((upload(message.id), upload(report.id)), (None, None));
+
+        let inbox = s.inbox(&windows, Seq::new(0), None, 50).expect("inbox");
+        let files = inbox.jobs.iter().map(|j| j.attachments.len()).collect::<Vec<_>>();
+        assert_eq!(files, [0, 1, 1], "the inbox lists attachment summaries");
+        assert_eq!(
+            upload(message.id),
+            Some(Code::AttachmentsLocked),
+            "fixed once delivered"
+        );
+    }
+
+    #[test]
+    fn inline_bodies_up_to_four_kib() {
+        let (_dir, s) = store();
+        let (linux, windows) = (agent("linux"), agent("windows"));
+        for body in [
+            "é".repeat(limits::INLINE_BYTES / 2),
+            format!("{}x", "é".repeat(limits::INLINE_BYTES / 2)),
+        ] {
+            s.create_job(&linux, delivery(Kind::Message, "windows", &body))
+                .expect("message");
+        }
+        s.create_job(
+            &linux,
+            delivery(Kind::Message, "windows", "x\u{1F600}".repeat(1500).as_str()),
+        )
+        .expect("message");
+        let json = s.inbox(&windows, Seq::new(0), None, 50).expect("inbox").to_json();
+        assert_eq!(
+            json["jobs"][0]["body"].as_str().map(str::len),
+            Some(limits::INLINE_BYTES)
+        );
+        assert!(json["jobs"][1].get("body").is_none(), "4 KiB + 1 comes as a preview");
+        assert_eq!(json["jobs"][1]["body_truncated"], true);
+        assert!(json["jobs"][2].get("body").is_none());
+        let preview = json["jobs"][2]["body_preview"].as_str().unwrap_or_default();
+        assert_eq!(preview.chars().count(), 200, "the preview counts chars, not bytes");
+    }
+
+    #[test]
+    fn old_databases_gain_the_reply_columns() {
+        let dir = TempDir::new();
+        fs::create_dir_all(&dir.0).expect("dir");
+        let conn = Connection::open(dir.0.join("racking.db")).expect("db");
+        conn.execute_batch(
+            "CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, from_agent TEXT NOT NULL, \
+             to_agent TEXT NOT NULL, kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, \
+             tags TEXT NOT NULL, origin TEXT, reply_to INTEGER, outcome TEXT, reason TEXT, state TEXT NOT NULL, \
+             created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, seq INTEGER NOT NULL, \
+             updated_seq INTEGER NOT NULL) STRICT;
+             INSERT INTO jobs VALUES (1, 'linux', 'windows', 'task', 't', 'b', '[]', NULL, NULL, NULL, NULL, \
+             'sent', 0, 0, 1, 1);",
+        )
+        .expect("old schema");
+        drop(conn);
+        let s = Store::open(&dir.0).expect("open");
+        let job = s.get_job(&agent("linux"), JobId::new(1)).expect("job");
+        assert_eq!((job.priority, job.expects_reply), (Priority::Normal, true));
+        drop(s);
+        Store::open(&dir.0).expect("opening twice is fine");
     }
 
     fn store() -> (TempDir, Store) {

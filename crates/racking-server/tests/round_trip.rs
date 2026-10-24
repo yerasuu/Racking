@@ -408,3 +408,178 @@ fn dist_publish_and_download() {
             .is_some_and(|g| g.contains("PUT /dist/{target}/{file}") && g.contains("not_admin"))
     );
 }
+
+#[test]
+fn messages_notices_and_reports() {
+    let s = Server::start();
+    let post = |token: &str, key: &str, body: &Value| {
+        let mut resp = s
+            .http
+            .post(format!("{}/jobs", s.base))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Idempotency-Key", key)
+            .send_json(body)
+            .expect("post");
+        (
+            resp.status().as_u16(),
+            resp.body_mut().read_json::<Value>().expect("json"),
+        )
+    };
+
+    // Windows is already waiting when Linux speaks; one call brings the whole text.
+    let waiter = {
+        let (base, http) = (s.base.clone(), s.http.clone());
+        std::thread::spawn(move || {
+            let mut resp = http
+                .get(format!("{base}/inbox/wait?since=0&timeout=20"))
+                .header("Authorization", format!("Bearer {WINDOWS}"))
+                .call()
+                .expect("inbox wait");
+            resp.body_mut().read_json::<Value>().expect("json")
+        })
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    let text = "¿Qué rama uso?\nLa de ayer falla en Windows.";
+    let say = json!({"to": "windows", "kind": "message", "body": text, "priority": "high", "expects_reply": true});
+    let (status, j1) = post(LINUX, "say-1", &say);
+    assert_eq!(status, 201, "{j1}");
+    assert_eq!(
+        (j1["title"].as_str(), j1["state"].as_str(), j1["priority"].as_str()),
+        (Some("¿Qué rama uso?"), Some("sent"), Some("high"))
+    );
+    let (status, again) = post(LINUX, "say-1", &say);
+    assert_eq!(
+        (status, again["id"].clone()),
+        (201, j1["id"].clone()),
+        "idempotent send"
+    );
+
+    let got = waiter.join().expect("waiter");
+    assert_eq!(got["jobs"].as_array().map(Vec::len), Some(1), "{got}");
+    let delivered = &got["jobs"][0];
+    assert_eq!(
+        (delivered["body"].as_str(), delivered["state"].as_str()),
+        (Some(text), Some("received"))
+    );
+    let (_, out) = s.call("GET", "/outbox?since=0", Some(LINUX), None);
+    assert_eq!(out["jobs"][0]["state"], "received");
+    let since = out["next"].as_i64().expect("next");
+
+    let (status, err) = s.call("POST", "/jobs/j1/accept", Some(WINDOWS), None);
+    assert_eq!((status, err["error"]["code"].as_str()), (409, Some("bad_transition")));
+    assert!(
+        err["error"]["hint"]
+            .as_str()
+            .is_some_and(|h| h.contains("answer with a message"))
+    );
+    let (status, err) = s.call(
+        "POST",
+        "/jobs",
+        Some(WINDOWS),
+        Some(json!({"to": "linux", "kind": "result", "reply_to": "j1", "title": "done"})),
+    );
+    assert_eq!((status, err["error"]["code"].as_str()), (409, Some("bad_transition")));
+
+    let outbox_waiter = {
+        let (base, http) = (s.base.clone(), s.http.clone());
+        std::thread::spawn(move || {
+            let mut resp = http
+                .get(format!("{base}/outbox/wait?since={since}&timeout=20"))
+                .header("Authorization", format!("Bearer {LINUX}"))
+                .call()
+                .expect("outbox wait");
+            resp.body_mut().read_json::<Value>().expect("json")
+        })
+    };
+    let (status, _) = s.call(
+        "POST",
+        "/jobs",
+        Some(WINDOWS),
+        Some(json!({"to": "linux", "kind": "message", "reply_to": "j1", "body": "main"})),
+    );
+    assert_eq!(status, 201);
+    let woke = outbox_waiter.join().expect("outbox waiter");
+    assert_eq!(woke["jobs"][0]["state"], "answered", "{woke}");
+
+    // Notices: short, no files, never answered.
+    let (status, n) = post(
+        LINUX,
+        "n-1",
+        &json!({"to": "windows", "kind": "notice", "body": "CI is red"}),
+    );
+    assert_eq!((status, n["expects_reply"].as_bool()), (201, Some(false)));
+    let nid = n["id"].as_str().expect("id").to_owned();
+    let (status, err) = post(
+        LINUX,
+        "n-2",
+        &json!({"to": "windows", "kind": "notice", "body": "x".repeat(1025)}),
+    );
+    assert_eq!((status, err["error"]["code"].as_str()), (413, Some("too_large")));
+    let (status, err) = s.put_file(&format!("/jobs/{nid}/attachments/a.txt"), LINUX, b"x", &sha(b"x"), None);
+    assert_eq!(
+        (status, err["error"]["code"].as_str()),
+        (409, Some("attachments_locked"))
+    );
+    let (status, err) = post(
+        WINDOWS,
+        "n-3",
+        &json!({"to": "linux", "kind": "message", "reply_to": nid, "body": "ok"}),
+    );
+    assert_eq!((status, err["error"]["code"].as_str()), (409, Some("bad_transition")));
+
+    // Reports: up to 1 MiB, title required, listed as a summary only.
+    let (status, err) = post(LINUX, "r-1", &json!({"to": "windows", "kind": "report", "body": "x"}));
+    assert_eq!((status, err["error"]["code"].as_str()), (400, Some("bad_request")));
+    let big = "ñ".repeat(512 * 1024);
+    let (status, r) = post(
+        LINUX,
+        "r-2",
+        &json!({"to": "windows", "kind": "report", "title": "Probe log", "body": big}),
+    );
+    assert_eq!(
+        (status, r["body_size"].as_u64()),
+        (201, Some(1024 * 1024)),
+        "{}",
+        r["error"]
+    );
+    let (status, err) = post(
+        LINUX,
+        "r-3",
+        &json!({"to": "windows", "kind": "report", "title": "Too big", "body": format!("{big}x")}),
+    );
+    assert_eq!((status, err["error"]["code"].as_str()), (413, Some("too_large")));
+    let (status, err) = post(
+        LINUX,
+        "t-1",
+        &json!({"to": "windows", "title": "Too big", "body": "x".repeat(64 * 1024 + 1)}),
+    );
+    assert_eq!((status, err["error"]["code"].as_str()), (413, Some("too_large")));
+
+    let (_, inbox) = s.call("GET", "/inbox?since=1", Some(WINDOWS), None);
+    let report = inbox["jobs"]
+        .as_array()
+        .and_then(|jobs| jobs.iter().find(|j| j["kind"] == "report"))
+        .expect("report listed");
+    assert!(report.get("body").is_none(), "never the whole report inline");
+    assert_eq!(
+        (report["body_truncated"].as_bool(), report["state"].as_str()),
+        (Some(true), Some("received"))
+    );
+    let rid = report["id"].as_str().expect("id");
+    let (status, full) = s.call("GET", &format!("/jobs/{rid}"), Some(WINDOWS), None);
+    assert_eq!((status, full["body"].as_str().map(str::len)), (200, Some(1024 * 1024)));
+    let (status, err) = s.call(
+        "POST",
+        &format!("/jobs/{rid}/reject"),
+        Some(WINDOWS),
+        Some(json!({"reason": "no"})),
+    );
+    assert_eq!((status, err["error"]["code"].as_str()), (409, Some("bad_transition")));
+
+    let (_, guide) = s.call("GET", "/help", None, None);
+    assert!(
+        guide
+            .as_str()
+            .is_some_and(|g| g.contains("## Kinds") && g.contains("answered"))
+    );
+}
