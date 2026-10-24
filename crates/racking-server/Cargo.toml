@@ -4,6 +4,8 @@ description = "Racking job service: HTTP/JSON inboxes for coding agents on one L
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 tiny_http = "0.12"

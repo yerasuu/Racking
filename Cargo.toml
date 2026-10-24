@@ -6,6 +6,8 @@ members = ["crates/racking-server", "crates/rack", "crates/racking-mcp"]
 version = "0.1.2"
 edition = "2024"
 rust-version = "1.88"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/yerasuu/Racking"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
