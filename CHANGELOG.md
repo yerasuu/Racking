@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.2
+
+### Client
+- `rack` reads its default `rack.conf` without `RACK_CONFIG`.
+- Suggest a model per job (`--model`); publish capabilities and check them with `send --needs`.
+
+### Service
+- `model` on jobs and `capabilities` in presence.
+
 ## 0.1.1
 
 ### Service
