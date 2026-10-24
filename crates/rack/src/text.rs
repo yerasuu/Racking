@@ -3,7 +3,7 @@
 
 use std::fmt::Write as _;
 
-use crate::client::Job;
+use crate::client::{Agent, Job};
 
 /// Indent of the continuation lines of a multi-line notice or message.
 pub const CONTINUATION: &str = "    ";
@@ -37,6 +37,38 @@ pub fn size(bytes: u64) -> String {
     } else {
         format!("{} KiB", bytes.div_ceil(1024))
     }
+}
+
+/// A duration in the coarsest unit that fits: `12s`, `4 min`, `3 h`, `2 d`.
+pub fn ago(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{} min", secs / 60),
+        3600..86_400 => format!("{} h", secs / 3600),
+        _ => format!("{} d", secs / 86_400),
+    }
+}
+
+/// One line per agent of `GET /agents`, e.g.
+/// `windows online 12s ago, rack 0.1.0, windows: GPU box`. Everything after the
+/// state was written by that agent.
+pub fn agent_line(a: &Agent) -> String {
+    let state = if a.online { "online" } else { "offline" };
+    let mut line = match a.idle_secs {
+        None => format!("{} {state}, never seen", a.name),
+        Some(0) if a.online => format!("{} online now", a.name),
+        Some(idle) => format!("{} {state} {} ago", a.name, ago(idle)),
+    };
+    if let Some(v) = &a.rack_version {
+        let _ = write!(line, ", rack {v}");
+    }
+    if let Some(os) = &a.os {
+        let _ = write!(line, ", {os}");
+    }
+    if let Some(about) = &a.about {
+        let _ = write!(line, ": {about}");
+    }
+    line
 }
 
 /// The line for a notice, message or report someone sent, or `None` for other
@@ -132,6 +164,24 @@ mod tests {
             Some("j7 report from linux: Probe log (12 KiB)")
         );
         assert_eq!(incoming(&job("task", None)), None);
+    }
+
+    #[test]
+    fn agents() {
+        let agent = |v: serde_json::Value| serde_json::from_value::<Agent>(v).expect("agent");
+        let w = agent(serde_json::json!({"name": "windows", "online": true, "idle_secs": 12,
+            "rack_version": "0.1.0", "os": "windows", "about": "GPU box"}));
+        assert_eq!(agent_line(&w), "windows online 12s ago, rack 0.1.0, windows: GPU box");
+        let l = agent(serde_json::json!({"name": "linux", "online": false, "idle_secs": 250}));
+        assert_eq!(agent_line(&l), "linux offline 4 min ago");
+        let n = agent(serde_json::json!({"name": "mac", "online": false, "idle_secs": null}));
+        assert_eq!(agent_line(&n), "mac offline, never seen");
+        let now = agent(serde_json::json!({"name": "mac", "online": true, "idle_secs": 0}));
+        assert_eq!(agent_line(&now), "mac online now");
+        assert_eq!(
+            (ago(59), ago(60), ago(7200), ago(200_000)),
+            ("59s".into(), "1 min".into(), "2 h".into(), "2 d".into())
+        );
     }
 
     #[test]

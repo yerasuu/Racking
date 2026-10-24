@@ -58,13 +58,27 @@ fn main() -> ExitCode {
         }
     };
     tracing::info!(target: "racking_mcp", root = %ctx.root.path().display(), "serving MCP on stdio");
-    match server::serve(io::stdin().lock(), io::stdout(), Arc::new(ctx)) {
+    let ctx = Arc::new(ctx);
+    announce(&ctx);
+    match server::serve(io::stdin().lock(), io::stdout(), ctx) {
         // The writer thread is not joined: once the client closes stdin, nobody reads the replies.
         Ok(_writer) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(target: "racking_mcp", error = %e, "cannot start the stdout writer");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Publishes this server's version and OS for `racking_agents` once, on a
+/// thread of its own so a slow or old Racking server never delays the handshake.
+fn announce(ctx: &Arc<Ctx>) {
+    let ctx = Arc::clone(ctx);
+    let spawned = std::thread::Builder::new()
+        .name("announce".to_owned())
+        .spawn(move || ctx.client.announce(env!("CARGO_PKG_VERSION")));
+    if let Err(e) = spawned {
+        tracing::warn!(target: "racking_mcp", error = %e, "cannot start the announce thread; presence info not sent");
     }
 }
 

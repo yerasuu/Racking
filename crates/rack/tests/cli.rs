@@ -361,3 +361,25 @@ fn say_notify_report_and_pull() {
     let shown = env.ok("windows", &["show", "j4"], None);
     assert!(shown.contains(&"x".repeat(2000)), "show prints the whole report");
 }
+
+#[test]
+fn agents_and_about() {
+    let env = Env::new();
+    let set = env.ok("windows", &["about", "GPU", "box", "on", "the", "desk"], None);
+    assert!(set.starts_with("windows online"), "{set}");
+    let version = env!("CARGO_PKG_VERSION");
+    let os = std::env::consts::OS;
+    let listed = env.ok("linux", &["agents"], None);
+    let lines: Vec<&str> = listed.lines().collect();
+    assert_eq!(lines.len(), 2, "{listed}");
+    assert!(lines[0].starts_with("linux online"), "{listed}");
+    assert!(lines[1].starts_with("windows online"), "{listed}");
+    assert!(
+        lines[1].ends_with(&format!(", rack {version}, {os}: GPU box on the desk")),
+        "rack published its version and OS on start: {listed}"
+    );
+    let cleared = env.ok("windows", &["about", "--clear"], None);
+    assert!(!cleared.contains(':'), "{cleared}");
+    let out = env.rack("windows", &["about"], None);
+    assert_eq!(out.status.code(), Some(2));
+}

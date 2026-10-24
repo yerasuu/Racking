@@ -346,7 +346,7 @@ mod tests {
         assert_eq!(by_id(0)["error"]["code"], INVALID_REQUEST);
         assert_eq!(by_id(1)["result"]["protocolVersion"], "2025-06-18");
         assert_eq!(by_id(1)["result"]["capabilities"]["tools"]["listChanged"], false);
-        assert_eq!(by_id(2)["result"]["tools"].as_array().map(Vec::len), Some(14));
+        assert_eq!(by_id(2)["result"]["tools"].as_array().map(Vec::len), Some(15));
         assert_eq!(by_id(3)["result"], json!({}));
         assert_eq!(by_id(4)["error"]["code"], METHOD_NOT_FOUND);
         assert_eq!(by_id(5)["error"]["code"], INVALID_PARAMS);

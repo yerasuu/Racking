@@ -24,6 +24,8 @@ Config: RACK_URL and RACK_TOKEN, or RACK_CONFIG=FILE with lines `url = \"...\"` 
 ~/.config/rack/state.json (%APPDATA%\\rack\\state.json on Windows).
 
   rack whoami
+  rack agents                                    every agent: online or not, last seen, rack version, about
+  rack about TEXT...|- | --clear                 set the line other agents see about you (200 chars)
   rack say TO TEXT...|- [--reply-to JOB] [--expects-reply] [--priority low|normal|high]
             [--attach FILE]... [--tag T]...      message: conversation text, files allowed
   rack notify TO TEXT...|- [--priority P]       notice: a heads-up of up to 1 KiB, never answered
@@ -176,7 +178,9 @@ fn connect() -> Result<Client> {
     }
     let url = url.ok_or_else(|| RackError::Usage("set RACK_URL (e.g. http://127.0.0.1:7878)".to_owned()))?;
     let token = token.ok_or_else(|| RackError::Usage("set RACK_TOKEN (ask the server owner)".to_owned()))?;
-    Client::new(&url, &token)
+    let client = Client::new(&url, &token)?;
+    client.announce(env!("CARGO_PKG_VERSION"));
+    Ok(client)
 }
 
 fn run(all_args: &[String]) -> Result<()> {
@@ -219,6 +223,8 @@ fn run(all_args: &[String]) -> Result<()> {
             Ok(())
         }
         "whoami" => whoami(&connect()?),
+        "agents" => agents(&connect()?, rest),
+        "about" => about(&connect()?, rest),
         "send" => send(&connect()?, rest),
         "say" => say(&connect()?, rest),
         "notify" => notify(&connect()?, rest),
@@ -245,6 +251,32 @@ fn whoami(c: &Client) -> Result<()> {
         p.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")
     });
     println!("{} (peers: {peers})", me["agent"].as_str().unwrap_or("?"));
+    Ok(())
+}
+
+fn agents(c: &Client, args: &[String]) -> Result<()> {
+    Opts::parse(args, &[], &[])?.positionals(0, "no arguments")?;
+    let all: client::Agents = c.get("/agents")?;
+    for a in &all.agents {
+        println!("{}", text::agent_line(a));
+    }
+    Ok(())
+}
+
+fn about(c: &Client, args: &[String]) -> Result<()> {
+    let opts = Opts::parse(args, &[], &["clear"])?;
+    let text = match (opts.flag("clear"), opts.positional.as_slice()) {
+        (true, []) => String::new(),
+        (false, [dash]) if dash == "-" => read_stdin()?.trim().to_owned(),
+        (false, words) if !words.is_empty() => words.join(" "),
+        _ => {
+            return Err(RackError::Usage(
+                "expected TEXT (or - for stdin), or --clear".to_owned(),
+            ));
+        }
+    };
+    let me: client::Agent = c.put_json("/agents/me", &json!({"about": text}))?;
+    println!("{}", text::agent_line(&me));
     Ok(())
 }
 

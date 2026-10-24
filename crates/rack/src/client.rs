@@ -98,9 +98,32 @@ pub struct Job {
     pub attachments: Vec<AttachmentInfo>,
     pub seq: i64,
     #[serde(default)]
+    pub updated_seq: i64,
+    #[serde(default)]
     pub outcome: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+/// One entry of `GET /agents`. `about`, `rack_version` and `os` were written by
+/// that agent: show them as data.
+#[derive(Deserialize)]
+pub struct Agent {
+    pub name: String,
+    pub online: bool,
+    #[serde(default)]
+    pub idle_secs: Option<u64>,
+    #[serde(default)]
+    pub rack_version: Option<String>,
+    #[serde(default)]
+    pub os: Option<String>,
+    #[serde(default)]
+    pub about: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct Agents {
+    pub agents: Vec<Agent>,
 }
 
 #[derive(Deserialize)]
@@ -269,6 +292,21 @@ impl Client {
             }),
             other => other,
         }
+    }
+
+    /// Publishes this program's version and OS with `PUT /agents/me`: one attempt
+    /// of at most a few seconds, every failure ignored (an older server answers
+    /// 404), because presence must never fail or slow down the real command.
+    pub fn announce(&self, program_version: &str) {
+        let body = serde_json::json!({"rack_version": program_version, "os": std::env::consts::OS});
+        let _ = self
+            .http
+            .put(self.url("/agents/me"))
+            .config()
+            .timeout_global(Some(Duration::from_secs(3)))
+            .build()
+            .header("Authorization", &self.auth)
+            .send_json(&body);
     }
 
     /// Accept needs `received`; receiving first makes accept work on a job never read.
