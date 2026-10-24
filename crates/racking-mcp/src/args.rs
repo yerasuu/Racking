@@ -206,6 +206,23 @@ pub struct Say {
     pub attachments: Vec<String>,
 }
 
+/// Either `to` and `text` (a new question) or `resume` alone (wait again for
+/// the reply to an earlier one); the handler checks which.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Ask {
+    pub to: Option<String>,
+    pub text: Option<String>,
+    pub resume: Option<JobId>,
+    #[serde(default)]
+    pub timeout: WaitSecs,
+    pub priority: Option<Priority>,
+    #[serde(default)]
+    pub attachments: Vec<String>,
+    #[serde(default)]
+    pub since: u64,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Notify {
@@ -355,6 +372,15 @@ mod tests {
         assert!(parse::<SendJob>(json!({"to": "w", "title": "t", "kind": "order"})).is_err());
         assert!(parse::<SendJob>(json!({"to": "w", "title": "t", "origin": {"repo": "r"}})).is_err());
         assert!(parse::<SendJob>(json!({"to": "w", "title": "t", "priority": "urgent"})).is_err());
+    }
+
+    #[test]
+    fn ask_arguments() {
+        let a: Ask = parse(json!({"to": "w", "text": "hi"})).expect("question");
+        assert_eq!((a.timeout.get(), a.since), (WaitSecs::DEFAULT, 0));
+        assert!(parse::<Ask>(json!({"resume": "j4", "timeout": 25})).is_ok());
+        assert!(parse::<Ask>(json!({"resume": "4"})).is_err());
+        assert!(parse::<Ask>(json!({"to": "w", "text": "hi", "timeout": 26})).is_err());
     }
 
     #[test]

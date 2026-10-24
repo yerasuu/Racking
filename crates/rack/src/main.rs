@@ -8,6 +8,7 @@ mod update;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -29,6 +30,10 @@ Config: RACK_URL and RACK_TOKEN, or RACK_CONFIG=FILE with lines `url = \"...\"` 
   rack say TO TEXT...|- [--reply-to JOB] [--expects-reply] [--priority low|normal|high]
             [--attach FILE]... [--tag T]...      message: conversation text, files allowed
   rack notify TO TEXT...|- [--priority P]       notice: a heads-up of up to 1 KiB, never answered
+  rack ask TO TEXT...|- [--timeout SECS] [--attach FILE]... [--priority P]
+                                                 message expecting a reply; blocks until it comes
+                                                 (default 60 s); exit 0 with the job id if it does not
+  rack ask --resume JOB [--timeout SECS]         wait again for the reply to JOB
   rack report TO TITLE [--file PATH|--body TEXT|-] [--attach FILE]... [--priority P]
             [--expects-reply] [--tag T]...       report: findings to read later, up to 1 MiB
   rack send TO TITLE [--body TEXT|-] [--tag T]... [--origin REPO#ID] [--attach FILE]...
@@ -228,6 +233,7 @@ fn run(all_args: &[String]) -> Result<()> {
         "send" => send(&connect()?, rest),
         "say" => say(&connect()?, rest),
         "notify" => notify(&connect()?, rest),
+        "ask" => ask(&connect()?, rest, &state_path()?),
         "report" => report(&connect()?, rest),
         "inbox" => inbox(&connect()?, rest),
         "wait" => wait(&connect()?, rest, &state_path()?),
@@ -379,6 +385,56 @@ fn notify(c: &Client, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn ask(c: &Client, args: &[String], state_path: &Path) -> Result<()> {
+    let opts = Opts::parse(args, &["timeout", "attach", "priority", "resume"], &[])?;
+    let timeout = opts.number("timeout")?.unwrap_or(60);
+    let mut st = State::load(state_path)?;
+    let asked = match opts.value("resume") {
+        Some(id) => {
+            if !opts.positional.is_empty() || opts.value("attach").is_some() || opts.value("priority").is_some() {
+                return Err(RackError::Usage(
+                    "--resume JOB takes only --timeout; the message was sent already".to_owned(),
+                ));
+            }
+            let job: Job = c.get(&format!("/jobs/{}", job_id(id)?))?;
+            if !job.expects_reply || !text::is_delivery(&job.kind) {
+                return Err(RackError::Usage(format!(
+                    "{} is a {} that expects no reply; `rack ask --resume` waits for replies to `rack ask`",
+                    job.id, job.kind
+                )));
+            }
+            job
+        }
+        None => {
+            let (to, body) = to_and_text(&opts)?;
+            if let Some(warning) = rack::ask::absence(c, to) {
+                eprintln!("rack: {warning}; sending anyway");
+            }
+            let mut job = json!({"to": to, "kind": "message", "body": body, "expects_reply": true});
+            common_fields(&mut job, &opts);
+            let files: Vec<&str> = opts.all("attach").collect();
+            create_and_attach(c, &job, &files)?.0
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(timeout.unsigned_abs());
+    let Some(found) = rack::ask::wait_reply(c, &asked, st.inbox_since, deadline)? else {
+        println!(
+            "{} sent to {}, no reply yet (still waiting: rack wait / rack show {})",
+            asked.id, asked.to, asked.id
+        );
+        return Ok(());
+    };
+    for j in &found.earlier {
+        println!("{}", incoming_line(j));
+    }
+    println!("{}", incoming_line(&found.reply));
+    if found.after_cursor {
+        st.inbox_since = found.reply.seq;
+        st.save(state_path)?;
+    }
+    Ok(())
+}
+
 fn report(c: &Client, args: &[String]) -> Result<()> {
     let opts = Opts::parse(args, &["file", "body", "attach", "priority", "tag"], &["expects-reply"])?;
     let [to, title] = opts.positionals(2, "TO and TITLE (quote a title with spaces)")? else {
@@ -470,13 +526,17 @@ enum Direction {
     Out,
 }
 
-/// Incoming notices, messages and reports print with their text (see `text::incoming`);
-/// everything else, and the outbox, as a state line.
+/// An incoming notice, message or report with its text (see `text::incoming`); anything else as a state line.
+fn incoming_line(j: &Job) -> String {
+    text::incoming(j).unwrap_or_else(|| summary_line(j, Direction::In))
+}
+
+/// Incoming jobs as `incoming_line`; the outbox as state lines.
 fn print_listing(l: &Listing, direction: Direction) {
     for j in &l.jobs {
-        match (direction, text::incoming(j)) {
-            (Direction::In, Some(line)) => println!("{line}"),
-            _ => println!("{}", summary_line(j, direction)),
+        match direction {
+            Direction::In => println!("{}", incoming_line(j)),
+            Direction::Out => println!("{}", summary_line(j, direction)),
         }
     }
     println!("next {}", l.next);

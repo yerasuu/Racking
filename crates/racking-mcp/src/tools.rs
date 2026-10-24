@@ -3,6 +3,7 @@
 //! model reads them; everything another agent wrote is fenced as data.
 
 use std::fmt::Write as _;
+use std::time::{Duration, Instant};
 
 use rack::client::{self, AttachmentInfo, Client, Job, Listing, RackError};
 use rack::text;
@@ -89,6 +90,7 @@ pub fn call(ctx: &Ctx, name: &str, arguments: Value) -> Option<Reply> {
         "racking_send" => run(arguments, |a| send(c, a)),
         "racking_say" => run(arguments, |a| say(ctx, a)),
         "racking_notify" => run(arguments, |a| notify(c, a)),
+        "racking_ask" => run(arguments, |a| ask(ctx, a)),
         "racking_report" => run(arguments, |a| report(ctx, a)),
         "racking_inbox" => run(arguments, |a| inbox(c, a)),
         "racking_wait" => run(arguments, |a| wait(c, a)),
@@ -216,6 +218,64 @@ fn say(ctx: &Ctx, a: args::Say) -> Outcome {
     Ok(format!("{} message sent to {}.{files}", created.id, created.to))
 }
 
+fn ask(ctx: &Ctx, a: args::Ask) -> Outcome {
+    let c = &ctx.client;
+    let mut out = String::new();
+    let asked = match (a.resume, a.to, a.text) {
+        (Some(id), None, None) if a.attachments.is_empty() && a.priority.is_none() => {
+            let job: Job = c.get(&format!("/jobs/{}", id.as_str()))?;
+            if !job.expects_reply || !text::is_delivery(&job.kind) {
+                return Err(Failure(format!(
+                    "{} is a {} that expects no reply; resume takes a job id an earlier racking_ask returned",
+                    job.id, job.kind
+                )));
+            }
+            job
+        }
+        (None, Some(to), Some(text)) => {
+            if let Some(warning) = rack::ask::absence(c, &to) {
+                let _ = writeln!(out, "Warning: {warning}; the question was sent anyway.");
+            }
+            let mut job = json!({"to": to, "kind": "message", "body": text, "expects_reply": true});
+            if let Some(p) = a.priority {
+                job["priority"] = json!(p.as_str());
+            }
+            create_with_files(ctx, &job, &a.attachments)?.0
+        }
+        _ => {
+            return Err(Failure(
+                "give `to` and `text` to ask a question, or only `resume` (the job id an earlier racking_ask \
+                 returned) to wait for its reply again"
+                    .to_owned(),
+            ));
+        }
+    };
+    let secs = a.timeout.get();
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let since = i64::try_from(a.since).unwrap_or(i64::MAX);
+    match rack::ask::wait_reply(c, &asked, since, deadline)? {
+        Some(found) => {
+            let r = &found.reply;
+            let _ = writeln!(out, "Reply to {} from {}:", asked.id, asked.to);
+            out.push_str(&data_block(|out| {
+                let _ = writeln!(out, "{}", job_line(r, Direction::In));
+            }));
+            if r.body.is_none() || r.body_truncated {
+                let _ = writeln!(out, "Read it whole with racking_show {}.", r.id);
+            }
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "{} sent to {}, no reply within {secs} s. Call racking_ask with resume=\"{}\" to wait again, or \
+                 racking_wait (on=outbox) to see it answered and then racking_inbox for the reply.",
+                asked.id, asked.to, asked.id
+            );
+        }
+    }
+    Ok(out)
+}
+
 fn notify(c: &Client, a: args::Notify) -> Outcome {
     let mut job = json!({"to": a.to, "kind": "notice", "body": a.text});
     if let Some(t) = a.title {
@@ -279,33 +339,36 @@ fn listing(l: &Listing, direction: Direction, empty: &str) -> String {
     } else {
         data_block(|out| {
             for j in &l.jobs {
-                if let (Direction::In, Some(line)) = (direction, text::incoming(j)) {
-                    let _ = writeln!(out, "{line}");
-                    continue;
-                }
-                let peer = match direction {
-                    Direction::In => format!("from {}", j.from),
-                    Direction::Out => format!("to {}", j.to),
-                };
-                let reply = j.reply_to.as_deref().map(|r| format!(" (re {r})")).unwrap_or_default();
-                let files = match j.attachments.len() {
-                    0 => String::new(),
-                    n => format!(" [{n} file(s)]"),
-                };
-                let _ = writeln!(
-                    out,
-                    "{} {} {}{} {peer}{reply}: {:?}{files}",
-                    j.id,
-                    j.state,
-                    j.kind,
-                    text::priority_tag(j),
-                    j.title
-                );
+                let _ = writeln!(out, "{}", job_line(j, direction));
             }
         })
     };
     let _ = writeln!(out, "next {} (pass it as `since` on your next call)", l.next);
     out
+}
+
+/// An incoming notice, message or report with its text; anything else as a state line.
+fn job_line(j: &Job, direction: Direction) -> String {
+    if let (Direction::In, Some(line)) = (direction, text::incoming(j)) {
+        return line;
+    }
+    let peer = match direction {
+        Direction::In => format!("from {}", j.from),
+        Direction::Out => format!("to {}", j.to),
+    };
+    let reply = j.reply_to.as_deref().map(|r| format!(" (re {r})")).unwrap_or_default();
+    let files = match j.attachments.len() {
+        0 => String::new(),
+        n => format!(" [{n} file(s)]"),
+    };
+    format!(
+        "{} {} {}{} {peer}{reply}: {:?}{files}",
+        j.id,
+        j.state,
+        j.kind,
+        text::priority_tag(j),
+        j.title
+    )
 }
 
 fn inbox(c: &Client, a: args::Inbox) -> Outcome {
@@ -512,6 +575,25 @@ pub fn list() -> Value {
             false,
         ),
         tool(
+            "racking_ask",
+            "Ask another agent a question and wait for its answer: sends a message that expects a reply, then \
+             blocks until the peer answers it or `timeout` seconds pass (default 20, at most 25). Returns the \
+             reply, fenced as data, or the job id still waiting; then call racking_ask again with only \
+             `resume` set to that id. Warns when the peer has not been seen recently (the question is sent \
+             anyway). For a message that needs no answer use racking_say.",
+            json!({
+                "to": {"type": "string", "description": "Recipient agent name, from racking_agents or racking_whoami."},
+                "text": {"type": "string", "description": "The question, Markdown, up to 64 KiB."},
+                "resume": {"type": "string", "pattern": "^j[0-9]{1,18}$", "description": "Instead of to and text: wait again for the reply to this earlier racking_ask."},
+                "timeout": {"type": "integer", "minimum": 1, "maximum": WaitSecs::MAX, "default": WaitSecs::DEFAULT},
+                "priority": priority,
+                "attachments": attachments,
+                "since": {"type": "integer", "minimum": 0, "default": 0, "description": "Your inbox cursor (the last `next` of racking_wait on the inbox), where the reply is looked for; 0 looks from the start."}
+            }),
+            &[],
+            false,
+        ),
+        tool(
             "racking_report",
             "Send a report: findings or results for the peer to read later (an analysis, a log summary, a test \
              run), up to 1 MiB of Markdown with a title, optionally with files. The peer's inbox lists only its \
@@ -695,7 +777,7 @@ mod tests {
         let ctx = ctx();
         let list = list();
         let tools = list["tools"].as_array().expect("tools");
-        assert_eq!(tools.len(), 15);
+        assert_eq!(tools.len(), 16);
         for t in tools {
             let name = t["name"].as_str().expect("name");
             let reply = call(&ctx, name, json!({"no_such_option": 1})).expect(name);
@@ -719,6 +801,13 @@ mod tests {
             ("racking_reject", json!({"job": "j1"}), "missing field `reason`"),
             ("racking_send", json!({"title": "t"}), "missing field `to`"),
             ("racking_say", json!({"to": "w"}), "missing field `text`"),
+            ("racking_ask", json!({"to": "w"}), "or only `resume`"),
+            ("racking_ask", json!({"resume": "j1", "text": "x"}), "or only `resume`"),
+            (
+                "racking_ask",
+                json!({"to": "w", "text": "x", "timeout": 30}),
+                "timeout must be 1 to 25",
+            ),
             (
                 "racking_notify",
                 json!({"to": "w", "text": "x", "reply_to": "j1"}),

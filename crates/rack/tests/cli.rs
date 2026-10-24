@@ -33,6 +33,10 @@ struct Env {
 
 impl Env {
     fn new() -> Self {
+        Self::with_clock(racking_server::Clock::system())
+    }
+
+    fn with_clock(clock: racking_server::Clock) -> Self {
         static RUNS: AtomicUsize = AtomicUsize::new(0);
         let run = RUNS.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!("rack-cli-{}-{run}", std::process::id()));
@@ -47,7 +51,7 @@ impl Env {
             root.join("data").display().to_string()
         ))
         .expect("config");
-        let server = racking_server::start(&config).expect("start");
+        let server = racking_server::start_with_clock(&config, clock).expect("start");
         let url = format!("http://{}", server.addr());
         Self {
             root,
@@ -382,4 +386,67 @@ fn agents_and_about() {
     assert!(!cleared.contains(':'), "{cleared}");
     let out = env.rack("windows", &["about"], None);
     assert_eq!(out.status.code(), Some(2));
+}
+
+/// Answers the first message past `since` in windows's inbox with `text`, from another client.
+fn answer_next(url: &str, since: i64, text: &str) -> std::thread::JoinHandle<String> {
+    let (url, text) = (url.to_owned(), text.to_owned());
+    std::thread::spawn(move || {
+        let c = rack::client::Client::new(&url, WINDOWS).expect("client");
+        let l: rack::client::Listing = c.get(&format!("/inbox/wait?since={since}&timeout=20")).expect("wait");
+        let asked = l.jobs.first().expect("a message arrived");
+        let reply = serde_json::json!({"to": "linux", "kind": "message", "body": text, "reply_to": asked.id});
+        c.create_job(&reply).expect("reply").id
+    })
+}
+
+#[test]
+fn ask_waits_for_the_reply() {
+    let clock = racking_server::Clock::manual(1_800_000_000);
+    let env = Env::with_clock(clock.clone());
+
+    // Windows was seen 4 min ago: the question still goes, after a warning, and times out with exit 0.
+    env.ok("windows", &["whoami"], None);
+    clock.advance(240);
+    let out = env.rack(
+        "linux",
+        &["ask", "windows", "Are", "you", "there?", "--timeout", "1"],
+        None,
+    );
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert_eq!(stderr, "rack: windows has not been seen for 4 min; sending anyway\n");
+    assert_eq!(
+        stdout,
+        "j1 sent to windows, no reply yet (still waiting: rack wait / rack show j1)\n"
+    );
+
+    // A second client answers while `rack ask` blocks; the reply is the only line.
+    let answering = answer_next(&env.url, 1, "fix/vulkan-probe\nrebased on main");
+    let got = env.ok(
+        "linux",
+        &["ask", "windows", "Which", "branch?", "--timeout", "20"],
+        None,
+    );
+    assert_eq!(answering.join().expect("answer"), "j3");
+    assert_eq!(
+        got,
+        "j3 message from windows (re j2): fix/vulkan-probe\n    rebased on main\n"
+    );
+    assert_eq!(
+        env.ok("linux", &["wait", "--timeout", "0"], None),
+        "next 1\n",
+        "ask moved the inbox cursor past the reply it showed"
+    );
+
+    // Late answer to j1: --resume picks it up.
+    let late = answer_next(&env.url, 0, "yes, now");
+    assert_eq!(late.join().expect("answer"), "j4");
+    let resumed = env.ok("linux", &["ask", "--resume", "j1", "--timeout", "5"], None);
+    assert_eq!(resumed, "j4 message from windows (re j1): yes, now\n");
+    let refused = env.rack("linux", &["ask", "--resume", "j3"], None);
+    assert_eq!(refused.status.code(), Some(2), "j3 expects no reply");
 }
