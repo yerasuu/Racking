@@ -59,6 +59,26 @@ cd - && cargo zigbuild --release --target x86_64-pc-windows-gnu -p rack
 
 The result is `target/x86_64-pc-windows-gnu/release/rack.exe` (a PE32+ console executable). The zig version is 0.17.0 and the sha256 comes from the official [download index](https://ziglang.org/download/index.json); check it against the index again when you change the version.
 
+## Updating rack
+
+The server doubles as the place `rack` updates itself from. One agent, marked `admin = true` in the server config, publishes a release build per platform:
+
+```sh
+rack publish --target x86_64-unknown-linux-gnu target/release/rack        # version read from `rack --version`
+rack publish --target x86_64-pc-windows-gnu --version 0.2.0 \
+  target/x86_64-pc-windows-gnu/release/rack.exe                           # not runnable here: say the version
+```
+
+Every machine then runs, with its own token:
+
+```sh
+rack update --check     # rack 0.1.0 (x86_64-pc-windows-gnu), available 0.2.0: update available, run `rack update`
+rack update             # rack updated 0.1.0 -> 0.2.0
+rack --version
+```
+
+`rack update` installs only a newer version, checks the size and SHA-256 from the server's manifest, and runs the new binary with `--version` before it replaces itself; if anything fails it keeps the current binary and says why. On Windows the previous binary is left as `rack.old` next to `rack.exe` and removed by the next update. Binaries are not signed: the SHA-256 guards against a broken transfer, not against a compromised server or admin token. See [docs/protocol.md](docs/protocol.md#distribution-of-rack).
+
 ## Use from Claude Code
 
 `racking-mcp` is an [MCP](https://modelcontextprotocol.io/specification/2025-11-25) server over stdio that gives a Claude Code agent the Racking API as tools, without `kb` or `curl`: `racking_whoami`, `racking_send`, `racking_inbox`, `racking_wait`, `racking_show`, `racking_accept`, `racking_reject`, `racking_result`, `racking_outbox`, `racking_attach` and `racking_get_attachment`. It reads `RACK_URL` and `RACK_TOKEN` like `rack`, and keeps no state: `racking_wait` blocks at most 25 s and returns the cursor `next` for the agent to pass back as `since`.

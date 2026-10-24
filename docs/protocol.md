@@ -111,6 +111,9 @@ All need the Bearer token, except `GET /` and `GET /help` (they show no data).
 | `GET /outbox/wait` | Block until the state of one of my sent jobs changes. Uses `updated_seq`, see below. |
 | `GET /links` | Id correspondence kept by the service (see below). |
 | `PUT /links/{job_id}` | Record the local entry made for a job. Recipient only. |
+| `GET /dist/manifest` | The `rack` binaries published for `rack update` (see below). |
+| `GET /dist/{target}/{file}` | Download one. `file` is `rack` or the manifest's `file`. |
+| `PUT /dist/{target}/{file}` | Publish one (raw body, `X-Sha256`, `X-Version`). Admin agents only. |
 
 Results and comments are jobs too: `POST /jobs` with `kind` `result` and `reply_to`. There is no separate endpoint.
 
@@ -137,7 +140,8 @@ Error:
 | 400 | `bad_request` | Malformed JSON or field out of range. `message` names the field. |
 | 401 | `no_token` / `bad_token` | Missing or unknown token. Hint: ask the owner for a token. |
 | 403 | `not_yours` | Job belongs to other agents. |
-| 404 | `not_found` | No such job, attachment or agent. |
+| 403 | `not_admin` | Publishing a `rack` binary needs an agent with `admin = true`. |
+| 404 | `not_found` | No such job, attachment, agent or published binary. |
 | 409 | `bad_transition` | State move not allowed. |
 | 409 | `attachments_locked` | Job already received. |
 | 413 | `too_large` | Body or file over the limit. Hint names the limit. |
@@ -146,6 +150,19 @@ Error:
 | 429 | `rate_limited` | Too many requests in flight, or the same `Idempotency-Key` still running. Hint carries `Retry-After`. |
 | 500 | `internal` | Storage or disk failure. Details go to the server log only. |
 | 503 | `shutting_down` | Retry later. |
+
+## Distribution of `rack`
+
+The service is also where `rack update` gets new `rack` binaries (decision #21). It keeps the latest binary per target and serves it to any agent with a token; nothing is reachable without one.
+
+- Targets are a fixed list of Rust target triples: `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-gnu`, `aarch64-unknown-linux-gnu`. Any other answers `400 bad_request`.
+- `GET /dist/manifest` answers `{"version": "0.2.0", "targets": {"x86_64-pc-windows-gnu": {"version": "0.2.0", "file": "rack.exe", "size": 4718592, "sha256": "..."}}}`. The top `version` is the one published last (`null` while nothing is); each target carries its own, since targets may be published at different times.
+- `GET /dist/{target}/{file}` streams the binary with `X-Sha256`. `file` is `rack` or the target's own name (`rack.exe` on Windows).
+- `PUT /dist/{target}/{file}` publishes: raw body, `X-Sha256` (checked, `422 checksum_mismatch` if it differs) and `X-Version`, a [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html) version. Only an agent marked `admin = true` in the server config may publish (`403 not_admin` otherwise). Limit 32 MiB. The upload replaces the target's binary with an atomic rename; older versions are not kept.
+
+Integrity is the SHA-256 in the manifest only; binaries are not signed. Whoever controls the service (or an admin token) controls what `rack update` installs.
+
+`rack update` reads the manifest, takes the entry of the target it was built for, and installs it only if its version is newer by semver precedence. It checks size and SHA-256, runs the new file with `--version` and requires it to print `rack <version>`, then replaces itself (Unix: rename over the executable; Windows: the running `rack.exe` moves to `rack.old`, the new one takes its name, and the old one is moved back if that fails). On any failure the old binary stays.
 
 ## Id correspondence
 

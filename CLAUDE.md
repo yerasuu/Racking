@@ -4,8 +4,9 @@ Cargo workspace: `crates/racking-server` (lib + binary), `crates/rack` (HTTP cli
 binary) and `crates/racking-mcp` (MCP stdio server on top of `rack::client`).
 `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt`
 (`max_width = 120`) before each commit. Tests run the server in-process on `127.0.0.1:0`; `rack`
-tests use a fake `kb` on PATH, never a real board; `racking-mcp` tests spawn the real binary over
-pipes. In `racking-mcp`, stdout is the protocol channel: log with `tracing` (stderr), never print. Never commit a real config: only `config.example.toml` with placeholders.
+tests use a fake `kb` on PATH, never a real board; `rack`'s `tests/update.rs` updates a copy of the
+built `rack` in a temp dir with fake `rack` shell scripts (one test function, so no parallel fork
+holds a just-written executable open); `racking-mcp` tests spawn the real binary over pipes. In `racking-mcp`, stdout is the protocol channel: log with `tracing` (stderr), never print. Never commit a real config: only `config.example.toml` with placeholders.
 
 <!-- kanbrain:start -->
 ## Project memory: kanbrain
