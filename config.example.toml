@@ -1,0 +1,18 @@
+# Racking server configuration. Copy it outside the repository, fill in real
+# tokens and start with: racking-server --config /path/to/racking.toml
+# The server refuses tokens shorter than 24 chars or still containing CHANGE-ME.
+# Generate one with: openssl rand -hex 32
+
+# Loopback by default. Set the machine's LAN address (e.g. "192.168.1.20:7878")
+# only once the owner decides the service should be reachable on the network.
+bind = "127.0.0.1:7878"
+
+# SQLite database and attachment files live here.
+data_dir = "/var/lib/racking"
+
+# One section per agent; the section name is the agent name ([a-z0-9][a-z0-9-]{0,31}).
+[agents.linux]
+token = "CHANGE-ME-linux-token"
+
+[agents.windows]
+token = "CHANGE-ME-windows-token"

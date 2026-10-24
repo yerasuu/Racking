@@ -3,7 +3,6 @@ name = "rack"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
 
 [dependencies]
 ureq = { version = "3", default-features = false, features = ["json"] }

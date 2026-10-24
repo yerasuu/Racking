@@ -6,7 +6,6 @@ members = ["crates/racking-server", "crates/rack"]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-license = "MIT"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
