@@ -64,7 +64,10 @@ pub struct AttachmentInfo {
     pub sha256: String,
 }
 
-/// A job as the server returns it; `body` is present only on `GET /jobs/{id}`.
+/// A job as the server returns it. `body` is present on `GET /jobs/{id}`, and in
+/// listings for notices and messages up to 4 KiB; other listed jobs carry
+/// `body_preview`. Fields added with notices, messages and reports default, so
+/// answers from an older server still parse.
 #[derive(Deserialize)]
 pub struct Job {
     pub id: String,
@@ -74,6 +77,16 @@ pub struct Job {
     pub title: String,
     #[serde(default)]
     pub body: Option<String>,
+    #[serde(default)]
+    pub body_preview: Option<String>,
+    #[serde(default)]
+    pub body_size: u64,
+    #[serde(default)]
+    pub body_truncated: bool,
+    #[serde(default)]
+    pub priority: Option<String>,
+    #[serde(default)]
+    pub expects_reply: bool,
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
@@ -235,6 +248,27 @@ impl Client {
             actual: hex(&hasher.finalize()),
             size,
         })
+    }
+
+    /// `POST /jobs`. A server from before notices, messages and reports refuses
+    /// those kinds with a 400 on `kind`; that answer gets a hint saying so.
+    pub fn create_job(&self, job: &Value) -> Result<Job> {
+        match self.post("/jobs", Some(job)) {
+            Err(RackError::Api {
+                status: 400,
+                code,
+                message,
+                ..
+            }) if message.starts_with("kind:") => Err(RackError::Api {
+                status: 400,
+                code,
+                message,
+                hint: "This Racking server predates notices, messages and reports; update racking-server, \
+                       or send a task instead."
+                    .to_owned(),
+            }),
+            other => other,
+        }
     }
 
     /// Accept needs `received`; receiving first makes accept work on a job never read.

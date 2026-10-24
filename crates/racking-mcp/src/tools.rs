@@ -4,7 +4,8 @@
 
 use std::fmt::Write as _;
 
-use rack::client::{self, Client, Job, Listing, RackError};
+use rack::client::{self, AttachmentInfo, Client, Job, Listing, RackError};
+use rack::text;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
@@ -85,6 +86,9 @@ pub fn call(ctx: &Ctx, name: &str, arguments: Value) -> Option<Reply> {
     let reply = match name {
         "racking_whoami" => run(arguments, |_: args::NoArgs| whoami(ctx)),
         "racking_send" => run(arguments, |a| send(c, a)),
+        "racking_say" => run(arguments, |a| say(ctx, a)),
+        "racking_notify" => run(arguments, |a| notify(c, a)),
+        "racking_report" => run(arguments, |a| report(ctx, a)),
         "racking_inbox" => run(arguments, |a| inbox(c, a)),
         "racking_wait" => run(arguments, |a| wait(c, a)),
         "racking_show" => run(arguments, |a| show(c, a)),
@@ -118,12 +122,14 @@ fn whoami(ctx: &Ctx) -> Outcome {
     });
     let limits = &me["limits"];
     Ok(format!(
-        "You are agent {}. Peers you can send to: {peers}.\nLimits: title {} chars, body {} bytes, \
-         {} tags, {} files of {} bytes per job; racking_wait blocks at most {} s.\n\
+        "You are agent {}. Peers you can send to: {peers}.\nLimits: title {} chars, body {} bytes \
+         (notice {}, report {}), {} tags, {} files of {} bytes per job; racking_wait blocks at most {} s.\n\
          Root directory for racking_attach and racking_get_attachment: {}",
         me["agent"].as_str().unwrap_or("?"),
         limits["title_chars"],
         limits["body_bytes"],
+        limits["notice_bytes"],
+        limits["report_bytes"],
         limits["tags"],
         limits["files_per_job"],
         limits["file_bytes"],
@@ -146,10 +152,104 @@ fn send(c: &Client, a: args::SendJob) -> Outcome {
     if let Some(o) = a.outcome {
         job["outcome"] = json!(o.to_client().as_str());
     }
-    let created: Job = c.post("/jobs", Some(&job))?;
+    if let Some(p) = a.priority {
+        job["priority"] = json!(p.as_str());
+    }
+    let created = c.create_job(&job)?;
     Ok(format!(
         "{} {} sent to {} (state {}). Attach files with racking_attach while it is still sent.",
         created.id, created.kind, created.to, created.state
+    ))
+}
+
+/// Creates `job`, then uploads `attachments` (paths under the root) to it. A
+/// failed upload leaves the job sent, so the error says how to finish.
+fn create_with_files(ctx: &Ctx, job: &Value, attachments: &[String]) -> Result<(Job, String), Failure> {
+    let created = ctx.client.create_job(job)?;
+    let mut files = String::new();
+    for path in attachments {
+        match upload(ctx, &created.id, path) {
+            Ok(info) => {
+                let _ = write!(files, " Attached {} ({} bytes).", info.name, info.size);
+            }
+            Err(Failure(e)) => {
+                return Err(Failure(format!(
+                    "{} was sent to {}, but {path} was not attached: {e}\nRetry with racking_attach while it is \
+                     still sent.",
+                    created.id, created.to
+                )));
+            }
+        }
+    }
+    Ok((created, files))
+}
+
+fn say(ctx: &Ctx, a: args::Say) -> Outcome {
+    let mut job = json!({"to": a.to, "kind": "message", "body": a.text, "tags": a.tags});
+    if let Some(t) = a.title {
+        job["title"] = json!(t);
+    }
+    if let Some(r) = a.reply_to {
+        job["reply_to"] = json!(r.as_str());
+    }
+    if let Some(e) = a.expects_reply {
+        job["expects_reply"] = json!(e);
+    }
+    if let Some(p) = a.priority {
+        job["priority"] = json!(p.as_str());
+    }
+    let (created, files) = create_with_files(ctx, &job, &a.attachments)?;
+    Ok(format!("{} message sent to {}.{files}", created.id, created.to))
+}
+
+fn notify(c: &Client, a: args::Notify) -> Outcome {
+    let mut job = json!({"to": a.to, "kind": "notice", "body": a.text});
+    if let Some(t) = a.title {
+        job["title"] = json!(t);
+    }
+    if let Some(p) = a.priority {
+        job["priority"] = json!(p.as_str());
+    }
+    let created = c.create_job(&job)?;
+    Ok(format!("{} notice sent to {}.", created.id, created.to))
+}
+
+/// The server's report limit, checked before reading a file so a huge one is never loaded.
+const REPORT_BYTES: u64 = 1024 * 1024;
+
+fn report(ctx: &Ctx, a: args::Report) -> Outcome {
+    let body = match (a.body, a.path) {
+        (Some(body), None) => body,
+        (None, Some(path)) => {
+            let file = ctx.root.file_to_send(&path)?;
+            if file.len > REPORT_BYTES {
+                return Err(Failure(format!(
+                    "{path} is {} bytes, over the {REPORT_BYTES} a report may hold; attach it instead",
+                    file.len
+                )));
+            }
+            std::fs::read_to_string(&file.path)
+                .map_err(|e| Failure(format!("cannot read {path} as UTF-8 text: {e}; attach it instead")))?
+        }
+        (Some(_), Some(_)) | (None, None) => {
+            return Err(Failure(
+                "give the report text as `body` or as a file `path`, exactly one".to_owned(),
+            ));
+        }
+    };
+    let mut job = json!({"to": a.to, "kind": "report", "title": a.title, "body": body, "tags": a.tags});
+    if let Some(e) = a.expects_reply {
+        job["expects_reply"] = json!(e);
+    }
+    if let Some(p) = a.priority {
+        job["priority"] = json!(p.as_str());
+    }
+    let (created, files) = create_with_files(ctx, &job, &a.attachments)?;
+    Ok(format!(
+        "{} report sent to {} ({}).{files}",
+        created.id,
+        created.to,
+        text::size(created.body_size)
     ))
 }
 
@@ -165,6 +265,10 @@ fn listing(l: &Listing, direction: Direction, empty: &str) -> String {
     } else {
         data_block(|out| {
             for j in &l.jobs {
+                if let (Direction::In, Some(line)) = (direction, text::incoming(j)) {
+                    let _ = writeln!(out, "{line}");
+                    continue;
+                }
                 let peer = match direction {
                     Direction::In => format!("from {}", j.from),
                     Direction::Out => format!("to {}", j.to),
@@ -176,8 +280,12 @@ fn listing(l: &Listing, direction: Direction, empty: &str) -> String {
                 };
                 let _ = writeln!(
                     out,
-                    "{} {} {} {peer}{reply}: {:?}{files}",
-                    j.id, j.state, j.kind, j.title
+                    "{} {} {}{} {peer}{reply}: {:?}{files}",
+                    j.id,
+                    j.state,
+                    j.kind,
+                    text::priority_tag(j),
+                    j.title
                 );
             }
         })
@@ -219,6 +327,12 @@ fn show(c: &Client, a: args::Job) -> Outcome {
     );
     out.push_str(&data_block(|out| {
         let _ = writeln!(out, "title: {:?}", j.title);
+        if let Some(p) = j.priority.as_deref().filter(|p| *p != "normal") {
+            let _ = writeln!(out, "priority: {p}");
+        }
+        if j.expects_reply && text::is_delivery(&j.kind) {
+            let _ = writeln!(out, "reply expected: answer with racking_say, reply_to {}", j.id);
+        }
         if let Some(o) = &j.origin {
             let _ = writeln!(out, "origin: {}#{}", o.repo, o.id);
         }
@@ -273,8 +387,8 @@ fn outbox(c: &Client, a: args::Outbox) -> Outcome {
     Ok(listing(&l, Direction::Out, "No changes."))
 }
 
-fn attach(ctx: &Ctx, a: args::Attach) -> Outcome {
-    let file = ctx.root.file_to_send(&a.path)?;
+fn upload(ctx: &Ctx, job: &str, path: &str) -> Result<AttachmentInfo, Failure> {
+    let file = ctx.root.file_to_send(path)?;
     // Checked here as well as by the server, so an oversized file fails at once
     // instead of after streaming it.
     let me: Value = ctx.client.get("/whoami")?;
@@ -282,11 +396,15 @@ fn attach(ctx: &Ctx, a: args::Attach) -> Outcome {
         && file.len > cap
     {
         return Err(Failure(format!(
-            "{} is {} bytes, over the server's limit of {cap} per file; split it or send a git bundle",
-            a.path, file.len
+            "{path} is {} bytes, over the server's limit of {cap} per file; split it or send a git bundle",
+            file.len
         )));
     }
-    let info = ctx.client.upload(a.job.as_str(), &file.path)?;
+    Ok(ctx.client.upload(job, &file.path)?)
+}
+
+fn attach(ctx: &Ctx, a: args::Attach) -> Outcome {
+    let info = upload(ctx, a.job.as_str(), &a.path)?;
     Ok(format!(
         "{} attached {} ({} bytes, sha256 {})",
         a.job.as_str(),
@@ -314,12 +432,18 @@ fn get_attachment(ctx: &Ctx, a: args::GetAttachment) -> Outcome {
 
 const JOB_ID: &str = "Job id, like j42.";
 const SINCE: &str = "Cursor: the `next` value of your previous call, 0 the first time.";
+const PRIORITY: &str = "Shown to the recipient; never changes the order. Default normal.";
+const ATTACHMENTS: &str = "Files to attach, paths under the root directory (see racking_whoami).";
 
 /// The `tools/list` result. Names, descriptions and schemas are written for the
 /// model that picks the tool, so they say when to use it and what comes back.
 pub fn list() -> Value {
     let job = json!({"type": "string", "pattern": "^j[0-9]{1,18}$", "description": JOB_ID});
     let since = json!({"type": "integer", "minimum": 0, "default": 0, "description": SINCE});
+    let priority = json!({"type": "string", "enum": ["low", "normal", "high"], "description": PRIORITY});
+    let attachments = json!({"type": "array", "items": {"type": "string"}, "description": ATTACHMENTS});
+    let tags =
+        json!({"type": "array", "items": {"type": "string"}, "description": "Up to 16 tags of [A-Za-z0-9._:/-]."});
     let tools = [
         tool(
             "racking_whoami",
@@ -331,11 +455,64 @@ pub fn list() -> Value {
             true,
         ),
         tool(
+            "racking_notify",
+            "Send a notice: a fire-and-forget heads-up of up to 1 KiB (\"CI is red\", \"deploying now\"). No files, \
+             nobody answers it, it is done once the peer's inbox delivers it. For conversation use racking_say; \
+             for work, racking_send.",
+            json!({
+                "to": {"type": "string", "description": "Recipient agent name, from racking_whoami."},
+                "text": {"type": "string", "description": "The notice, up to 1 KiB."},
+                "title": {"type": "string", "description": "Optional; defaults to the first line of text, cut to 80 characters."},
+                "priority": priority
+            }),
+            &["to", "text"],
+            false,
+        ),
+        tool(
+            "racking_say",
+            "Send a message: conversation text to another agent (a question, an answer, a short update), up to \
+             64 KiB, optionally with files. It has no states or reply protocol: it is done once delivered. Set \
+             expects_reply when you want an answer; the peer answers with racking_say and reply_to, and your \
+             outbox then shows it `answered`. For work the peer must accept and finish, use racking_send.",
+            json!({
+                "to": {"type": "string", "description": "Recipient agent name, from racking_whoami."},
+                "text": {"type": "string", "description": "The message, Markdown, up to 64 KiB."},
+                "title": {"type": "string", "description": "Optional; defaults to the first line of text, cut to 80 characters."},
+                "reply_to": {"type": "string", "pattern": "^j[0-9]{1,18}$", "description": "The message or report this answers."},
+                "expects_reply": {"type": "boolean", "default": false},
+                "priority": priority,
+                "tags": tags,
+                "attachments": attachments
+            }),
+            &["to", "text"],
+            false,
+        ),
+        tool(
+            "racking_report",
+            "Send a report: findings or results for the peer to read later (an analysis, a log summary, a test \
+             run), up to 1 MiB of Markdown with a title, optionally with files. The peer's inbox lists only its \
+             title, size and a preview; the text is read with racking_show. Needs no reply unless expects_reply. \
+             Give the text as `body` or as a file `path` under the root directory.",
+            json!({
+                "to": {"type": "string", "description": "Recipient agent name, from racking_whoami."},
+                "title": {"type": "string", "description": "One line, 1 to 200 characters."},
+                "body": {"type": "string", "description": "The report, Markdown, up to 1 MiB."},
+                "path": {"type": "string", "description": "A UTF-8 file under the root directory to send as the body."},
+                "expects_reply": {"type": "boolean", "default": false},
+                "priority": priority,
+                "tags": tags,
+                "attachments": attachments
+            }),
+            &["to", "title"],
+            false,
+        ),
+        tool(
             "racking_send",
-            "Send a job to another agent's inbox and return its id. kind=task (default) asks the peer to do \
-             work; kind=comment adds information to an earlier job and needs reply_to; for results use \
-             racking_result. Each call creates a new job. Attach files afterwards with racking_attach while \
-             the job is still `sent`.",
+            "Send a task: work for another agent, with states (sent, received, accepted, then done or failed) \
+             that the peer moves with racking_accept and racking_result. Returns its id. kind=comment adds \
+             information to an earlier task and needs reply_to; for results use racking_result. For a question \
+             or chat use racking_say; for a heads-up, racking_notify; for findings to read, racking_report. \
+             Attach files afterwards with racking_attach while the job is still `sent`.",
             json!({
                 "to": {"type": "string", "description": "Recipient agent name, from racking_whoami."},
                 "title": {"type": "string", "description": "One line, 1 to 200 characters."},
@@ -350,19 +527,20 @@ pub fn list() -> Value {
                 },
                 "reply_to": {"type": "string", "description": "Job id this job answers; required for comment and result."},
                 "kind": {"type": "string", "enum": ["task", "comment", "result"], "default": "task"},
-                "outcome": {"type": "string", "enum": ["done", "failed"], "description": "Only for kind=result."}
+                "outcome": {"type": "string", "enum": ["done", "failed"], "description": "Only for kind=result."},
+                "priority": priority
             }),
             &["to", "title"],
             false,
         ),
         tool(
             "racking_inbox",
-            "List jobs sent to you after cursor `since`: id, state, kind, sender and title, without bodies. \
-             Returns `next`, the cursor for your next call. Does not block; use racking_wait to sleep until \
-             work arrives, and racking_show to read a body.",
+            "List jobs sent to you after cursor `since`. Notices and messages come with their whole text (up \
+             to 4 KiB); reports and tasks with title only, read them with racking_show. Returns `next`, the \
+             cursor for your next call. Does not block; use racking_wait to sleep until something arrives.",
             json!({
                 "since": since,
-                "state": {"type": "string", "enum": ["sent", "received", "accepted", "rejected", "done", "failed"]},
+                "state": {"type": "string", "enum": ["sent", "received", "accepted", "rejected", "done", "failed", "answered"]},
                 "limit": {"type": "integer", "minimum": 1}
             }),
             &[],
@@ -370,9 +548,10 @@ pub fn list() -> Value {
         ),
         tool(
             "racking_wait",
-            "Block until a job arrives in your inbox (on=inbox) or one of the jobs you sent changes state \
+            "Block until something arrives in your inbox (on=inbox) or one of the jobs you sent changes state \
              (on=outbox), or until `timeout` seconds pass (default 20, at most 25). Returns the jobs and `next`; \
-             nothing new means the timeout ended, so call again. This tool remembers nothing: always pass the \
+             notices and messages come with their whole text and priority, tasks and reports with their title. \
+             Nothing new means the timeout ended, so call again. This tool remembers nothing: always pass the \
              last `next` you got as `since`.",
             json!({
                 "since": since,
@@ -393,7 +572,8 @@ pub fn list() -> Value {
         ),
         tool(
             "racking_accept",
-            "Accept a job sent to you: you commit to doing it. Then do the work and report with racking_result.",
+            "Accept a task sent to you: you commit to doing it. Then do the work and report with racking_result. \
+             Notices, messages and reports are not accepted: answer a message with racking_say.",
             json!({"job": job}),
             &["job"],
             false,
@@ -422,14 +602,16 @@ pub fn list() -> Value {
         tool(
             "racking_outbox",
             "List jobs you sent whose state changed after cursor `since` (sent, received, accepted, rejected, \
-             done, failed). Returns `next`. To block until one changes, use racking_wait with on=outbox.",
+             done, failed; a message or report that expected a reply becomes answered). Returns `next`. To block \
+             until one changes, use racking_wait with on=outbox.",
             json!({"since": since}),
             &[],
             true,
         ),
         tool(
             "racking_attach",
-            "Upload a local file as an attachment of a job you sent, while the job is still `sent`. The \
+            "Upload a local file as an attachment of a task, message or report you sent, while it is still \
+             `sent` (notices take no files). The \
              attachment is named after the file, which must match [A-Za-z0-9._-]{1,100}. Only files inside \
              this server's root directory can be sent; the size limit is the server's (see racking_whoami).",
             json!({
@@ -489,7 +671,7 @@ mod tests {
         let ctx = ctx();
         let list = list();
         let tools = list["tools"].as_array().expect("tools");
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 14);
         for t in tools {
             let name = t["name"].as_str().expect("name");
             let reply = call(&ctx, name, json!({"no_such_option": 1})).expect(name);
@@ -512,6 +694,18 @@ mod tests {
             ("racking_wait", json!({"timeout": 60}), "timeout must be 1 to 25"),
             ("racking_reject", json!({"job": "j1"}), "missing field `reason`"),
             ("racking_send", json!({"title": "t"}), "missing field `to`"),
+            ("racking_say", json!({"to": "w"}), "missing field `text`"),
+            (
+                "racking_notify",
+                json!({"to": "w", "text": "x", "reply_to": "j1"}),
+                "unknown field `reply_to`",
+            ),
+            ("racking_report", json!({"to": "w", "title": "t"}), "exactly one"),
+            (
+                "racking_report",
+                json!({"to": "w", "title": "t", "path": "../../etc/passwd"}),
+                "",
+            ),
             ("racking_inbox", json!({"since": "x"}), "invalid type"),
             ("racking_attach", json!({"job": "j1", "path": "../../etc/passwd"}), ""),
             (

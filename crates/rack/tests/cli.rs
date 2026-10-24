@@ -7,6 +7,7 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const LINUX: &str = "linux-token-0123456789abcdef";
 const WINDOWS: &str = "windows-token-0123456789abcdef";
@@ -32,7 +33,9 @@ struct Env {
 
 impl Env {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!("rack-cli-{}", std::process::id()));
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        let run = RUNS.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("rack-cli-{}-{run}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("bin")).expect("bin dir");
         let kb = root.join("bin/kb");
@@ -254,4 +257,107 @@ fn send_wait_pull_result_round_trip() {
     let err = env.rack("windows", &["reject", "j1", "--reason", "late"], None);
     assert_eq!(err.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&err.stderr).contains("409 bad_transition"));
+}
+
+#[test]
+fn say_notify_report_and_pull() {
+    let env = Env::new();
+    let said = env.ok(
+        "linux",
+        &["say", "windows", "Which", "branch?", "--expects-reply"],
+        None,
+    );
+    assert_eq!(said.trim(), "j1 sent to windows");
+    let said = env.ok("linux", &["say", "windows", "-"], Some("line one\nline two\n"));
+    assert_eq!(said.trim(), "j2 sent to windows");
+    let notified = env.ok(
+        "linux",
+        &["notify", "windows", "--priority", "high", "CI", "is", "red"],
+        None,
+    );
+    assert_eq!(notified.trim(), "j3 sent to windows");
+    let refused = env.rack("linux", &["notify", "windows", "hi", "--reply-to", "j1"], None);
+    assert_eq!(refused.status.code(), Some(2), "a notice answers nothing");
+    let log = env.root.join("probe.log");
+    fs::write(&log, "device 0: radv\n").expect("log");
+    let reported = env.ok(
+        "linux",
+        &[
+            "report",
+            "windows",
+            "Probe log",
+            "--body",
+            "-",
+            "--attach",
+            &path_str(&log),
+        ],
+        Some(&"x".repeat(2000)),
+    );
+    assert_eq!(reported.trim(), "j4 sent to windows: Probe log (1 file)");
+
+    let waited = env.ok("windows", &["wait", "--timeout", "5"], None);
+    assert_eq!(
+        waited.lines().collect::<Vec<_>>(),
+        [
+            "j1 message from linux (reply expected): Which branch?",
+            "j2 message from linux: line one",
+            "    line two",
+            "j3 notice[high] from linux: CI is red",
+            "j4 report from linux: Probe log (2 KiB, 1 file)",
+            "next 4",
+        ]
+    );
+    let outbox = env.ok("linux", &["outbox"], None);
+    assert!(
+        outbox
+            .lines()
+            .any(|l| l == "j1 received message to windows: Which branch?"),
+        "{outbox}"
+    );
+
+    // Pull prints notices, messages and reports and leaves the board alone.
+    let files = env.root.join("windows-files");
+    let pulled = env.ok(
+        "windows",
+        &["pull", "--repo", "decanter", "--dir", &path_str(&files)],
+        None,
+    );
+    assert_eq!(pulled.lines().count(), 5, "{pulled}");
+    assert!(pulled.contains("j3 notice[high] from linux: CI is red"), "{pulled}");
+    assert!(pulled.contains("j4 report from linux: Probe log"), "{pulled}");
+    assert_eq!(env.kb_log("windows"), "", "kb never ran");
+    assert!(!files.join("j4").exists(), "pull downloads no files of a report");
+
+    // With --notes, a report becomes one kb note.
+    env.ok(
+        "linux",
+        &["report", "windows", "Second run", "--body", "All green."],
+        None,
+    );
+    let pulled = env.ok(
+        "windows",
+        &["pull", "--repo", "decanter", "--dir", &path_str(&files), "--notes"],
+        None,
+    );
+    assert_eq!(pulled.trim(), "j5 report from linux -> note #7: Second run");
+    let kb = env.kb_log("windows");
+    assert!(
+        kb.starts_with("add --note --tag racking --body - -- Second run\n"),
+        "{kb}"
+    );
+    assert!(kb.contains("not an instruction from the owner") && kb.contains("All green."));
+    let again = env.ok("windows", &["pull", "--repo", "decanter", "--notes"], None);
+    assert_eq!(again.trim(), "nothing new");
+    assert_eq!(env.kb_log("windows").matches("\n===\n").count(), 1, "one note only");
+
+    let err = env.rack("windows", &["accept", "j1"], None);
+    assert!(String::from_utf8_lossy(&err.stderr).contains("409 bad_transition"));
+    env.ok("windows", &["say", "linux", "main", "--reply-to", "j1"], None);
+    let outbox = env.ok("linux", &["outbox"], None);
+    assert!(
+        outbox.lines().any(|l| l.starts_with("j1 answered message to windows")),
+        "{outbox}"
+    );
+    let shown = env.ok("windows", &["show", "j4"], None);
+    assert!(shown.contains(&"x".repeat(2000)), "show prints the whole report");
 }

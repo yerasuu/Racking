@@ -120,6 +120,24 @@ impl Kind {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Priority {
+    Low,
+    Normal,
+    High,
+}
+
+impl Priority {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Priority::Low => "low",
+            Priority::Normal => "normal",
+            Priority::High => "high",
+        }
+    }
+}
+
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ResultOutcome {
@@ -170,6 +188,47 @@ pub struct SendJob {
     pub reply_to: Option<JobId>,
     pub kind: Option<Kind>,
     pub outcome: Option<ResultOutcome>,
+    pub priority: Option<Priority>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Say {
+    pub to: String,
+    pub text: String,
+    pub title: Option<String>,
+    pub reply_to: Option<JobId>,
+    pub expects_reply: Option<bool>,
+    pub priority: Option<Priority>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub attachments: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Notify {
+    pub to: String,
+    pub text: String,
+    pub title: Option<String>,
+    pub priority: Option<Priority>,
+}
+
+/// The report text comes from `body` or from the file at `path`, exactly one.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Report {
+    pub to: String,
+    pub title: String,
+    pub body: Option<String>,
+    pub path: Option<String>,
+    pub expects_reply: Option<bool>,
+    pub priority: Option<Priority>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub attachments: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -295,5 +354,18 @@ mod tests {
         assert!(s.kind.is_none() && s.body.is_empty() && s.tags.is_empty());
         assert!(parse::<SendJob>(json!({"to": "w", "title": "t", "kind": "order"})).is_err());
         assert!(parse::<SendJob>(json!({"to": "w", "title": "t", "origin": {"repo": "r"}})).is_err());
+        assert!(parse::<SendJob>(json!({"to": "w", "title": "t", "priority": "urgent"})).is_err());
+    }
+
+    #[test]
+    fn say_notify_report() {
+        let s: Say = parse(json!({"to": "w", "text": "hi"})).expect("minimal say");
+        assert!(s.reply_to.is_none() && s.attachments.is_empty() && s.priority.is_none());
+        assert!(parse::<Say>(json!({"to": "w", "text": "hi", "reply_to": "x"})).is_err());
+        assert!(parse::<Notify>(json!({"to": "w", "text": "hi", "reply_to": "j1"})).is_err());
+        assert!(parse::<Notify>(json!({"to": "w", "text": "hi", "priority": "high"})).is_ok());
+        assert!(parse::<Report>(json!({"to": "w", "text": "hi"})).is_err());
+        let r: Report = parse(json!({"to": "w", "title": "t", "path": "out/report.md"})).expect("report");
+        assert!(r.body.is_none() && r.path.is_some());
     }
 }
