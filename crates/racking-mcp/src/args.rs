@@ -189,6 +189,11 @@ pub struct SendJob {
     pub kind: Option<Kind>,
     pub outcome: Option<ResultOutcome>,
     pub priority: Option<Priority>,
+    pub model: Option<String>,
+    #[serde(default)]
+    pub needs: Vec<String>,
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Deserialize)]
@@ -200,6 +205,7 @@ pub struct Say {
     pub reply_to: Option<JobId>,
     pub expects_reply: Option<bool>,
     pub priority: Option<Priority>,
+    pub model: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
@@ -242,6 +248,7 @@ pub struct Report {
     pub path: Option<String>,
     pub expects_reply: Option<bool>,
     pub priority: Option<Priority>,
+    pub model: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
@@ -372,6 +379,10 @@ mod tests {
         assert!(parse::<SendJob>(json!({"to": "w", "title": "t", "kind": "order"})).is_err());
         assert!(parse::<SendJob>(json!({"to": "w", "title": "t", "origin": {"repo": "r"}})).is_err());
         assert!(parse::<SendJob>(json!({"to": "w", "title": "t", "priority": "urgent"})).is_err());
+        let s: SendJob = parse(json!({"to": "w", "title": "t", "model": "opus", "needs": ["nvidia"], "force": true}))
+            .expect("model and needs");
+        assert_eq!((s.model.as_deref(), s.needs.len(), s.force), (Some("opus"), 1, true));
+        assert!(parse::<SendJob>(json!({"to": "w", "title": "t", "needs": "nvidia"})).is_err());
     }
 
     #[test]

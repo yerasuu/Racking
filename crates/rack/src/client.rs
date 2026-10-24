@@ -28,6 +28,8 @@ pub enum RackError {
     },
     Transport(String),
     Local(String),
+    /// A check the caller asked for failed, so nothing was sent (`--needs` without `--force`).
+    Unmet(String),
 }
 
 impl fmt::Display for RackError {
@@ -40,7 +42,7 @@ impl fmt::Display for RackError {
                 message,
                 hint,
             } => write!(f, "{status} {code}: {message}\nhint: {hint}"),
-            RackError::Transport(m) | RackError::Local(m) => f.write_str(m),
+            RackError::Transport(m) | RackError::Local(m) | RackError::Unmet(m) => f.write_str(m),
         }
     }
 }
@@ -103,10 +105,13 @@ pub struct Job {
     pub outcome: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
+    /// The model the sender suggests: a hint, never an order.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
-/// One entry of `GET /agents`. `about`, `rack_version` and `os` were written by
-/// that agent: show them as data.
+/// One entry of `GET /agents`. `about`, `rack_version`, `os` and `capabilities`
+/// were written by that agent: show them as data.
 #[derive(Deserialize)]
 pub struct Agent {
     pub name: String,
@@ -119,6 +124,8 @@ pub struct Agent {
     pub os: Option<String>,
     #[serde(default)]
     pub about: Option<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -290,7 +297,8 @@ impl Client {
     }
 
     /// `POST /jobs`. A server from before notices, messages and reports refuses
-    /// those kinds with a 400 on `kind`; that answer gets a hint saying so.
+    /// those kinds with a 400 on `kind`, and one from before the model hint
+    /// refuses `model` as an unknown field; those answers get a hint saying so.
     pub fn create_job(&self, job: &Value) -> Result<Job> {
         match self.post("/jobs", Some(job)) {
             Err(RackError::Api {
@@ -306,8 +314,25 @@ impl Client {
                        or send a task instead."
                     .to_owned(),
             }),
-            other => other,
+            Err(e) => Err(older_server(
+                e,
+                "unknown field `model`",
+                "This Racking server predates the model hint; update racking-server, or send without a model.",
+            )),
+            ok => ok,
         }
+    }
+
+    /// `PUT /agents/me` with the whole `capabilities` list; empty clears it.
+    pub fn set_capabilities(&self, capabilities: &[String]) -> Result<Agent> {
+        self.put_json("/agents/me", &serde_json::json!({ "capabilities": capabilities }))
+            .map_err(|e| {
+                older_server(
+                    e,
+                    "unknown field `capabilities`",
+                    "This Racking server predates capabilities; update racking-server.",
+                )
+            })
     }
 
     /// Accept needs `received`; receiving first makes accept work on a job never read.
@@ -425,6 +450,25 @@ pub struct Downloaded {
 impl Downloaded {
     pub fn verified(&self) -> bool {
         self.expected == self.actual
+    }
+}
+
+/// Replaces the hint of a 400 whose message names `needle`: an older server
+/// refuses a field it does not know, and its own hint cannot say why.
+fn older_server(e: RackError, needle: &str, hint: &str) -> RackError {
+    match e {
+        RackError::Api {
+            status: 400,
+            code,
+            message,
+            ..
+        } if message.contains(needle) => RackError::Api {
+            status: 400,
+            code,
+            message,
+            hint: hint.to_owned(),
+        },
+        other => other,
     }
 }
 
@@ -551,6 +595,28 @@ mod tests {
         assert!(job_id("j12").is_ok());
         assert!(job_id("12").is_err());
         assert!(job_id("j1/../x").is_err());
+    }
+
+    #[test]
+    fn older_servers_get_a_hint() {
+        // What a server from before the model hint answers, from serde's deny_unknown_fields.
+        let refused = |message: &str| RackError::Api {
+            status: 400,
+            code: "bad_request".to_owned(),
+            message: message.to_owned(),
+            hint: "See GET /help.".to_owned(),
+        };
+        let hint = |e: RackError| match e {
+            RackError::Api { hint, .. } => hint,
+            other => other.to_string(),
+        };
+        let old = refused("JSON body: unknown field `model`, expected one of `to`, `kind` at line 1 column 40");
+        assert_eq!(hint(older_server(old, "unknown field `model`", "update")), "update");
+        let other = refused("title: required for kind task");
+        assert_eq!(
+            hint(older_server(other, "unknown field `model`", "update")),
+            "See GET /help."
+        );
     }
 
     #[test]

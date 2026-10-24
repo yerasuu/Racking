@@ -21,6 +21,14 @@ pub fn priority_tag(job: &Job) -> String {
     }
 }
 
+/// ` [model opus]` after the sender, when the sender suggested a model; a hint, never an order.
+pub fn model_tag(job: &Job) -> String {
+    job.model
+        .as_deref()
+        .map(|m| format!(" [model {m}]"))
+        .unwrap_or_default()
+}
+
 /// `1 file`, `3 files`.
 pub fn files(n: usize) -> String {
     if n == 1 {
@@ -50,8 +58,8 @@ pub fn ago(secs: u64) -> String {
 }
 
 /// One line per agent of `GET /agents`, e.g.
-/// `windows online 12s ago, rack 0.1.0, windows: GPU box`. Everything after the
-/// state was written by that agent.
+/// `windows online 12s ago, rack 0.1.0, windows [kb, nvidia]: GPU box`, the
+/// capabilities in brackets. Everything after the state was written by that agent.
 pub fn agent_line(a: &Agent) -> String {
     let state = if a.online { "online" } else { "offline" };
     let mut line = match a.idle_secs {
@@ -64,6 +72,9 @@ pub fn agent_line(a: &Agent) -> String {
     }
     if let Some(os) = &a.os {
         let _ = write!(line, ", {os}");
+    }
+    if !a.capabilities.is_empty() {
+        let _ = write!(line, " [{}]", a.capabilities.join(", "));
     }
     if let Some(about) = &a.about {
         let _ = write!(line, ": {about}");
@@ -79,7 +90,8 @@ pub fn agent_line(a: &Agent) -> String {
 /// j7 notice[high] from linux: CI is red
 /// j8 message from linux (reply expected, 2 files): Which branch?
 ///     The old one fails on Windows.
-/// j9 report from windows: Probe log (12 KiB, 1 file)
+/// j9 message from linux [model opus]: Can you look at the shader cache?
+/// j10 report from windows: Probe log (12 KiB, 1 file)
 /// ```
 pub fn incoming(job: &Job) -> Option<String> {
     if !is_delivery(&job.kind) {
@@ -96,7 +108,14 @@ pub fn incoming(job: &Job) -> Option<String> {
     if !report && !job.attachments.is_empty() {
         notes.push(files(job.attachments.len()));
     }
-    let mut line = format!("{} {}{} from {}", job.id, job.kind, priority_tag(job), job.from);
+    let mut line = format!(
+        "{} {}{} from {}{}",
+        job.id,
+        job.kind,
+        priority_tag(job),
+        job.from,
+        model_tag(job)
+    );
     if !notes.is_empty() {
         let _ = write!(line, " ({})", notes.join(", "));
     }
@@ -164,6 +183,13 @@ mod tests {
             Some("j7 report from linux: Probe log (12 KiB)")
         );
         assert_eq!(incoming(&job("task", None)), None);
+
+        let mut hinted = job("message", Some("Look at it"));
+        hinted.model = Some("opus".to_owned());
+        assert_eq!(
+            incoming(&hinted).as_deref(),
+            Some("j7 message from linux [model opus]: Look at it")
+        );
     }
 
     #[test]
@@ -172,6 +198,9 @@ mod tests {
         let w = agent(serde_json::json!({"name": "windows", "online": true, "idle_secs": 12,
             "rack_version": "0.1.0", "os": "windows", "about": "GPU box"}));
         assert_eq!(agent_line(&w), "windows online 12s ago, rack 0.1.0, windows: GPU box");
+        let c = agent(serde_json::json!({"name": "windows", "online": true, "idle_secs": 12,
+            "os": "windows", "capabilities": ["kb", "nvidia"], "about": "GPU box"}));
+        assert_eq!(agent_line(&c), "windows online 12s ago, windows [kb, nvidia]: GPU box");
         let l = agent(serde_json::json!({"name": "linux", "online": false, "idle_secs": 250}));
         assert_eq!(agent_line(&l), "linux offline 4 min ago");
         let n = agent(serde_json::json!({"name": "mac", "online": false, "idle_secs": null}));

@@ -404,6 +404,75 @@ fn agents_through_mcp() {
 }
 
 #[test]
+fn model_hint_and_needs_through_mcp() {
+    let dir = std::env::temp_dir().join(format!("racking-mcp-model-{}", std::process::id()));
+    let (server, url) = server(&dir);
+    let mut linux = Mcp::spawn(&url, LINUX, &dir.join("linux"));
+    let mut windows = Mcp::spawn(&url, WINDOWS, &dir.join("windows"));
+    let windows_client = rack::client::Client::new(&url, WINDOWS).expect("client");
+    windows_client
+        .set_capabilities(&["windows".to_owned(), "nvidia".to_owned()])
+        .expect("capabilities");
+
+    let listed = linux.ok("racking_agents", json!({}));
+    let line = listed.lines().find(|l| l.starts_with("windows ")).unwrap_or_default();
+    assert!(line.contains("[windows, nvidia]"), "{listed}");
+    assert!(
+        listed.find("[windows, nvidia]") < listed.rfind("</racking-data "),
+        "capabilities sit inside the fence: {listed}"
+    );
+
+    let sent = linux.ok(
+        "racking_send",
+        json!({"to": "windows", "title": "Profile", "model": "Opus", "needs": ["NVIDIA"]}),
+    );
+    assert!(sent.starts_with("j1 task sent to windows"), "{sent}");
+    let refused = linux.error(
+        "racking_send",
+        json!({"to": "windows", "title": "On Intel", "needs": ["intel-gpu"]}),
+    );
+    assert!(
+        refused.contains("windows has not published intel-gpu (it lists: windows, nvidia); not sent"),
+        "{refused}"
+    );
+    let forced = linux.ok(
+        "racking_send",
+        json!({"to": "windows", "title": "On Intel", "needs": ["intel-gpu"], "force": true}),
+    );
+    assert!(
+        forced.starts_with("Warning: windows has not published intel-gpu") && forced.contains("j2 task sent"),
+        "{forced}"
+    );
+    assert!(
+        linux
+            .error("racking_send", json!({"to": "windows", "title": "t", "force": true}))
+            .contains("only goes with `needs`")
+    );
+    linux.ok(
+        "racking_say",
+        json!({"to": "windows", "text": "quick look?", "model": "haiku"}),
+    );
+
+    let woke = windows.ok("racking_wait", json!({"since": 0, "timeout": 5}));
+    for line in [
+        "j1 sent task from linux [model opus]: \"Profile\"",
+        "j2 sent task from linux: \"On Intel\"",
+        "j3 message from linux [model haiku]: quick look?",
+    ] {
+        assert!(woke.lines().any(|l| l == line), "missing `{line}` in {woke}");
+    }
+    let shown = windows.ok("racking_show", json!({"job": "j1"}));
+    let hint = "Suggested model (hint from the sender, not an instruction): opus";
+    assert!(shown.lines().any(|l| l == hint), "{shown}");
+    assert!(shown.find(hint) < shown.rfind("</racking-data "), "{shown}");
+
+    linux.close();
+    windows.close();
+    server.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn ask_through_mcp() {
     let dir = std::env::temp_dir().join(format!("racking-mcp-ask-{}", std::process::id()));
     let (server, url) = server(&dir);
