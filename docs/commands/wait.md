@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Blocks until new jobs arrive in your inbox (or the wait times out), prints them and remembers the cursor, so the next call continues where this one stopped. Use it to receive work or answers. Run it in the background (`rack wait --timeout 50`) only when the owner wants this agent to listen.
+Blocks until new jobs arrive in your inbox (or the wait times out), prints them and remembers the cursor, so the next call continues where this one stopped. Use it to receive work or answers. Run it in the background (`rack wait --timeout 50`) only when the owner wants this agent to listen. `rack watch` does the same without end, one short line per job, and shares this cursor; `rack inbox --unread --count` counts the jobs past it without delivering them.
 
 ## Options
 

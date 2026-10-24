@@ -4,6 +4,7 @@
 mod pull;
 mod state;
 mod update;
+mod watch;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -49,7 +50,13 @@ Config: RACK_URL and RACK_TOKEN, or RACK_CONFIG=FILE, or the default file
             [--model M] [--needs NAME,...] [--force]
                                                  task: work with states (accept, result)
   rack inbox [--since N] [--state STATE] [--limit N]
+  rack inbox --unread [--count]                  jobs past the saved cursor, without delivering them;
+                                                 --count prints only how many (for a stop hook)
   rack wait [--since N] [--timeout SECS]         block for new jobs; stores the cursor
+  rack watch [--since N] [--once] [--timeout SECS]
+                                                 like wait, forever: one line per new job (200 chars),
+                                                 for a Monitor or hook; --once stops after the first
+                                                 batch, --timeout gives up quietly after SECS
   rack show JOB
   rack accept JOB
   rack reject JOB --reason TEXT
@@ -250,8 +257,9 @@ fn run(all_args: &[String]) -> Result<()> {
         "notify" => notify(&connect()?, rest),
         "ask" => ask(&connect()?, rest, &state_path()?),
         "report" => report(&connect()?, rest),
-        "inbox" => inbox(&connect()?, rest),
+        "inbox" => inbox(&connect()?, rest, state_path),
         "wait" => wait(&connect()?, rest, &state_path()?),
+        "watch" => watch(&connect()?, rest, &state_path()?),
         "show" => show(&connect()?, rest),
         "accept" => accept(&connect()?, rest),
         "reject" => reject(&connect()?, rest),
@@ -620,9 +628,20 @@ fn print_listing(l: &Listing, direction: Direction) {
     println!("next {}", l.next);
 }
 
-fn inbox(c: &Client, args: &[String]) -> Result<()> {
-    let opts = Opts::parse(args, &["since", "state", "limit"], &[])?;
+fn inbox(c: &Client, args: &[String], state_path: impl FnOnce() -> Result<PathBuf>) -> Result<()> {
+    let opts = Opts::parse(args, &["since", "state", "limit"], &["unread", "count"])?;
     opts.positionals(0, "no arguments besides options")?;
+    if opts.flag("unread") {
+        if !opts.values.is_empty() {
+            return Err(RackError::Usage(
+                "--unread starts at the saved cursor and takes only --count".to_owned(),
+            ));
+        }
+        return unread(c, &state_path()?, opts.flag("count"));
+    }
+    if opts.flag("count") {
+        return Err(RackError::Usage("--count goes with --unread".to_owned()));
+    }
     let mut path = format!("/inbox?since={}", opts.number("since")?.unwrap_or(0));
     if let Some(s) = opts.value("state") {
         if !s.bytes().all(|b| b.is_ascii_lowercase()) {
@@ -637,6 +656,42 @@ fn inbox(c: &Client, args: &[String]) -> Result<()> {
     }
     print_listing(&c.get(&path)?, Direction::In);
     Ok(())
+}
+
+/// Jobs past the `rack wait` cursor, peeked so they stay `sent` and still reach the agent
+/// as new when it reads them. A full page prints as `200+`: enough for a guard that only asks "any?".
+fn unread(c: &Client, state_path: &Path, count_only: bool) -> Result<()> {
+    const PAGE: usize = 200;
+    let since = State::load(state_path)?.inbox_since;
+    let l: Listing = c.get(&format!("/inbox?since={since}&limit={PAGE}&peek=1"))?;
+    if count_only {
+        let more = if l.jobs.len() == PAGE { "+" } else { "" };
+        println!("{}{more}", l.jobs.len());
+    } else {
+        for j in &l.jobs {
+            println!("{}", incoming_line(j));
+        }
+    }
+    Ok(())
+}
+
+fn watch(c: &Client, args: &[String], state_path: &Path) -> Result<()> {
+    let opts = Opts::parse(args, &["since", "timeout"], &["once"])?;
+    opts.positionals(0, "no arguments besides options")?;
+    watch::Watch {
+        client: c,
+        state_path,
+        since: opts.number("since")?,
+        mode: if opts.flag("once") {
+            watch::Mode::Once
+        } else {
+            watch::Mode::Forever
+        },
+        deadline: opts
+            .number("timeout")?
+            .map(|s| Instant::now() + Duration::from_secs(s.unsigned_abs())),
+    }
+    .run()
 }
 
 fn wait(c: &Client, args: &[String], state_path: &Path) -> Result<()> {

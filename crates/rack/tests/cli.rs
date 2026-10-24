@@ -60,30 +60,34 @@ impl Env {
         }
     }
 
-    fn rack(&self, agent: &str, args: &[&str], stdin: Option<&str>) -> Output {
+    /// `rack` as `agent`, with every pipe captured; the caller spawns it.
+    fn command(&self, agent: &str, args: &[&str]) -> Command {
         let token = if agent == "linux" { LINUX } else { WINDOWS };
         let path = format!(
             "{}:{}",
             self.root.join("bin").display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let mut child = Command::new(env!("CARGO_BIN_EXE_rack"))
-            .args([
-                "--state",
-                &self.root.join(agent).join("state.json").display().to_string(),
-            ])
-            .args(args)
-            .env("RACK_URL", &self.url)
-            .env("RACK_TOKEN", token)
-            .env_remove("RACK_CONFIG")
-            .env("PATH", path)
-            .env("FAKE_KB_LOG", self.root.join(format!("{agent}-kb.log")))
-            .env("FAKE_KB_FAIL", self.root.join("kb-fail"))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("run rack");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rack"));
+        cmd.args([
+            "--state",
+            &self.root.join(agent).join("state.json").display().to_string(),
+        ])
+        .args(args)
+        .env("RACK_URL", &self.url)
+        .env("RACK_TOKEN", token)
+        .env_remove("RACK_CONFIG")
+        .env("PATH", path)
+        .env("FAKE_KB_LOG", self.root.join(format!("{agent}-kb.log")))
+        .env("FAKE_KB_FAIL", self.root.join("kb-fail"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+        cmd
+    }
+
+    fn rack(&self, agent: &str, args: &[&str], stdin: Option<&str>) -> Output {
+        let mut child = self.command(agent, args).spawn().expect("run rack");
         if let Some(mut input) = child.stdin.take() {
             input.write_all(stdin.unwrap_or_default().as_bytes()).expect("stdin");
         }
@@ -624,4 +628,62 @@ fn ask_waits_for_the_reply() {
     assert_eq!(resumed, "j4 message from windows (re j1): yes, now\n");
     let refused = env.rack("linux", &["ask", "--resume", "j3"], None);
     assert_eq!(refused.status.code(), Some(2), "j3 expects no reply");
+}
+
+#[test]
+fn watch_prints_one_short_line_per_job_and_keeps_the_cursor() {
+    let env = Env::new();
+
+    // `--once` blocks in the server's wait until another agent speaks, then exits 0.
+    let watcher = env
+        .command("windows", &["watch", "--once", "--timeout", "20"])
+        .spawn()
+        .expect("watch");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let long = format!("Can you look at the shader cache? {}", "x".repeat(300));
+    assert_eq!(
+        env.ok("linux", &["say", "windows", &long], None),
+        "j1 sent to windows\n"
+    );
+    let out = watcher.wait_with_output().expect("watch output");
+    let line = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{line}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        line.starts_with("j1 message from linux: Can you look at the shader cache? xxx"),
+        "{line}"
+    );
+    assert!(line.ends_with("...\n"), "{line}");
+    assert_eq!(line.trim_end().chars().count(), 200, "{line}");
+
+    // The guard's count peeks: it says 1 twice and the sender still sees `sent`.
+    env.ok("linux", &["say", "windows", "second"], None);
+    assert_eq!(env.ok("windows", &["inbox", "--unread", "--count"], None), "1\n");
+    assert_eq!(env.ok("windows", &["inbox", "--unread", "--count"], None), "1\n");
+    assert!(
+        env.ok("linux", &["outbox"], None)
+            .contains("j2 sent message to windows"),
+        "counting delivered nothing"
+    );
+
+    // A second run starts at the saved cursor: only the new job, never j1 again.
+    let again = env.ok("windows", &["watch", "--once", "--timeout", "5"], None);
+    assert_eq!(again, "j2 message from linux: second\n");
+    assert_eq!(env.ok("windows", &["inbox", "--unread", "--count"], None), "0\n");
+    assert_eq!(env.ok("windows", &["watch", "--once", "--timeout", "1"], None), "");
+
+    // One watch per state file: a hook's `--once` steps aside while a Monitor's watch runs.
+    let mut forever = env.command("windows", &["watch"]).spawn().expect("watch");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let aside = env.rack("windows", &["watch", "--once", "--timeout", "20"], None);
+    assert!(aside.status.success());
+    assert!(aside.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&aside.stderr).contains("another rack watch already runs"),
+        "{}",
+        String::from_utf8_lossy(&aside.stderr)
+    );
+    let refused = env.rack("windows", &["watch"], None);
+    assert_eq!(refused.status.code(), Some(1));
+    forever.kill().expect("kill");
+    let _ = forever.wait();
 }

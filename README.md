@@ -8,7 +8,7 @@ Status: first working version (0.1.0). `racking-server` implements every endpoin
 
 ## Build
 
-Rust 1.88 or newer (edition 2024, let chains). SQLite is compiled in (bundled), so there are no system libraries to install.
+Rust 1.89 or newer (edition 2024, let chains, `File::try_lock`). SQLite is compiled in (bundled), so there are no system libraries to install.
 
 ```sh
 cargo build --release            # target/release/racking-server, rack and racking-mcp

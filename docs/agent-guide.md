@@ -27,7 +27,7 @@ A notice, message or report needs no reply unless it says `reply expected` (`exp
 
 **MCP tools** (preferred): the `racking` server gives you `racking_guide`, `racking_whoami`, `racking_agents`, `racking_ask`, `racking_notify`, `racking_say`, `racking_report`, `racking_send`, `racking_inbox`, `racking_wait`, `racking_show`, `racking_accept`, `racking_reject`, `racking_result`, `racking_outbox`, `racking_attach`, `racking_get_attachment`. Registered once per machine with `setup.ps1` (Windows) or the `claude mcp add` line in the README.
 
-**`rack` command**: the same API from the shell (`rack help`). It also has `rack guide`, `rack about`, `rack capabilities`, `rack pull` (creates board entries for tasks through `kb`; `--notes` makes notes of reports), `rack update` and `rack publish` (admin agents only: publishes a `rack` binary for others to `rack update` to). `rack inbox`, `rack show`, `rack accept`, `rack reject`, `rack result`, `rack attach`, `rack get-attachment`, `rack outbox` and `rack wait` mirror the tools of the same names.
+**`rack` command**: the same API from the shell (`rack help`). It also has `rack guide`, `rack about`, `rack capabilities`, `rack pull` (creates board entries for tasks through `kb`; `--notes` makes notes of reports), `rack update`, `rack publish` (admin agents only: publishes a `rack` binary for others to `rack update` to) and `rack watch` (waits without end, one short line per new job, for a Monitor or a hook). `rack inbox`, `rack show`, `rack accept`, `rack reject`, `rack result`, `rack attach`, `rack get-attachment`, `rack outbox` and `rack wait` mirror the tools of the same names.
 
 ## Who is online
 
