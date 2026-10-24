@@ -210,4 +210,78 @@ fn publish_then_update_replaces_and_failures_keep_the_old_binary() {
         text(&out)
     );
     assert_eq!(fs::read(&installed).expect("read"), original);
+
+    // A test build goes to its own slot, read from its own --version, and leaves the stable release.
+    let test_build = env.script("rack-test", "echo rack 99.1.0-1");
+    let out = env.run(
+        real,
+        LINUX,
+        &["publish", "--target", TARGET, &test_build.display().to_string()],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .starts_with(&format!("published rack 99.1.0-1 for {TARGET} in the pre slot")),
+        "{}",
+        text(&out)
+    );
+
+    // The default channel does not see it.
+    let out = env.run(&installed, WINDOWS, &["update", "--check"]);
+    let line = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(line.lines().count(), 1, "{line}");
+    assert!(line.contains("available 0.0.1: up to date"), "{line}");
+    let out = env.run(&installed, WINDOWS, &["update"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(
+        fs::read(&installed).expect("read"),
+        original,
+        "stable channel ignores the test build"
+    );
+
+    // --pre shows both slots and installs the test build, downloaded from /dist/pre/.
+    let out = env.run(&installed, WINDOWS, &["update", "--check", "--pre"]);
+    let lines = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(lines.lines().count(), 2, "{lines}");
+    assert!(lines.contains("stable 0.0.1: up to date"), "{lines}");
+    assert!(
+        lines.contains("pre 99.1.0-1: update available, run `rack update --pre`"),
+        "{lines}"
+    );
+    let out = env.run(&installed, WINDOWS, &["update", "--pre"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(
+        fs::read(&installed).expect("read"),
+        fs::read(&test_build).expect("read test")
+    );
+
+    // Once the stable 99.1.0 is out it outranks 99.1.0-1, still in the pre slot, even on --pre.
+    fs::copy(real, &installed).expect("reinstall rack");
+    let stable = env.script("rack-stable", "echo rack 99.1.0");
+    let out = env.run(
+        real,
+        LINUX,
+        &["publish", "--target", TARGET, &stable.display().to_string()],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("in the stable slot"),
+        "{}",
+        text(&out)
+    );
+    let out = env.run(&installed, WINDOWS, &["update", "--check", "--pre"]);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("pre 99.1.0-1: not newer than stable 99.1.0, ignored"),
+        "{}",
+        text(&out)
+    );
+    let out = env.run(&installed, WINDOWS, &["update", "--pre"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(
+        fs::read(&installed).expect("read"),
+        fs::read(&stable).expect("read stable")
+    );
+    assert_eq!(files_in(&env.root.join("bin")), ["rack"], "no temp file left");
 }

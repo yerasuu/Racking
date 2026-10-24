@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::client::{self, Client, RackError, Result};
+pub use origin::Channel;
+use origin::{Available, Release};
 use version::Version;
 
 const CURRENT: &str = env!("CARGO_PKG_VERSION");
@@ -34,41 +36,79 @@ struct Failure {
     hint: &'static str,
 }
 
-pub fn check(c: &Client) -> Result<()> {
+pub fn check(c: &Client, channel: Channel) -> Result<()> {
     let current = current()?;
-    let line = match origin::latest(c, TARGET)? {
-        None => format!("rack {current} ({TARGET}), available: none published, no update"),
-        Some(r) if r.version > current => format!(
-            "rack {current} ({TARGET}), available {}: update available, run `rack update`",
-            r.version
-        ),
-        Some(r) => format!("rack {current} ({TARGET}), available {}: up to date", r.version),
-    };
-    println!("{line}");
+    let available = origin::latest(c, TARGET, channel)?;
+    print!("{}", check_lines(&current, &available, channel));
     Ok(())
 }
 
-pub fn update(c: &Client) -> Result<()> {
+/// One line on the stable channel; with `--pre`, one per slot, so the test
+/// build shows even when it is not the one `rack update --pre` would take.
+fn check_lines(current: &Version, available: &Available, channel: Channel) -> String {
+    let head = format!("rack {current} ({TARGET})");
+    let Channel::Pre = channel else {
+        return match &available.stable {
+            None => format!("{head}, available: none published, no update\n"),
+            Some(r) if r.version > *current => {
+                format!("{head}, available {}: update available, run `rack update`\n", r.version)
+            }
+            Some(r) => format!("{head}, available {}: up to date\n", r.version),
+        };
+    };
+    let stable = match &available.stable {
+        None => format!("{head}, stable: none published"),
+        Some(r) if r.version > *current => {
+            format!("{head}, stable {}: update available, run `rack update`", r.version)
+        }
+        Some(r) => format!("{head}, stable {}: up to date", r.version),
+    };
+    let pre = match (&available.pre, &available.stable) {
+        (None, _) => format!("{head}, pre: none published"),
+        (Some(p), Some(s)) if p.version <= s.version => format!(
+            "{head}, pre {}: not newer than stable {}, ignored",
+            p.version, s.version
+        ),
+        (Some(p), _) if p.version > *current => {
+            format!("{head}, pre {}: update available, run `rack update --pre`", p.version)
+        }
+        (Some(p), _) => format!("{head}, pre {}: up to date", p.version),
+    };
+    format!("{stable}\n{pre}\n")
+}
+
+/// The release `rack update` installs on `channel`, if one is newer than `current`.
+/// On `Pre` the higher of both slots wins, the stable one on a tie, so a test
+/// build `X.Y.Z-N` moves on to its stable `X.Y.Z` once that is published.
+fn pick(available: &Available, channel: Channel) -> Option<&Release> {
+    let stable = available.stable.as_ref();
+    match (channel, stable, available.pre.as_ref()) {
+        (Channel::Pre, Some(s), Some(p)) if p.version > s.version => Some(p),
+        (Channel::Pre, None, pre) => pre,
+        _ => stable,
+    }
+}
+
+pub fn update(c: &Client, channel: Channel) -> Result<()> {
     let current = current()?;
-    let release = origin::latest(c, TARGET)
-        .map_err(|e| {
-            failed(
-                &current,
-                Failure {
-                    why: format!("cannot read the manifest: {}", one_line(&e)),
-                    hint: "check RACK_URL and RACK_TOKEN with `rack whoami`, then retry",
-                },
-            )
-        })?
-        .ok_or_else(|| {
-            failed(
-                &current,
-                Failure {
-                    why: format!("no rack published for {TARGET}"),
-                    hint: "an admin agent publishes one with `rack publish`",
-                },
-            )
-        })?;
+    let available = origin::latest(c, TARGET, channel).map_err(|e| {
+        failed(
+            &current,
+            Failure {
+                why: format!("cannot read the manifest: {}", one_line(&e)),
+                hint: "check RACK_URL and RACK_TOKEN with `rack whoami`, then retry",
+            },
+        )
+    })?;
+    let release = pick(&available, channel).ok_or_else(|| {
+        failed(
+            &current,
+            Failure {
+                why: format!("no rack published for {TARGET}"),
+                hint: "an admin agent publishes one with `rack publish`",
+            },
+        )
+    })?;
     if release.version <= current {
         println!("rack {current} is up to date (available {})", release.version);
         return Ok(());
@@ -97,7 +137,7 @@ pub fn update(c: &Client) -> Result<()> {
         std::process::id(),
         std::env::consts::EXE_SUFFIX
     ));
-    let result = install(c, &release, &exe, &tmp);
+    let result = install(c, release, &exe, &tmp);
     if result.is_err()
         && let Err(e) = fs::remove_file(&tmp)
         && e.kind() != io::ErrorKind::NotFound
@@ -109,7 +149,7 @@ pub fn update(c: &Client) -> Result<()> {
     Ok(())
 }
 
-fn install(c: &Client, release: &origin::Release, exe: &Path, tmp: &Path) -> std::result::Result<(), Failure> {
+fn install(c: &Client, release: &Release, exe: &Path, tmp: &Path) -> std::result::Result<(), Failure> {
     const REPUBLISH: &str = "retry; if it repeats, ask the owner to publish the binary again";
     origin::fetch(c, TARGET, release, tmp).map_err(|e| Failure {
         why: format!("download: {}", one_line(&e)),
@@ -189,10 +229,19 @@ pub fn publish(c: &Client, target: &str, version: Option<&str>, file: &Path) -> 
             ))
         })?,
     };
+    // A service from before the test slot stores every upload as the release, so a
+    // test build sent there would reach everyone running a plain `rack update`.
+    if version.is_prerelease() && !origin::has_test_slot(c)? {
+        return Err(RackError::Local(format!(
+            "the server keeps no test builds apart and would publish {version} as the stable release; \
+             update racking-server first, or publish a stable X.Y.Z"
+        )));
+    }
     let v = version.to_string();
     let published: Value = c.put_file(&format!("/dist/{target}/rack"), file, &[("X-Version", &v)])?;
     println!(
-        "published rack {v} for {target}: {} bytes, sha256 {}",
+        "published rack {v} for {target} in the {} slot: {} bytes, sha256 {}",
+        published["slot"].as_str().unwrap_or("stable"),
         published["size"],
         published["sha256"].as_str().unwrap_or("?")
     );
@@ -200,7 +249,13 @@ pub fn publish(c: &Client, target: &str, version: Option<&str>, file: &Path) -> 
 }
 
 pub fn print_version() {
-    println!("rack {CURRENT}");
+    println!("{}", version_line(CURRENT));
+}
+
+/// What `rack --version` prints and `reported_version` reads back: the whole
+/// version, pre-release part included, since `rack update` checks the new binary by it.
+fn version_line(version: &str) -> String {
+    format!("rack {version}")
 }
 
 /// Runs `exe --version` with a deadline and reads the `rack X.Y.Z` it prints.
@@ -286,5 +341,104 @@ mod tests {
     fn own_version_and_target() {
         assert!(current().is_ok());
         assert!(!TARGET.is_empty(), "build.rs embeds the target triple");
+    }
+
+    #[test]
+    fn version_line_keeps_the_prerelease_part() {
+        // What a binary built with `version = "0.1.4-1"` prints, and reads back when it is the new one.
+        assert_eq!(version_line("0.1.4-1"), "rack 0.1.4-1");
+        assert_eq!(
+            parse_reported(&format!("{}\n", version_line("0.1.4-1"))).map(|v| v.to_string()),
+            Ok("0.1.4-1".to_owned())
+        );
+        assert_eq!(version_line(CURRENT), format!("rack {}", env!("CARGO_PKG_VERSION")));
+    }
+
+    fn v(s: &str) -> Version {
+        s.parse().unwrap_or_else(|e: String| panic!("{e}"))
+    }
+
+    fn release(version: &str, channel: Channel) -> Release {
+        Release {
+            version: v(version),
+            channel,
+            file: "rack".to_owned(),
+            size: 1,
+            sha256: "0".repeat(64),
+        }
+    }
+
+    fn offer(stable: Option<&str>, pre: Option<&str>) -> Available {
+        Available {
+            stable: stable.map(|s| release(s, Channel::Stable)),
+            pre: pre.map(|p| release(p, Channel::Pre)),
+        }
+    }
+
+    fn picked(available: &Available, channel: Channel) -> Option<String> {
+        pick(available, channel).map(|r| r.version.to_string())
+    }
+
+    #[test]
+    fn pick_follows_the_channel() {
+        let both = offer(Some("0.1.3"), Some("0.1.4-2"));
+        assert_eq!(picked(&both, Channel::Stable).as_deref(), Some("0.1.3"));
+        assert_eq!(picked(&both, Channel::Pre).as_deref(), Some("0.1.4-2"));
+        assert!(pick(&both, Channel::Pre).is_some_and(|r| r.channel == Channel::Pre));
+
+        // Once 0.1.4 is out, the stale 0.1.4-2 left in the pre slot is passed over.
+        let released = offer(Some("0.1.4"), Some("0.1.4-2"));
+        assert_eq!(picked(&released, Channel::Pre).as_deref(), Some("0.1.4"));
+        assert!(pick(&released, Channel::Pre).is_some_and(|r| r.channel == Channel::Stable));
+        let tie = offer(Some("0.1.4"), Some("0.1.4"));
+        assert!(pick(&tie, Channel::Pre).is_some_and(|r| r.channel == Channel::Stable));
+
+        assert_eq!(
+            picked(&offer(None, Some("0.1.4-1")), Channel::Pre).as_deref(),
+            Some("0.1.4-1")
+        );
+        assert_eq!(picked(&offer(None, Some("0.1.4-1")), Channel::Stable), None);
+        assert_eq!(picked(&offer(None, None), Channel::Pre), None);
+    }
+
+    #[test]
+    fn a_test_build_updates_to_its_stable_release() {
+        // Running 0.1.4-1, the default channel installs 0.1.4 because 0.1.4 > 0.1.4-1.
+        let running = v("0.1.4-1");
+        let released = offer(Some("0.1.4"), Some("0.1.4-1"));
+        for channel in [Channel::Stable, Channel::Pre] {
+            assert!(pick(&released, channel).is_some_and(|r| r.version > running));
+        }
+        // And never steps back to an older stable one.
+        let older = offer(Some("0.1.3"), Some("0.1.4-1"));
+        assert!(pick(&older, Channel::Stable).is_some_and(|r| r.version < running));
+    }
+
+    #[test]
+    fn check_prints_one_line_per_channel() {
+        let head = format!("rack 0.1.3 ({TARGET})");
+        let both = offer(Some("0.1.3"), Some("0.1.4-2"));
+        assert_eq!(
+            check_lines(&v("0.1.3"), &both, Channel::Stable),
+            format!("{head}, available 0.1.3: up to date\n")
+        );
+        assert_eq!(
+            check_lines(&v("0.1.3"), &both, Channel::Pre),
+            format!(
+                "{head}, stable 0.1.3: up to date\n\
+                 {head}, pre 0.1.4-2: update available, run `rack update --pre`\n"
+            )
+        );
+        assert_eq!(
+            check_lines(&v("0.1.3"), &offer(Some("0.1.4"), Some("0.1.4-2")), Channel::Pre),
+            format!(
+                "{head}, stable 0.1.4: update available, run `rack update`\n\
+                 {head}, pre 0.1.4-2: not newer than stable 0.1.4, ignored\n"
+            )
+        );
+        assert_eq!(
+            check_lines(&v("0.1.3"), &offer(None, None), Channel::Pre),
+            format!("{head}, stable: none published\n{head}, pre: none published\n")
+        );
     }
 }

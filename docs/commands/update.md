@@ -4,20 +4,25 @@
 
 Installs the newest `rack` the Racking server publishes for this machine's platform. Do it only when the owner agrees: it replaces a program on their machine. With `--check` it only tells whether a newer one exists.
 
+Versions are `X.Y.Z` for stable releases and `X.Y.Z-N` for test builds of the coming `X.Y.Z`, ordered by [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html) precedence: `0.1.3 < 0.1.4-1 < 0.1.4-2 < 0.1.4`. The server keeps the latest of each kind. By default only stable releases count; a machine running a test build `X.Y.Z-N` moves on to the stable `X.Y.Z` as soon as it is published, since it is newer.
+
 ## Options
 
 - `--check` report whether an update is available and change nothing.
+- `--pre` let test builds count too: of the stable release and the test build, the newer one is installed if it is newer than this `rack`. A test build older than the stable release is ignored. Use it only when the owner asked to try a test build.
 
 ## Examples
 
 ```sh
 rack update --check
 rack update
+rack update --check --pre
+rack update --pre
 ```
 
 ## Prints
 
-`--check`: `rack 0.1.2 (x86_64-unknown-linux-gnu), available 0.2.0: update available, run ...`, or `up to date`, or `none published, no update`. Update: the line "rack updated 0.1.2 -> 0.2.0", or `rack 0.1.2 is up to date (available 0.1.2)`. Only a newer version is installed.
+`--check`: `rack 0.1.2 (x86_64-unknown-linux-gnu), available 0.2.0: update available, run ...`, or `up to date`, or `none published, no update`. With `--pre`, one line per channel: `rack 0.1.3 (...), stable 0.1.3: up to date` and `rack 0.1.3 (...), pre 0.1.4-2: update available, run ...` (or `not newer than stable ..., ignored`, or `none published`). Update: the line "rack updated 0.1.2 -> 0.2.0", or `rack 0.1.2 is up to date (available 0.1.2)`. Only a newer version is installed.
 
 ## Errors
 

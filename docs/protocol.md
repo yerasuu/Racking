@@ -164,8 +164,9 @@ All need the Bearer token, except `GET /` and `GET /help` (they show no data).
 | `GET /links` | Id correspondence kept by the service (see below). |
 | `PUT /links/{job_id}` | Record the local entry made for a job. Recipient only. |
 | `GET /dist/manifest` | The `rack` binaries published for `rack update` (see below). |
-| `GET /dist/{target}/{file}` | Download one. `file` is `rack` or the manifest's `file`. |
-| `PUT /dist/{target}/{file}` | Publish one (raw body, `X-Sha256`, `X-Version`). Admin agents only. |
+| `GET /dist/{target}/{file}` | Download the stable one. `file` is `rack` or the manifest's `file`. |
+| `GET /dist/pre/{target}/{file}` | Download the test build (`prerelease` in the manifest). |
+| `PUT /dist/{target}/{file}` | Publish one (raw body, `X-Sha256`, `X-Version`); the version picks the slot. Admin agents only. |
 
 Results and comments are jobs too: `POST /jobs` with `kind` `result` and `reply_to`. There is no separate endpoint.
 
@@ -207,16 +208,19 @@ Error:
 
 ## Distribution of `rack`
 
-The service is also where `rack update` gets new `rack` binaries (decision #21). It keeps the latest binary per target and serves it to any agent with a token; nothing is reachable without one.
+The service is also where `rack update` gets new `rack` binaries (decision #21). It keeps, per target, the latest stable release and the latest test build, and serves them to any agent with a token; nothing is reachable without one.
+
+Versions follow [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html) (decision #41): `X.Y.Z` is a stable release and `X.Y.Z-N` a test build before the stable `X.Y.Z` (any SemVer pre-release identifiers are accepted; numeric ones compare as numbers). By SemVer precedence a test build is lower than its release: `0.1.3 < 0.1.4-1 < 0.1.4-2 < 0.1.4`. Build metadata (`+...`) does not count for precedence, so the service refuses it.
 
 - Targets are a fixed list of Rust target triples: `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-gnu`, `aarch64-unknown-linux-gnu`. Any other answers `400 bad_request`.
-- `GET /dist/manifest` answers `{"version": "0.2.0", "targets": {"x86_64-pc-windows-gnu": {"version": "0.2.0", "file": "rack.exe", "size": 4718592, "sha256": "..."}}}`. The top `version` is the one published last (`null` while nothing is); each target carries its own, since targets may be published at different times.
-- `GET /dist/{target}/{file}` streams the binary with `X-Sha256`. `file` is `rack` or the target's own name (`rack.exe` on Windows).
-- `PUT /dist/{target}/{file}` publishes: raw body, `X-Sha256` (checked, `422 checksum_mismatch` if it differs) and `X-Version`, a [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html) version. Only an agent marked `admin = true` in the server config may publish (`403 not_admin` otherwise). Limit 32 MiB. The upload replaces the target's binary with an atomic rename; older versions are not kept.
+- Each target has two slots, picked by the `X-Version` of the upload: a version without a pre-release part goes to the stable slot, one with it (`X.Y.Z-N`) to the pre slot. Publishing to one slot never replaces the other. A stable publish leaves the pre slot as it is: once its version is lower than the stable one, clients ignore it (the service itself does not order versions).
+- `GET /dist/manifest` answers `{"version": "0.2.0", "targets": {"x86_64-pc-windows-gnu": {"version": "0.2.0", "file": "rack.exe", "size": 4718592, "sha256": "..."}}, "prerelease": {"version": "0.2.1-1", "targets": {...same shape...}}}`. The top level is the stable slot, in the shape it had before test builds existed, so `rack` 0.1.0 to 0.1.2 (which ignore unknown keys) keep working and never see a test build; `prerelease` lists the pre slot. Each `version` is the one published last in its slot (`null` while nothing is); each target carries its own, since targets may be published at different times.
+- `GET /dist/{target}/{file}` streams the stable binary with `X-Sha256`. `file` is `rack` or the target's own name (`rack.exe` on Windows). `GET /dist/pre/{target}/{file}` streams the test build the same way.
+- `PUT /dist/{target}/{file}` publishes: raw body, `X-Sha256` (checked, `422 checksum_mismatch` if it differs) and `X-Version` (`400 bad_request` if it is not SemVer or has build metadata). The answer names the `slot` (`stable` or `pre`) and the download `path`. Only an agent marked `admin = true` in the server config may publish (`403 not_admin` otherwise). Limit 32 MiB. The upload replaces the slot's binary with an atomic rename; older versions are not kept. On disk the stable slot is `<data_dir>/dist/<target>/` (as before the slots, so existing data is still served) and the pre slot `<data_dir>/dist/pre/<target>/`.
 
 Integrity is the SHA-256 in the manifest only; binaries are not signed. Whoever controls the service (or an admin token) controls what `rack update` installs.
 
-`rack update` reads the manifest, takes the entry of the target it was built for, and installs it only if its version is newer by semver precedence. It checks size and SHA-256, runs the new file with `--version` and requires it to print `rack <version>`, then replaces itself (Unix: rename over the executable; Windows: the running `rack.exe` moves to `rack.old`, the new one takes its name, and the old one is moved back if that fails). On any failure the old binary stays.
+`rack update` reads the manifest and takes the entry of the target it was built for: by default the stable slot only; with `--pre` the newer of the stable and pre entries (the stable one on a tie). It installs it only if its version is newer than the running one by SemVer precedence, so a running test build `X.Y.Z-N` moves to the stable `X.Y.Z` on a plain `rack update`. It checks size and SHA-256, runs the new file with `--version` and requires it to print `rack <version>`, then replaces itself (Unix: rename over the executable; Windows: the running `rack.exe` moves to `rack.old`, the new one takes its name, and the old one is moved back if that fails). On any failure the old binary stays. `rack publish` of a test build first checks the manifest has `prerelease`, so it never sends one to a service from before the slots, which would store it as the stable release.
 
 ## Id correspondence
 

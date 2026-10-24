@@ -69,6 +69,13 @@ impl FromStr for Version {
     }
 }
 
+impl Version {
+    /// `X.Y.Z-N`: a test build, ordered below the stable `X.Y.Z`.
+    pub fn is_prerelease(&self) -> bool {
+        !self.pre.is_empty()
+    }
+}
+
 impl Ord for Version {
     fn cmp(&self, other: &Self) -> Ordering {
         self.core.cmp(&other.core).then_with(|| {
@@ -139,25 +146,31 @@ mod tests {
         }
         assert_eq!(v("1.0.0+linux"), v("1.0.0+other"));
         assert!(v("0.10.0") > v("0.9.9"));
+
+        // The numbering of decision #41: test builds X.Y.Z-N before the stable X.Y.Z.
+        let tests = ["0.1.3", "0.1.4-1", "0.1.4-2", "0.1.4-10", "0.1.4", "0.1.5-1"];
+        for pair in tests.windows(2) {
+            assert!(v(pair[0]) < v(pair[1]), "{} < {}", pair[0], pair[1]);
+        }
+        assert!(v("0.1.4-1").is_prerelease() && !v("0.1.4").is_prerelease() && !v("0.1.4+a-b").is_prerelease());
     }
 
     #[test]
     fn grammar() {
-        for bad in [
-            "",
-            "1",
-            "1.2",
-            "1.2.3.4",
-            "01.2.3",
-            "1.2.3-",
-            "1.2.3-01",
-            "1.2.3+",
-            "v1.2.3",
-            "1.2.3-a..b",
-        ] {
-            assert!(bad.parse::<Version>().is_err(), "{bad}");
+        // The same table as racking-server's types::Version tests, so both parsers accept the same grammar.
+        let mut cases = 0;
+        for line in include_str!("../../../../testdata/versions.txt").lines() {
+            let Some((expect, s)) = line.split_once(' ').filter(|_| !line.starts_with('#')) else {
+                continue;
+            };
+            let s = if s == "<empty>" { "" } else { s };
+            match expect {
+                "ok" => assert_eq!(v(s).to_string(), s),
+                "bad" => assert!(s.parse::<Version>().is_err(), "{s}"),
+                other => panic!("unknown case `{other}`"),
+            }
+            cases += 1;
         }
-        assert_eq!(v("1.2.3-rc.1+b5").to_string(), "1.2.3-rc.1+b5");
-        assert!("99999999999999999999.0.0".parse::<Version>().is_err());
+        assert!(cases > 20, "the table was read");
     }
 }

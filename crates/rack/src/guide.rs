@@ -99,7 +99,11 @@ pub const COMMANDS: &[Command] = &[
         Some("racking_outbox")
     ),
     command!("pull", "turn new tasks into entries on the local kb board", None),
-    command!("update", "install the newest rack the server publishes", None),
+    command!(
+        "update",
+        "install the newest stable rack the server publishes; --pre: test builds too",
+        None
+    ),
     command!(
         "publish",
         "admin agents: publish a rack binary for others to update to",

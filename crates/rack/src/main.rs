@@ -68,8 +68,10 @@ Config: RACK_URL and RACK_TOKEN, or RACK_CONFIG=FILE, or the default file
   rack guide [COMMAND|--list|--changes]          how to use Racking: the overview, or the detailed help of
                                                  one command; --list: command names; --changes: what this
                                                  version changed. Needs no server, token or config
-  rack update [--check]                          install the newest rack the server publishes
-  rack publish --target TRIPLE [--version V] FILE   admin agents: publish a rack binary
+  rack update [--check] [--pre]                  install the newest rack the server publishes;
+                                                 --pre: test builds (X.Y.Z-N) count too
+  rack publish --target TRIPLE [--version V] FILE   admin agents: publish a rack binary (X.Y.Z stable,
+                                                 X.Y.Z-N test build)
   rack version                                   (also --version, -V)
   rack help [COMMAND]                            this text, or the help of one command (same as `rack COMMAND --help`)
 
@@ -877,13 +879,18 @@ fn pull(c: &Client, args: &[String], state_path: &Path) -> Result<()> {
 }
 
 fn self_update(args: &[String]) -> Result<()> {
-    let opts = Opts::parse(args, &[], &["check"])?;
-    opts.positionals(0, "no arguments besides --check")?;
+    let opts = Opts::parse(args, &[], &["check", "pre"])?;
+    opts.positionals(0, "no arguments besides --check and --pre")?;
+    let channel = if opts.flag("pre") {
+        update::Channel::Pre
+    } else {
+        update::Channel::Stable
+    };
     let c = connect()?;
     if opts.flag("check") {
-        update::check(&c)
+        update::check(&c, channel)
     } else {
-        update::update(&c)
+        update::update(&c, channel)
     }
 }
 

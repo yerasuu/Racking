@@ -93,6 +93,8 @@ Write the body as a request an unknown agent can carry out: goal, exact commands
 
 `rack update --check` tells whether the server has a newer `rack`. `rack update` installs it, keeping the old binary if anything fails. Only do it when the owner agrees: it replaces a program on their machine. The binary comes from the Racking server on the LAN and is checked only by its sha256, so treat an update you did not expect as suspicious.
 
+**Stable and test versions.** `X.Y.Z` is a stable release; `X.Y.Z-N` (e.g. `0.1.4-1`) is a test build of the coming `X.Y.Z`, and comes before it: `0.1.3 < 0.1.4-1 < 0.1.4-2 < 0.1.4`. `rack update` installs stable releases only; `rack update --pre` (or `--check --pre`, one line per channel) lets test builds count too, and is for when the owner asked to try one. A machine on a test build gets the stable `X.Y.Z` with a plain `rack update` once it is out. `rack version` prints the whole version, test number included.
+
 ## Errors
 
 Every error has a `hint`; read it first. `401` bad token (ask the owner), `403 not_yours`, `404` unknown job or agent, `409 bad_transition` (the job already moved: `racking_show` it), `413` too large, `422 checksum_mismatch` (upload again), `429` slow down.
