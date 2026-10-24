@@ -24,6 +24,8 @@ struct RawConfig {
 #[serde(deny_unknown_fields)]
 struct RawAgent {
     token: String,
+    #[serde(default)]
+    admin: bool,
 }
 
 fn default_bind() -> String {
@@ -40,6 +42,8 @@ pub struct Config {
 pub struct Agent {
     pub name: AgentName,
     pub token: String,
+    /// May publish `rack` binaries (`PUT /dist/...`); off unless the config says so.
+    pub admin: bool,
 }
 
 impl Config {
@@ -69,7 +73,11 @@ impl Config {
             if agents.iter().any(|a: &Agent| a.token == token) {
                 return Err(format!("agents.{name}.token is shared with another agent"));
             }
-            agents.push(Agent { name, token });
+            agents.push(Agent {
+                name,
+                token,
+                admin: agent.admin,
+            });
         }
         Ok(Self {
             bind,
@@ -96,6 +104,23 @@ mod tests {
             "[agents.linux]\ntoken = \"{T1}\"\n[agents.windows]\ntoken = \"{T2}\"\n"
         ));
         assert_eq!(c.map(|c| c.bind.to_string()), Ok("127.0.0.1:7878".to_owned()));
+    }
+
+    #[test]
+    fn admin_is_opt_in() {
+        let c = cfg(&format!(
+            "[agents.linux]\ntoken = \"{T1}\"\nadmin = true\n[agents.windows]\ntoken = \"{T2}\"\n"
+        ));
+        let admins = c.map(|c| {
+            c.agents
+                .iter()
+                .map(|a| (a.name.to_string(), a.admin))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            admins,
+            Ok(vec![("linux".to_owned(), true), ("windows".to_owned(), false)])
+        );
     }
 
     #[test]

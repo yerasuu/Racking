@@ -9,6 +9,7 @@ pub enum Code {
     NoToken,
     BadToken,
     NotYours,
+    NotAdmin,
     NotFound,
     BadTransition,
     AttachmentsLocked,
@@ -21,7 +22,7 @@ pub enum Code {
 
 impl Code {
     /// Every code with its status and meaning, in the order `/help` lists them.
-    pub const ALL: [(Code, &'static str); 12] = [
+    pub const ALL: [(Code, &'static str); 13] = [
         (
             Code::BadRequest,
             "Malformed JSON or field out of range. `message` names the field.",
@@ -32,7 +33,14 @@ impl Code {
             Code::NotYours,
             "The job belongs to other agents, or the move is the other party's.",
         ),
-        (Code::NotFound, "No such job, attachment, agent or route."),
+        (
+            Code::NotAdmin,
+            "Publishing `rack` needs an agent with `admin = true` in the server config.",
+        ),
+        (
+            Code::NotFound,
+            "No such job, attachment, agent, published binary or route.",
+        ),
         (Code::BadTransition, "State move not allowed."),
         (
             Code::AttachmentsLocked,
@@ -52,7 +60,7 @@ impl Code {
         match self {
             Code::BadRequest => 400,
             Code::NoToken | Code::BadToken => 401,
-            Code::NotYours => 403,
+            Code::NotYours | Code::NotAdmin => 403,
             Code::NotFound => 404,
             Code::BadTransition | Code::AttachmentsLocked => 409,
             Code::TooLarge => 413,
@@ -68,6 +76,7 @@ impl Code {
             Code::NoToken => "no_token",
             Code::BadToken => "bad_token",
             Code::NotYours => "not_yours",
+            Code::NotAdmin => "not_admin",
             Code::NotFound => "not_found",
             Code::BadTransition => "bad_transition",
             Code::AttachmentsLocked => "attachments_locked",

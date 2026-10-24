@@ -1,6 +1,7 @@
 //! The round trip of docs/protocol.md against a real server on a random loopback port.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -18,10 +19,12 @@ struct Server {
 
 impl Server {
     fn start() -> Self {
-        let dir = std::env::temp_dir().join(format!("racking-it-{}", std::process::id()));
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        let run = RUNS.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("racking-it-{}-{run}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let config = racking_server::Config::parse(&format!(
-            "bind = \"127.0.0.1:0\"\ndata_dir = {:?}\n[agents.linux]\ntoken = \"{LINUX}\"\n\
+            "bind = \"127.0.0.1:0\"\ndata_dir = {:?}\n[agents.linux]\ntoken = \"{LINUX}\"\nadmin = true\n\
              [agents.windows]\ntoken = \"{WINDOWS}\"\n",
             dir.display().to_string()
         ))
@@ -83,6 +86,21 @@ impl Server {
             req = req.header("Idempotency-Key", k);
         }
         let mut resp = req.send(bytes).expect("upload");
+        let status = resp.status().as_u16();
+        (status, resp.body_mut().read_json().unwrap_or(Value::Null))
+    }
+}
+
+impl Server {
+    fn publish(&self, path: &str, token: &str, bytes: &[u8], sha: &str, version: &str) -> (u16, Value) {
+        let mut resp = self
+            .http
+            .put(format!("{}{path}", self.base))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Sha256", sha)
+            .header("X-Version", version)
+            .send(bytes)
+            .expect("publish");
         let status = resp.status().as_u16();
         (status, resp.body_mut().read_json().unwrap_or(Value::Null))
     }
@@ -306,4 +324,87 @@ fn protocol_round_trip() {
     let (status, err) = s.call("POST", "/jobs", Some(LINUX), Some(json!({"to":"mac","title":"x"})));
     assert_eq!((status, err["error"]["code"].as_str()), (404, Some("not_found")));
     assert!(err["error"]["hint"].as_str().is_some_and(|h| h.contains("windows")));
+}
+
+#[test]
+fn dist_publish_and_download() {
+    let s = Server::start();
+    let linux_rack = b"#!/bin/sh\necho rack 0.2.0\n";
+    let path = "/dist/x86_64-unknown-linux-gnu/rack";
+
+    let (status, m) = s.call("GET", "/dist/manifest", Some(WINDOWS), None);
+    assert_eq!((status, m), (200, json!({"version": null, "targets": {}})));
+    let (status, err) = s.call("GET", "/dist/manifest", None, None);
+    assert_eq!((status, err["error"]["code"].as_str()), (401, Some("no_token")));
+    let (status, err) = s.call("GET", path, Some(WINDOWS), None);
+    assert_eq!((status, err["error"]["code"].as_str()), (404, Some("not_found")));
+
+    let (status, err) = s.publish(path, WINDOWS, linux_rack, &sha(linux_rack), "0.2.0");
+    assert_eq!((status, err["error"]["code"].as_str()), (403, Some("not_admin")));
+    assert!(
+        err["error"]["hint"]
+            .as_str()
+            .is_some_and(|h| h.contains("admin = true"))
+    );
+    let (status, err) = s.publish(path, LINUX, linux_rack, &sha(b"other"), "0.2.0");
+    assert_eq!(
+        (status, err["error"]["code"].as_str()),
+        (422, Some("checksum_mismatch"))
+    );
+    let (status, err) = s.publish(path, LINUX, linux_rack, &sha(linux_rack), "v0.2");
+    assert_eq!((status, err["error"]["code"].as_str()), (400, Some("bad_request")));
+    let (status, err) = s.publish(
+        "/dist/x86_64-apple-darwin/rack",
+        LINUX,
+        linux_rack,
+        &sha(linux_rack),
+        "0.2.0",
+    );
+    assert_eq!((status, err["error"]["code"].as_str()), (400, Some("bad_request")));
+    let (status, err) = s.publish(
+        "/dist/x86_64-unknown-linux-gnu/rack.exe",
+        LINUX,
+        linux_rack,
+        &sha(linux_rack),
+        "0.2.0",
+    );
+    assert_eq!((status, err["error"]["code"].as_str()), (404, Some("not_found")));
+
+    let (status, published) = s.publish(path, LINUX, linux_rack, &sha(linux_rack), "0.2.0");
+    assert_eq!((status, published["version"].as_str()), (200, Some("0.2.0")));
+    let exe = b"MZ fake windows rack";
+    let (status, _) = s.publish("/dist/x86_64-pc-windows-gnu/rack.exe", LINUX, exe, &sha(exe), "0.2.1");
+    assert_eq!(status, 200);
+
+    let (status, m) = s.call("GET", "/dist/manifest", Some(WINDOWS), None);
+    assert_eq!(status, 200);
+    assert_eq!(m["version"], "0.2.1", "the top version is the last published");
+    assert_eq!(
+        m["targets"]["x86_64-unknown-linux-gnu"],
+        json!({"version": "0.2.0", "file": "rack", "size": linux_rack.len(), "sha256": sha(linux_rack)})
+    );
+    assert_eq!(m["targets"]["x86_64-pc-windows-gnu"]["file"], "rack.exe");
+
+    let mut resp = s
+        .http
+        .get(format!("{}/dist/x86_64-pc-windows-gnu/rack.exe", s.base))
+        .header("Authorization", format!("Bearer {WINDOWS}"))
+        .call()
+        .expect("download");
+    assert_eq!(resp.status().as_u16(), 200);
+    let header = resp
+        .headers()
+        .get("x-sha256")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body = resp.body_mut().read_to_vec().expect("bytes");
+    assert_eq!((body.as_slice(), header), (&exe[..], Some(sha(exe))));
+
+    let (status, guide) = s.call("GET", "/help", None, None);
+    assert_eq!(status, 200);
+    assert!(
+        guide
+            .as_str()
+            .is_some_and(|g| g.contains("PUT /dist/{target}/{file}") && g.contains("not_admin"))
+    );
 }

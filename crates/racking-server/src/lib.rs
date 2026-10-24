@@ -5,6 +5,7 @@
 mod api;
 mod clock;
 pub mod config;
+mod dist;
 mod error;
 mod store;
 mod types;
@@ -50,7 +51,8 @@ impl Running {
 /// When the data directory or database cannot be opened, or the address cannot be bound.
 pub fn start(config: &Config) -> Result<Running, String> {
     let store = store::Store::open(&config.data_dir)?;
-    let app = Arc::new(api::App::new(config, store));
+    let dist = dist::Dist::open(&config.data_dir)?;
+    let app = Arc::new(api::App::new(config, store, dist));
     let server = tiny_http::Server::http(config.bind).map_err(|e| format!("cannot listen on {}: {e}", config.bind))?;
     let addr = server
         .server_addr()

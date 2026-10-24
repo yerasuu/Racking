@@ -11,8 +11,11 @@ bind = "127.0.0.1:7878"
 data_dir = "/var/lib/racking"
 
 # One section per agent; the section name is the agent name ([a-z0-9][a-z0-9-]{0,31}).
+# `admin = true` lets that agent publish rack binaries for `rack update`
+# (PUT /dist/...); it is false when left out. Give it to one agent at most.
 [agents.linux]
 token = "CHANGE-ME-linux-token"
+admin = true
 
 [agents.windows]
 token = "CHANGE-ME-windows-token"

@@ -13,9 +13,10 @@ use sha2::{Digest, Sha256};
 use tiny_http::{Header, Request, Response, ResponseBox};
 
 use crate::config::Config;
+use crate::dist::{self, Dist};
 use crate::error::{ApiError, ApiResult, Code};
 use crate::store::{self, Claim, Download, Kind, Move, NewJob, Origin, Outcome, State, Store, View, limits};
-use crate::types::{AgentName, AttachmentName, JobId, Seq, Sha256Hex, truncate};
+use crate::types::{AgentName, AttachmentName, JobId, Seq, Sha256Hex, Target, Version, truncate};
 
 /// Requests served at once, wait requests included. Two agents need a handful;
 /// the cap keeps a misbehaving client from growing threads without bound.
@@ -295,34 +296,79 @@ static ROUTES: &[Route] = &[
                   $RACK_URL/links/j1",
         handler: put_link,
     },
+    Route {
+        method: Method::Get,
+        path: "/dist/manifest",
+        auth: true,
+        body: BodyKind::None,
+        summary: "The `rack` binaries `rack update` installs: `{\"version\", \"targets\": {<target triple>: \
+                  {\"version\", \"file\", \"size\", \"sha256\"}}}`. `version` is the one published last (null while \
+                  none is). Integrity is the SHA-256 only; nothing is signed.",
+        query: &[],
+        input: "",
+        example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" $RACK_URL/dist/manifest",
+        handler: dist_manifest,
+    },
+    Route {
+        method: Method::Get,
+        path: "/dist/{target}/{file}",
+        auth: true,
+        body: BodyKind::None,
+        summary: "Download the `rack` binary of a target. `file` is `rack` or the target's file name from the \
+                  manifest (`rack.exe` on Windows). The answer carries `X-Sha256`: check it against the manifest.",
+        query: &[],
+        input: "",
+        example: "curl -s -o rack -H \"Authorization: Bearer $RACK_TOKEN\" \
+                  $RACK_URL/dist/x86_64-unknown-linux-gnu/rack",
+        handler: get_dist_file,
+    },
+    Route {
+        method: Method::Put,
+        path: "/dist/{target}/{file}",
+        auth: true,
+        body: BodyKind::Raw,
+        summary: "Admin agents only (`admin = true` in the server config): publish the `rack` binary of a target. \
+                  It replaces the one there; only the latest is kept.",
+        query: &[],
+        input: "Raw body. Headers `X-Sha256` (hex SHA-256 of the body) and `X-Version` (semver, e.g. `0.2.0`) are \
+                required. `target` is one of `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-gnu`, \
+                `aarch64-unknown-linux-gnu`. Limit: 32 MiB.",
+        example: "curl -s -T rack -H \"Authorization: Bearer $RACK_TOKEN\" -H 'X-Version: 0.2.0' \
+                  -H \"X-Sha256: $(sha256sum rack | cut -d' ' -f1)\" $RACK_URL/dist/x86_64-unknown-linux-gnu/rack",
+        handler: put_dist_file,
+    },
 ];
 
 /// Shared state of the running service.
 pub struct App {
     pub store: Store,
+    dist: Dist,
     agents: Vec<AgentToken>,
     in_flight: AtomicUsize,
 }
 
 struct AgentToken {
     name: AgentName,
+    admin: bool,
     /// Tokens are compared by digest so the comparison takes the same time
     /// whatever the length or content of the presented token.
     digest: [u8; 32],
 }
 
 impl App {
-    pub fn new(config: &Config, store: Store) -> Self {
+    pub fn new(config: &Config, store: Store, dist: Dist) -> Self {
         let agents = config
             .agents
             .iter()
             .map(|a| AgentToken {
                 name: a.name.clone(),
+                admin: a.admin,
                 digest: Sha256::digest(a.token.as_bytes()).into(),
             })
             .collect();
         Self {
             store,
+            dist,
             agents,
             in_flight: AtomicUsize::new(0),
         }
@@ -343,6 +389,10 @@ impl App {
             }
         }
         found
+    }
+
+    fn is_admin(&self, me: &AgentName) -> bool {
+        self.agents.iter().any(|a| a.admin && &a.name == me)
     }
 
     fn peers_of<'a>(&'a self, me: &'a AgentName) -> impl Iterator<Item = &'a str> + 'a {
@@ -752,7 +802,7 @@ pub fn guide() -> String {
     let _ = writeln!(
         md,
         "\n## Limits\n\nTitle {} chars, body {} KiB, {} tags of {} chars, {} files per job, {} MiB per file, {} MiB \
-         per job, wait {} s default and {} s max, lists {} by default and {} max.",
+         per job, wait {} s default and {} s max, lists {} by default and {} max, {} MiB per published `rack` binary.",
         limits::TITLE_CHARS,
         limits::BODY_BYTES / 1024,
         limits::TAGS,
@@ -764,6 +814,7 @@ pub fn guide() -> String {
         limits::WAIT_MAX_SECS,
         limits::LIST_DEFAULT,
         limits::LIST_MAX,
+        limits::DIST_BYTES >> 20,
     );
     md
 }
@@ -1123,6 +1174,65 @@ fn put_link(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
     ok(link.to_json())
 }
 
+fn dist_manifest(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
+    call.me()?;
+    ok(app.dist.manifest()?)
+}
+
+/// The target of a `/dist/{target}/{file}` path; `file` may be `rack` or the target's own file name.
+fn dist_target(call: &Call<'_>) -> ApiResult<Target> {
+    let target: Target = call.param(0)?;
+    let file = call.params.get(1).copied().unwrap_or_default();
+    if file == "rack" || file == target.exe_name() {
+        Ok(target)
+    } else {
+        Err(ApiError::new(
+            Code::NotFound,
+            format!("no file {} for {target}", truncate(file, 40)),
+            format!("Use /dist/{target}/{}.", target.exe_name()),
+        ))
+    }
+}
+
+fn get_dist_file(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
+    call.me()?;
+    let target = dist_target(call)?;
+    Ok(Reply::File(app.dist.download(target)?))
+}
+
+fn put_dist_file(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
+    let me = call.me()?;
+    if !app.is_admin(me) {
+        return Err(ApiError::new(
+            Code::NotAdmin,
+            format!("agent {me} may not publish rack binaries"),
+            "Publish with the token of an agent marked `admin = true` in the server config.",
+        ));
+    }
+    let target = dist_target(call)?;
+    let claimed: Sha256Hex = call
+        .header("X-Sha256")
+        .ok_or_else(|| ApiError::bad_request("X-Sha256 header is required"))?
+        .parse()
+        .map_err(ApiError::bad_request)?;
+    let version: Version = call
+        .header("X-Version")
+        .ok_or_else(|| ApiError::bad_request("X-Version header is required"))?
+        .parse()
+        .map_err(|e: String| ApiError::bad_request(format!("X-Version: {e}")))?;
+    if call
+        .request
+        .body_length()
+        .is_some_and(|n| n as u64 > limits::DIST_BYTES)
+    {
+        return Err(dist::too_large());
+    }
+    let me = me.clone();
+    let published = app.dist.publish(target, &version, call.request.as_reader(), &claimed)?;
+    tracing::info!(target: "racking::dist", agent = %me, %target, version = version.as_str(), "published rack");
+    ok(published)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1138,6 +1248,7 @@ mod tests {
         );
         assert_eq!(match_path("/", "/"), Some(vec![]));
         assert_eq!(match_path("/", "/x"), None);
+        assert_eq!(match_path("/dist/{target}/{file}", "/dist/manifest"), None);
     }
 
     #[test]

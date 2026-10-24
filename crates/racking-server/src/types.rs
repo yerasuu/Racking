@@ -153,6 +153,92 @@ impl FromStr for Sha256Hex {
     }
 }
 
+/// A build target `rack` is published for. The list is fixed, so a target is
+/// safe to use as a directory name and nothing else reaches the disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    LinuxX86_64,
+    WindowsX86_64,
+    LinuxAarch64,
+}
+
+impl Target {
+    pub const ALL: [Target; 3] = [Target::LinuxX86_64, Target::WindowsX86_64, Target::LinuxAarch64];
+
+    /// The Rust target triple, as `rack` embeds it at build time.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Target::LinuxX86_64 => "x86_64-unknown-linux-gnu",
+            Target::WindowsX86_64 => "x86_64-pc-windows-gnu",
+            Target::LinuxAarch64 => "aarch64-unknown-linux-gnu",
+        }
+    }
+
+    pub fn exe_name(self) -> &'static str {
+        match self {
+            Target::WindowsX86_64 => "rack.exe",
+            Target::LinuxX86_64 | Target::LinuxAarch64 => "rack",
+        }
+    }
+}
+
+impl FromStr for Target {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Target::ALL.into_iter().find(|t| t.as_str() == s).ok_or_else(|| {
+            let known = Target::ALL.map(Target::as_str).join(", ");
+            format!("target `{}` is not one of {known}", truncate(s, 60))
+        })
+    }
+}
+
+impl fmt::Display for Target {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A version that follows the grammar of [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html):
+/// `MAJOR.MINOR.PATCH`, an optional `-pre.release` and `+build` metadata. The
+/// service only stores and shows it; clients do the ordering.
+pub struct Version(String);
+
+impl Version {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for Version {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let ident_ok = |id: &str| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+        let number_ok =
+            |id: &str| id == "0" || (!id.is_empty() && !id.starts_with('0') && id.bytes().all(|b| b.is_ascii_digit()));
+        let (rest, build) = s.split_once('+').map_or((s, None), |(r, b)| (r, Some(b)));
+        let (core, pre) = rest.split_once('-').map_or((rest, None), |(c, p)| (c, Some(p)));
+        let mut parts = core.split('.');
+        let core_ok = (0..3).all(|_| parts.next().is_some_and(|p| number_ok(p) && p.parse::<u64>().is_ok()))
+            && parts.next().is_none();
+        // Numeric pre-release identifiers must not have leading zeros; alphanumeric ones may.
+        let pre_ok = pre.is_none_or(|p| {
+            p.split('.')
+                .all(|id| ident_ok(id) && (number_ok(id) || !id.bytes().all(|b| b.is_ascii_digit())))
+        });
+        let build_ok = build.is_none_or(|b| b.split('.').all(ident_ok));
+        if s.len() <= 64 && core_ok && pre_ok && build_ok {
+            Ok(Self(s.to_owned()))
+        } else {
+            Err(format!(
+                "version `{}` must be semver, e.g. 1.2.3 or 1.2.3-rc.1, at most 64 chars",
+                truncate(s, 70)
+            ))
+        }
+    }
+}
+
 pub fn hex(bytes: &[u8]) -> String {
     use fmt::Write;
     bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut out, b| {
@@ -199,6 +285,48 @@ mod tests {
         assert!("a\\b".parse::<AttachmentName>().is_err());
         assert!("".parse::<AttachmentName>().is_err());
         assert!("x".repeat(101).parse::<AttachmentName>().is_err());
+    }
+
+    #[test]
+    fn targets() {
+        for t in Target::ALL {
+            assert_eq!(t.as_str().parse::<Target>(), Ok(t));
+        }
+        assert_eq!(
+            "x86_64-pc-windows-gnu".parse::<Target>().map(Target::exe_name),
+            Ok("rack.exe")
+        );
+        assert!("x86_64-apple-darwin".parse::<Target>().is_err());
+        assert!("../etc".parse::<Target>().is_err());
+    }
+
+    #[test]
+    fn versions() {
+        for ok in [
+            "0.1.0",
+            "1.2.3",
+            "10.20.30",
+            "1.0.0-rc.1",
+            "1.0.0-0.3.7",
+            "1.0.0-x-y.z",
+            "1.0.0+build.5",
+        ] {
+            assert!(ok.parse::<Version>().is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "1.2",
+            "1.2.3.4",
+            "01.2.3",
+            "1.2.3-",
+            "1.2.3-01",
+            "1.2.3+",
+            "1.2.3-a..b",
+            "v1.2.3",
+            "1.2.x",
+        ] {
+            assert!(bad.parse::<Version>().is_err(), "{bad}");
+        }
     }
 
     #[test]

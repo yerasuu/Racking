@@ -28,6 +28,8 @@ pub mod limits {
     pub const FILE_BYTES: u64 = 64 * 1024 * 1024;
     pub const JOB_FILE_BYTES: u64 = 256 * 1024 * 1024;
     pub const FILES_PER_JOB: usize = 16;
+    /// One published `rack` binary; a release build is a few MiB.
+    pub const DIST_BYTES: u64 = 32 * 1024 * 1024;
     pub const WAIT_DEFAULT_SECS: u64 = 25;
     pub const WAIT_MAX_SECS: u64 = 55;
     pub const IDEMPOTENCY_KEY_CHARS: usize = 80;
@@ -652,7 +654,8 @@ impl Store {
             std::process::id(),
             self.tmp_counter.fetch_add(1, Ordering::Relaxed)
         ));
-        let result = self.receive_upload(&tmp_path, body, budget, claimed).and_then(|size| {
+        let too_large = || too_large_for_job(budget);
+        let result = receive_file(&tmp_path, body, budget.max_bytes, too_large, claimed).and_then(|size| {
             let mut conn = self.db();
             let tx = conn.transaction()?;
             let job = load_job(&tx, id, View::Summary)?;
@@ -684,46 +687,6 @@ impl Store {
             tracing::warn!(target: "racking::store", path = %tmp_path.display(), error = %e, "could not remove temp file");
         }
         result
-    }
-
-    fn receive_upload(&self, path: &Path, body: &mut dyn Read, budget: Budget, claimed: &Sha256Hex) -> ApiResult<u64> {
-        let mut file = File::create(path).map_err(|e| ApiError::internal("create a temp file", &e))?;
-        let mut hasher = Sha256::new();
-        let mut size = 0u64;
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            let n = match body.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    return Err(ApiError::bad_request(format!("upload interrupted: {e}")));
-                }
-            };
-            size += n as u64;
-            if size > budget.max_bytes {
-                return Err(too_large_for_job(budget));
-            }
-            let chunk = &buf[..n];
-            hasher.update(chunk);
-            file.write_all(chunk)
-                .map_err(|e| ApiError::internal("write the attachment", &e))?;
-        }
-        file.sync_all()
-            .map_err(|e| ApiError::internal("flush the attachment", &e))?;
-        let actual = Sha256Hex::of_digest(&hasher.finalize());
-        if &actual != claimed {
-            return Err(ApiError::new(
-                Code::ChecksumMismatch,
-                format!(
-                    "X-Sha256 is {} but the uploaded bytes hash to {}",
-                    claimed.as_str(),
-                    actual.as_str()
-                ),
-                "Upload again; the file may have changed or the transfer was cut.",
-            ));
-        }
-        Ok(size)
     }
 
     /// Opens an attachment while holding the lock, so a concurrent cancel cannot
@@ -974,6 +937,55 @@ struct StoredKey {
     status: Option<u16>,
     response: Option<String>,
     created_at: i64,
+}
+
+/// Streams `body` into a new file at `path`, refusing more than `max_bytes`
+/// (with the caller's `too_large` error) and bytes that do not hash to `claimed`.
+/// The caller removes `path` on error.
+pub fn receive_file(
+    path: &Path,
+    body: &mut dyn Read,
+    max_bytes: u64,
+    too_large: impl FnOnce() -> ApiError,
+    claimed: &Sha256Hex,
+) -> ApiResult<u64> {
+    let mut file = File::create(path).map_err(|e| ApiError::internal("create a temp file", &e))?;
+    let mut hasher = Sha256::new();
+    let mut size = 0u64;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = match body.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                return Err(ApiError::bad_request(format!("upload interrupted: {e}")));
+            }
+        };
+        size += n as u64;
+        if size > max_bytes {
+            return Err(too_large());
+        }
+        let chunk = &buf[..n];
+        hasher.update(chunk);
+        file.write_all(chunk)
+            .map_err(|e| ApiError::internal("write the upload", &e))?;
+    }
+    file.sync_all()
+        .map_err(|e| ApiError::internal("flush the upload", &e))?;
+    let actual = Sha256Hex::of_digest(&hasher.finalize());
+    if &actual != claimed {
+        return Err(ApiError::new(
+            Code::ChecksumMismatch,
+            format!(
+                "X-Sha256 is {} but the uploaded bytes hash to {}",
+                claimed.as_str(),
+                actual.as_str()
+            ),
+            "Upload again; the file may have changed or the transfer was cut.",
+        ));
+    }
+    Ok(size)
 }
 
 /// What an upload may still add to a job.
