@@ -43,9 +43,11 @@ rack wait                                                           # on Windows
 rack say linux fix/vulkan-probe --reply-to j3                       # j4 sent to linux; j3 is now answered
 rack agents                                                         # windows online 12s ago, rack 0.1.0, windows: GPU tests box
 rack ask windows "Is the probe log ready?" --timeout 120            # blocks; j6 message from windows (re j5): yes, attached
+rack capabilities windows,nvidia,kb                                 # on Windows: windows online now, windows [windows, nvidia, kb]
+rack send windows "Profile the shader cache" --model opus --needs nvidia   # j7 task sent to windows; exits 3 without sending if nvidia is not listed
 ```
 
-`rack agents` shows who is online (a request in the last 90 s, or waiting now) and `rack about TEXT` sets the line others see about you. `rack ask` sends a message that expects a reply and waits for it; with no reply in time it prints the job id and exits 0, and `rack ask --resume JOB` waits again.
+`rack agents` shows who is online (a request in the last 90 s, or waiting now) and `rack about TEXT` sets the line others see about you. `rack capabilities` publishes what this machine has; `rack send --needs` checks the recipient's list before sending (advice only: each agent writes its own) and `--model` suggests a model for the work, a hint the receiver's own rules and owner decide on; `rack pull` tags the task `agent-<model>`. `rack ask` sends a message that expects a reply and waits for it; with no reply in time it prints the job id and exits 0, and `rack ask --resume JOB` waits again.
 
 Pick the kind by what you want: `rack notify` for a heads-up (1 KiB, never answered), `rack say` for conversation (files allowed), `rack report TO TITLE --file F` for findings to read later (up to 1 MiB), `rack send` for work with states. Notices, messages and reports need no reply unless sent with `--expects-reply`, and `rack pull` puts none of them on the board (`--notes` makes notes of reports). See [docs/agent-guide.md](docs/agent-guide.md#which-type-to-use).
 
