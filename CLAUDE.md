@@ -7,6 +7,9 @@ binary) and `crates/racking-mcp` (MCP stdio server on top of `rack::client`).
 tests use a fake `kb` on PATH, never a real board; `rack`'s `tests/update.rs` updates a copy of the
 built `rack` in a temp dir with fake `rack` shell scripts (one test function, so no parallel fork
 holds a just-written executable open); `racking-mcp` tests spawn the real binary over pipes. In `racking-mcp`, stdout is the protocol channel: log with `tracing` (stderr), never print. Never commit a real config: only `config.example.toml` with placeholders.
+Every release updates `docs/agent-guide.md` (the overview) and `docs/commands/<name>.md` (one help file per `rack` command): `rack guide`, `rack help COMMAND` and `racking_guide` embed them with `include_str!` through the table `rack::guide::COMMANDS`.
+Tests fail if a command in `USAGE` or the dispatch has no table entry or no complete help file (Purpose, Options, Examples, Exit codes, MCP), if an option the parser accepts is missing from its help, or if an MCP tool is undocumented.
+A new command or MCP tool therefore needs its table entry, its `docs/commands/<name>.md`, and a mention in the agent guide.
 
 <!-- kanbrain:start -->
 ## Project memory: kanbrain

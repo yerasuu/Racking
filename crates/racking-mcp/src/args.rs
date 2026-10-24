@@ -169,6 +169,14 @@ pub struct NoArgs {}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct Guide {
+    #[serde(default)]
+    pub changes: bool,
+    pub command: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Origin {
     pub repo: String,
     pub id: String,

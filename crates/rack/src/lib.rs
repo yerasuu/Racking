@@ -4,6 +4,7 @@
 pub mod ask;
 pub mod client;
 pub mod config;
+pub mod guide;
 pub mod needs;
 pub mod release;
 pub mod text;

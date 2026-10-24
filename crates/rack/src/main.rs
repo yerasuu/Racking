@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 // Imported at the crate root so `pull` and `state` keep reaching it as `crate::client`.
 use rack::client::{self, Client, Job, Listing, Outcome, RackError, Result, job_id, local};
 use rack::config;
+use rack::guide::Topic;
 use rack::text;
 use state::State;
 
@@ -57,10 +58,13 @@ Config: RACK_URL and RACK_TOKEN, or RACK_CONFIG=FILE, or the default file
   rack get-attachment JOB NAME [--out PATH]
   rack outbox [--since N] [--wait] [--timeout SECS]
   rack pull [--dir DIR] [--repo NAME] [--notes] new tasks -> kb entries; --notes: reports -> kb notes
+  rack guide [COMMAND|--list|--changes]          how to use Racking: the overview, or the detailed help of
+                                                 one command; --list: command names; --changes: what this
+                                                 version changed. Needs no server, token or config
   rack update [--check]                          install the newest rack the server publishes
   rack publish --target TRIPLE [--version V] FILE   admin agents: publish a rack binary
   rack version                                   (also --version, -V)
-  rack help
+  rack help [COMMAND]                            this text, or the help of one command (same as `rack COMMAND --help`)
 
 `--body -` and a TEXT of `-` read stdin. Notices, messages and reports need no reply
 unless they say `reply expected`; answer one with `rack say TO TEXT --reply-to JOB`.
@@ -212,11 +216,27 @@ fn run(all_args: &[String]) -> Result<()> {
         print!("{USAGE}");
         return Ok(());
     };
+    // Before `connect()`, like `guide`: asking for help must work with no server, token or config.
+    if rest
+        .iter()
+        .take_while(|a| *a != "--")
+        .any(|a| a == "--help" || a == "-h")
+        && let Some(c) = rack::guide::find(command)
+    {
+        print!("{}", c.help);
+        return Ok(());
+    }
     match command.as_str() {
-        "help" | "--help" | "-h" => {
-            print!("{USAGE}");
-            Ok(())
-        }
+        "help" | "--help" | "-h" => match rest {
+            [] => {
+                print!("{USAGE}");
+                Ok(())
+            }
+            [name] => print_topic(&Topic::Command(name)),
+            _ => Err(RackError::Usage("expected at most one COMMAND".to_owned())),
+        },
+        // Before `connect()`: the guide must work on a machine with no server, token or config.
+        "guide" => guide(rest),
         "version" | "--version" | "-V" => {
             update::print_version();
             Ok(())
@@ -243,6 +263,24 @@ fn run(all_args: &[String]) -> Result<()> {
         "update" => self_update(rest),
         "publish" => publish(rest),
         other => Err(RackError::Usage(format!("unknown command `{other}`"))),
+    }
+}
+
+fn print_topic(topic: &Topic) -> Result<()> {
+    print!("{}", rack::guide::render(topic).map_err(RackError::Usage)?);
+    Ok(())
+}
+
+fn guide(args: &[String]) -> Result<()> {
+    let opts = Opts::parse(args, &[], &["changes", "list"])?;
+    match (opts.flag("changes"), opts.flag("list"), opts.positional.as_slice()) {
+        (false, false, []) => print_topic(&Topic::Overview),
+        (true, false, []) => print_topic(&Topic::Changes),
+        (false, true, []) => print_topic(&Topic::List),
+        (false, false, [name]) => print_topic(&Topic::Command(name)),
+        _ => Err(RackError::Usage(
+            "expected one of COMMAND, --list or --changes, or nothing".to_owned(),
+        )),
     }
 }
 

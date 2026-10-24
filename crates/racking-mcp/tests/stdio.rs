@@ -128,7 +128,7 @@ fn round_trip_through_two_mcp_servers() {
     let mut windows = Mcp::spawn(&url, WINDOWS, &windows_root);
 
     let tools = linux.request("tools/list", json!({}));
-    assert_eq!(tools["result"]["tools"].as_array().map(Vec::len), Some(16));
+    assert_eq!(tools["result"]["tools"].as_array().map(Vec::len), Some(17));
     assert_eq!(linux.request("ping", json!({}))["result"], json!({}));
     assert!(
         linux

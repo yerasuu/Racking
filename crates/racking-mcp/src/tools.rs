@@ -6,6 +6,7 @@ use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use rack::client::{self, AttachmentInfo, Client, Job, Listing, RackError};
+use rack::guide::Topic;
 use rack::text;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -85,6 +86,7 @@ type Outcome = Result<String, Failure>;
 pub fn call(ctx: &Ctx, name: &str, arguments: Value) -> Option<Reply> {
     let c = &ctx.client;
     let reply = match name {
+        "racking_guide" => run(arguments, guide),
         "racking_whoami" => run(arguments, |_: args::NoArgs| whoami(ctx)),
         "racking_agents" => run(arguments, |_: args::NoArgs| agents(c)),
         "racking_send" => run(arguments, |a| send(c, a)),
@@ -116,6 +118,17 @@ fn run<A: DeserializeOwned>(arguments: Value, handler: impl FnOnce(A) -> Outcome
         Ok(text) => Reply { text, is_error: false },
         Err(Failure(text)) => Reply { text, is_error: true },
     }
+}
+
+/// The same texts as `rack guide`; needs no server, so it is answered from the binary.
+fn guide(a: args::Guide) -> Outcome {
+    let topic = match (&a.command, a.changes) {
+        (None, false) => Topic::Overview,
+        (None, true) => Topic::Changes,
+        (Some(name), false) => Topic::Command(name),
+        (Some(_), true) => return Err(Failure("give `command` or `changes`, not both".to_owned())),
+    };
+    rack::guide::render(&topic).map_err(Failure)
 }
 
 fn whoami(ctx: &Ctx) -> Outcome {
@@ -553,6 +566,18 @@ pub fn list() -> Value {
         json!({"type": "array", "items": {"type": "string"}, "description": "Up to 16 tags of [A-Za-z0-9._:/-]."});
     let tools = [
         tool(
+            "racking_guide",
+            "How to use Racking: rules, which message type to use, how to receive and send. Read it first. \
+             With `command` (a rack command name such as send or ask) it returns the detailed help of that \
+             command; with `changes: true`, what this version changed. Needs no server call.",
+            json!({
+                "command": {"type": "string", "pattern": "^[a-z-]{1,20}$", "description": "A rack command name (send, ask, pull...): its detailed help."},
+                "changes": {"type": "boolean", "default": false, "description": "Return the release notes of this version instead of the guide."}
+            }),
+            &[],
+            true,
+        ),
+        tool(
             "racking_whoami",
             "Show which Racking agent you are, the peer agents you can send jobs to, the server limits, and \
              the root directory files are attached from and saved under. Call it first when you do not know \
@@ -817,7 +842,7 @@ mod tests {
         let ctx = ctx();
         let list = list();
         let tools = list["tools"].as_array().expect("tools");
-        assert_eq!(tools.len(), 16);
+        assert_eq!(tools.len(), 17);
         for t in tools {
             let name = t["name"].as_str().expect("name");
             let reply = call(&ctx, name, json!({"no_such_option": 1})).expect(name);
@@ -830,6 +855,58 @@ mod tests {
             assert_eq!(t["inputSchema"]["additionalProperties"], false);
         }
         assert!(call(&ctx, "racking_nope", json!({})).is_none());
+    }
+
+    #[test]
+    fn every_tool_is_in_the_guide() {
+        for t in list()["tools"].as_array().expect("tools") {
+            let name = t["name"].as_str().expect("name");
+            assert!(
+                rack::guide::GUIDE.contains(name),
+                "docs/agent-guide.md does not mention the tool `{name}`"
+            );
+        }
+    }
+
+    #[test]
+    fn command_tools_named_by_the_table_exist() {
+        let list = list();
+        let names: Vec<&str> = list["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        for c in rack::guide::COMMANDS {
+            if let Some(tool) = c.mcp {
+                assert!(
+                    names.contains(&tool),
+                    "`rack {}` names {tool}, which racking-mcp lacks",
+                    c.name
+                );
+            }
+        }
+        for tool in &names {
+            assert!(
+                rack::guide::COMMANDS.iter().any(|c| c.mcp == Some(tool)),
+                "{tool} is in no command's MCP entry of rack::guide::COMMANDS"
+            );
+        }
+    }
+
+    #[test]
+    fn guide_tool_needs_no_server() {
+        let ctx = ctx();
+        let reply = call(&ctx, "racking_guide", json!({})).expect("tool");
+        assert!(!reply.is_error && reply.text.contains("guide (this text ships inside the binary"));
+        let reply = call(&ctx, "racking_guide", json!({"changes": true})).expect("tool");
+        assert!(!reply.is_error && reply.text.contains(": what changed"));
+        let reply = call(&ctx, "racking_guide", json!({"command": "get-attachment"})).expect("tool");
+        assert!(!reply.is_error && reply.text.starts_with("# rack get-attachment"));
+        let reply = call(&ctx, "racking_guide", json!({"command": "nope"})).expect("tool");
+        assert!(reply.is_error && reply.text.contains("valid commands"));
+        let reply = call(&ctx, "racking_guide", json!({"command": "send", "changes": true})).expect("tool");
+        assert!(reply.is_error);
     }
 
     #[test]
