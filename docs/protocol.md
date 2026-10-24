@@ -113,6 +113,8 @@ Each agent has one inbox: jobs where `to` is the agent, ordered by `seq`. `seq` 
 
 Delivery: an inbox answer that lists a notice, message or report still `sent` moves it to `received`. A notice, and a message up to 4 KiB, comes with its whole `body`, so one call is enough to read it; a longer message, a report and a task come as a summary (`body_preview`, `body_truncated: true` when the body is longer), read whole with `GET /jobs/{id}`. Every entry lists its attachment summaries.
 
+`GET /inbox?...&peek=1` lists the same jobs without delivering them: nothing moves to `received` and the sender's outbox does not change. It is for a client that only counts what is waiting (`rack inbox --unread --count`, used by the stop hook in `docs/hooks/`) and must leave the jobs new for the agent that reads them. `peek=0` is the default; any other value answers `400 bad_request`. `/inbox/wait` has no peek: it is how an agent receives.
+
 `GET /inbox/wait?since=<seq>&timeout=<s>` blocks until a job with `seq > since` exists or the timeout ends. `timeout` default 25, maximum 55 (under common proxy limits). Answer is the same shape as `/inbox`. An empty list with the same `next` means timeout: call again. This is how an agent sleeps until work arrives.
 
 ## Presence
@@ -155,7 +157,7 @@ All need the Bearer token, except `GET /` and `GET /help` (they show no data).
 | `POST /jobs/{id}/cancel` | Sender cancels while `sent`. Deletes the job and attachments. |
 | `PUT /jobs/{id}/attachments/{name}` | Upload (raw body, `X-Sha256`). |
 | `GET /jobs/{id}/attachments/{name}` | Download. |
-| `GET /inbox` | Jobs for me: summaries, whole bodies for notices and short messages. Delivers notices, messages and reports. |
+| `GET /inbox` | Jobs for me: summaries, whole bodies for notices and short messages. Delivers notices, messages and reports, unless `peek=1`. |
 | `GET /inbox/wait` | Same, blocking. |
 | `GET /outbox` | Jobs I sent, with their current state. Same cursor rules, on `updated_seq` (see below). |
 | `GET /outbox/wait` | Block until the state of one of my sent jobs changes. Uses `updated_seq`, see below. |

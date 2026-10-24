@@ -292,6 +292,15 @@ impl Attachment {
     }
 }
 
+/// Whether an inbox read hands over the notices, messages and reports it lists.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    Deliver,
+    /// Lists without moving anything to `received`, so a client can count what is
+    /// waiting (a stop guard) without taking the jobs from the agent that reads them.
+    Peek,
+}
+
 /// Whether a job is shown whole or as an inbox summary.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -871,6 +880,18 @@ impl Store {
     /// reports in it, so those still `sent` become `received` here, where their
     /// sender's outbox sees it.
     pub fn inbox(&self, me: &AgentName, since: Seq, state: Option<State>, limit: u32) -> ApiResult<Listing> {
+        self.inbox_with(me, since, state, limit, Delivery::Deliver)
+    }
+
+    /// `inbox`, or with `Delivery::Peek` the same listing with nothing handed over.
+    pub fn inbox_with(
+        &self,
+        me: &AgentName,
+        since: Seq,
+        state: Option<State>,
+        limit: u32,
+        delivery: Delivery,
+    ) -> ApiResult<Listing> {
         let mut conn = self.db();
         let tx = conn.transaction()?;
         let mut jobs = {
@@ -888,7 +909,7 @@ impl Store {
         let mut delivered = false;
         for job in &mut jobs {
             job.attachments = load_attachments(&tx, job.id)?;
-            if job.kind.is_delivery() && job.state == State::Sent {
+            if delivery == Delivery::Deliver && job.kind.is_delivery() && job.state == State::Sent {
                 job.updated_seq = set_state(&tx, job.id, State::Received, None, now)?;
                 job.state = State::Received;
                 job.updated_at = now;
@@ -1519,6 +1540,30 @@ mod tests {
     fn state_in_outbox(s: &Store, me: &AgentName, id: JobId) -> Option<State> {
         let out = s.outbox(me, Seq::new(0), 50).expect("outbox");
         out.jobs.iter().find(|j| j.id == id).map(|j| j.state)
+    }
+
+    #[test]
+    fn peek_lists_without_delivering() {
+        let (_dir, s) = store();
+        let (linux, windows) = (agent("linux"), agent("windows"));
+        let m = s
+            .create_job(&linux, delivery(Kind::Message, "windows", "hi"))
+            .expect("message");
+        let before = s.outbox(&linux, Seq::new(0), 50).expect("outbox").next;
+        let peeked = s
+            .inbox_with(&windows, Seq::new(0), None, 50, Delivery::Peek)
+            .expect("peek");
+        assert_eq!(
+            peeked.jobs.iter().map(|j| (j.id, j.state)).collect::<Vec<_>>(),
+            [(m.id, State::Sent)]
+        );
+        assert_eq!(peeked.next, m.seq);
+        assert!(
+            s.outbox(&linux, Seq::new(before), 50).expect("outbox").jobs.is_empty(),
+            "a peek changes nothing the sender sees"
+        );
+        let read = s.inbox(&windows, Seq::new(0), None, 50).expect("inbox");
+        assert_eq!(read.jobs[0].state, State::Received, "a normal read still delivers it");
     }
 
     #[test]

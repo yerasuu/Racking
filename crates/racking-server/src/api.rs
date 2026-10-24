@@ -84,6 +84,10 @@ const LIST_QUERY: &[(&str, &str)] = &[
     ("since", "cursor: return jobs past it (default 0); pass the last `next`"),
     ("state", "only jobs in this state"),
     ("limit", "page size, 1 to 200 (default 50)"),
+    (
+        "peek",
+        "`1` lists without delivering: nothing becomes `received` (to count what waits); default `0`",
+    ),
 ];
 const WAIT_QUERY: &[(&str, &str)] = &[
     ("since", "cursor: return jobs past it (default 0); pass the last `next`"),
@@ -1316,7 +1320,15 @@ fn list_args(call: &Call<'_>) -> ApiResult<ListArgs> {
 fn inbox(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
     let args = list_args(call)?;
     let state = call.query::<State>("state")?;
-    ok(app.store.inbox(call.me()?, args.since, state, args.limit)?.to_json())
+    let delivery = match call.query_raw("peek") {
+        None | Some("0") => store::Delivery::Deliver,
+        Some("1") => store::Delivery::Peek,
+        Some(_) => return Err(ApiError::bad_request("peek: 1 or 0")),
+    };
+    ok(app
+        .store
+        .inbox_with(call.me()?, args.since, state, args.limit, delivery)?
+        .to_json())
 }
 
 fn inbox_wait(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {

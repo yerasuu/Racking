@@ -414,6 +414,29 @@ fn dist_publish_and_download() {
 }
 
 #[test]
+fn inbox_peek_does_not_deliver() {
+    let s = Server::start();
+    let say = json!({"to": "windows", "kind": "message", "body": "still there?"});
+    let (status, j) = s.call("POST", "/jobs", Some(LINUX), Some(say));
+    assert_eq!(status, 201, "{j}");
+
+    let (status, peeked) = s.call("GET", "/inbox?since=0&peek=1", Some(WINDOWS), None);
+    assert_eq!(status, 200, "{peeked}");
+    assert_eq!(
+        (peeked["jobs"][0]["state"].as_str(), peeked["next"].as_i64()),
+        (Some("sent"), Some(1))
+    );
+    let (_, out) = s.call("GET", "/outbox?since=0", Some(LINUX), None);
+    assert_eq!(out["jobs"][0]["state"], "sent", "a peek is not a delivery");
+
+    let (status, err) = s.call("GET", "/inbox?peek=yes", Some(WINDOWS), None);
+    assert_eq!((status, err["error"]["code"].as_str()), (400, Some("bad_request")));
+
+    let (_, read) = s.call("GET", "/inbox?since=0&peek=0", Some(WINDOWS), None);
+    assert_eq!(read["jobs"][0]["state"], "received");
+}
+
+#[test]
 fn messages_notices_and_reports() {
     let s = Server::start();
     let post = |token: &str, key: &str, body: &Value| {
