@@ -1,3 +1,4 @@
 .brain/
 .claude/
 target/
+bin/
