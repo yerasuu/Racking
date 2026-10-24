@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.3
+
+First stable release (0.1.1 and 0.1.2 were local test builds).
+
+### Client
+- `rack guide` with per-command help, always matching the version; `rack watch` and unread counts.
+- Stable and test release channels (`X.Y.Z-N`) for `rack update`.
+
+### Service
+- Non-delivering inbox listing (`peek=1`); separate stable and test binaries in `/dist`.
+
+### Project
+- GPL-3.0-or-later license, CI, security policy and a new README.
+
 ## 0.1.2
 
 ### Client
