@@ -14,14 +14,16 @@ use serde_json::{Value, json};
 
 // Imported at the crate root so `pull` and `state` keep reaching it as `crate::client`.
 use rack::client::{self, Client, Job, Listing, Outcome, RackError, Result, job_id, local};
+use rack::config;
 use rack::text;
 use state::State;
 
 const USAGE: &str = "\
 rack: client for a Racking server (jobs between coding agents)
 
-Config: RACK_URL and RACK_TOKEN, or RACK_CONFIG=FILE with lines `url = \"...\"` and
-`token = \"...\"` (env wins). State (cursors, links): --state FILE, RACK_STATE, or
+Config: RACK_URL and RACK_TOKEN, or RACK_CONFIG=FILE, or the default file
+~/.config/rack/rack.conf (%APPDATA%\\rack\\rack.conf on Windows), with lines
+`url = \"...\"` and `token = \"...\"` (env wins, then RACK_CONFIG). State (cursors, links): --state FILE, RACK_STATE, or
 ~/.config/rack/state.json (%APPDATA%\\rack\\state.json on Windows).
 
   rack whoami
@@ -175,27 +177,8 @@ impl Opts {
     }
 }
 
-/// Server URL and token, from the environment or the file in RACK_CONFIG.
 fn connect() -> Result<Client> {
-    let mut url = std::env::var("RACK_URL").ok().filter(|v| !v.is_empty());
-    let mut token = std::env::var("RACK_TOKEN").ok().filter(|v| !v.is_empty());
-    if let Some(path) = std::env::var_os("RACK_CONFIG").filter(|p| !p.is_empty()) {
-        let path = PathBuf::from(path);
-        let text = std::fs::read_to_string(&path).map_err(|e| local(&format!("read {}", path.display()), e))?;
-        for line in text.lines() {
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            let value = value.trim().trim_matches('"').to_owned();
-            match key.trim() {
-                "url" => url = url.or(Some(value)),
-                "token" => token = token.or(Some(value)),
-                _ => {}
-            }
-        }
-    }
-    let url = url.ok_or_else(|| RackError::Usage("set RACK_URL (e.g. http://127.0.0.1:7878)".to_owned()))?;
-    let token = token.ok_or_else(|| RackError::Usage("set RACK_TOKEN (ask the server owner)".to_owned()))?;
+    let (url, token) = config::credentials()?;
     Ok(Client::new(&url, &token)?.identified(env!("CARGO_PKG_VERSION")))
 }
 
@@ -222,7 +205,7 @@ fn run(all_args: &[String]) -> Result<()> {
             .or_else(|| std::env::var_os("RACK_STATE").map(PathBuf::from))
         {
             Some(p) => Ok(p),
-            None => Ok(state::default_dir()?.join("state.json")),
+            None => Ok(config::default_dir()?.join("state.json")),
         }
     };
     let Some((command, rest)) = args.split_first() else {

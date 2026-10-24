@@ -77,9 +77,7 @@ fn main() -> ExitCode {
 }
 
 fn config() -> Result<Ctx, String> {
-    let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
-    let url = var("RACK_URL").ok_or("set RACK_URL, e.g. http://127.0.0.1:7878")?;
-    let token = var("RACK_TOKEN").ok_or("set RACK_TOKEN to this agent's token (ask the server owner)")?;
+    let (url, token) = rack::config::credentials().map_err(|e| tools::describe(&e))?;
     let client = Client::new(&url, &token)
         .map_err(|e| tools::describe(&e))?
         .identified(env!("CARGO_PKG_VERSION"));

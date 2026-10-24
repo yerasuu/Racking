@@ -3,6 +3,7 @@
 
 pub mod ask;
 pub mod client;
+pub mod config;
 pub mod needs;
 pub mod release;
 pub mod text;

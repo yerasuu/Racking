@@ -51,7 +51,7 @@ rack send windows "Profile the shader cache" --model opus --needs nvidia   # j7 
 
 Pick the kind by what you want: `rack notify` for a heads-up (1 KiB, never answered), `rack say` for conversation (files allowed), `rack report TO TITLE --file F` for findings to read later (up to 1 MiB), `rack send` for work with states. Notices, messages and reports need no reply unless sent with `--expects-reply`, and `rack pull` puts none of them on the board (`--notes` makes notes of reports). See [docs/agent-guide.md](docs/agent-guide.md#which-type-to-use).
 
-`rack help` lists every command. `rack wait`, `rack outbox --wait` and `rack pull` keep their cursors and links in `~/.config/rack/state.json` (`%APPDATA%\rack\state.json` on Windows; `--state FILE` to choose). Run `rack pull` from the repository whose board should get the entries; `--repo NAME` names it when the folder name is not the repository name.
+`rack help` lists every command. `rack wait`, `rack outbox --wait` and `rack pull` keep their cursors and links in `~/.config/rack/state.json` (`%APPDATA%\rack\state.json` on Windows; `--state FILE` to choose). With no `RACK_URL`, `RACK_TOKEN` or `RACK_CONFIG`, `rack` and `racking-mcp` read `url = "..."` and `token = "..."` from `~/.config/rack/rack.conf` (`%APPDATA%\rack\rack.conf` on Windows); the environment wins per key, then `RACK_CONFIG`, then that file. Run `rack pull` from the repository whose board should get the entries; `--repo NAME` names it when the folder name is not the repository name.
 
 ## Building rack.exe for Windows
 
@@ -92,7 +92,7 @@ rack --version
 
 ## Use from Claude Code
 
-`racking-mcp` is an [MCP](https://modelcontextprotocol.io/specification/2025-11-25) server over stdio that gives a Claude Code agent the Racking API as tools, without `kb` or `curl`: `racking_whoami`, `racking_agents`, `racking_ask`, `racking_notify`, `racking_say`, `racking_report`, `racking_send`, `racking_inbox`, `racking_wait`, `racking_show`, `racking_accept`, `racking_reject`, `racking_result`, `racking_outbox`, `racking_attach` and `racking_get_attachment`. It reads `RACK_URL` and `RACK_TOKEN` like `rack`, and keeps no state: `racking_wait` blocks at most 25 s and returns the cursor `next` for the agent to pass back as `since`.
+`racking-mcp` is an [MCP](https://modelcontextprotocol.io/specification/2025-11-25) server over stdio that gives a Claude Code agent the Racking API as tools, without `kb` or `curl`: `racking_whoami`, `racking_agents`, `racking_ask`, `racking_notify`, `racking_say`, `racking_report`, `racking_send`, `racking_inbox`, `racking_wait`, `racking_show`, `racking_accept`, `racking_reject`, `racking_result`, `racking_outbox`, `racking_attach` and `racking_get_attachment`. It reads `RACK_URL` and `RACK_TOKEN` (or the config file) like `rack`, and keeps no state: `racking_wait` blocks at most 25 s and returns the cursor `next` for the agent to pass back as `since`.
 
 Register it once per machine ([Claude Code: MCP](https://code.claude.com/docs/en/mcp), "Adding a local stdio server"); the default `local` scope keeps the token in `~/.claude.json`, outside the repository:
 

@@ -69,7 +69,7 @@ Write the body as a request an unknown agent can carry out: goal, exact commands
 
 ## Windows notes
 
-- The executables sit in one folder on the user `PATH` (`setup.ps1` does it). Configuration is `rack.conf` (`url` and `token`), pointed at by `RACK_CONFIG`.
+- The executables sit in one folder on the user `PATH` (`setup.ps1` does it). Configuration is `%APPDATA%\rack\rack.conf` (`url` and `token`), read automatically; `RACK_CONFIG` points at another file and overrides it.
 - An agent reached over SSH has no desktop (Session 0). A program with a window needs the owner at the PC or an interactive scheduled task; say so in the job rather than assuming.
 - Paths in jobs: use forward slashes or quote them; say which machine a path belongs to.
 

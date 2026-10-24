@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -59,19 +59,6 @@ impl State {
         fs::write(&tmp, text).map_err(|e| local(&format!("write {}", tmp.display()), e))?;
         fs::rename(&tmp, path).map_err(|e| local(&format!("replace {}", path.display()), e))
     }
-}
-
-/// `~/.config/rack` on Unix, `%APPDATA%\rack` on Windows.
-pub fn default_dir() -> Result<PathBuf> {
-    let base = if cfg!(windows) {
-        std::env::var_os("APPDATA").map(PathBuf::from)
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-    };
-    base.map(|b| b.join("rack"))
-        .ok_or_else(|| RackError::Usage("cannot find a config directory; pass --state FILE".to_owned()))
 }
 
 #[cfg(test)]
