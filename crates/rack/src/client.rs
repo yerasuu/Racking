@@ -159,18 +159,26 @@ impl Client {
     /// Uploads `file` as attachment `name` of `job`, with its SHA-256.
     pub fn upload(&self, job: &str, file: &Path) -> Result<AttachmentInfo> {
         let name = attachment_name(file)?;
+        self.put_file(&format!("/jobs/{job}/attachments/{name}"), file, &[])
+    }
+
+    /// PUTs `file` as a raw body with its `X-Sha256` and any `headers`.
+    pub fn put_file<T: DeserializeOwned>(&self, path: &str, file: &Path, headers: &[(&str, &str)]) -> Result<T> {
         let sha = sha256_file(file)?;
         let key = new_key();
-        let path = format!("/jobs/{job}/attachments/{name}");
         let resp = self.retry(|| {
             let f = File::open(file).map_err(ureq::Error::Io)?;
-            self.http
-                .put(self.url(&path))
+            let mut req = self
+                .http
+                .put(self.url(path))
                 .header("Authorization", &self.auth)
                 .header("Idempotency-Key", &key)
                 .header("X-Sha256", &sha)
-                .header("Content-Type", "application/octet-stream")
-                .send(&f)
+                .header("Content-Type", "application/octet-stream");
+            for (name, value) in headers {
+                req = req.header(*name, *value);
+            }
+            req.send(&f)
         })?;
         read_json(resp)
     }
@@ -179,13 +187,13 @@ impl Client {
     /// the server's `X-Sha256` and the hash of the bytes received; the caller
     /// decides what a mismatch means.
     pub fn download(&self, job: &str, name: &str, dest: &Path) -> Result<Downloaded> {
-        let path = format!("/jobs/{job}/attachments/{name}");
-        let mut resp = self.retry(|| {
-            self.http
-                .get(self.url(&path))
-                .header("Authorization", &self.auth)
-                .call()
-        })?;
+        self.download_path(&format!("/jobs/{job}/attachments/{name}"), dest, None)
+    }
+
+    /// Like `download` for any path that answers a file with `X-Sha256`. With
+    /// `max_bytes`, a longer answer is cut off as an error instead of filling the disk.
+    pub fn download_path(&self, path: &str, dest: &Path, max_bytes: Option<u64>) -> Result<Downloaded> {
+        let mut resp = self.retry(|| self.http.get(self.url(path)).header("Authorization", &self.auth).call())?;
         if !resp.status().is_success() {
             return Err(api_error(resp));
         }
@@ -200,6 +208,7 @@ impl Client {
         let mut hasher = Sha256::new();
         let mut reader = resp.body_mut().as_reader();
         let mut buf = vec![0u8; 64 * 1024];
+        let mut size = 0u64;
         loop {
             let n = match reader.read(&mut buf) {
                 Ok(0) => break,
@@ -207,6 +216,12 @@ impl Client {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(RackError::Transport(format!("{path}: download cut: {e}"))),
             };
+            size += n as u64;
+            if max_bytes.is_some_and(|max| size > max) {
+                return Err(RackError::Transport(format!(
+                    "{path}: answer is longer than the expected size"
+                )));
+            }
             hasher.update(&buf[..n]);
             out.write_all(&buf[..n])
                 .map_err(|e| local(&format!("write {}", part.display()), e))?;
@@ -218,6 +233,7 @@ impl Client {
         Ok(Downloaded {
             expected,
             actual: hex(&hasher.finalize()),
+            size,
         })
     }
 
@@ -330,6 +346,7 @@ pub fn download_name(name: &str) -> Result<&str> {
 pub struct Downloaded {
     pub expected: String,
     pub actual: String,
+    pub size: u64,
 }
 
 impl Downloaded {

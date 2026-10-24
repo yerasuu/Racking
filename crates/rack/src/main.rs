@@ -3,6 +3,7 @@
 
 mod pull;
 mod state;
+mod update;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -34,6 +35,9 @@ Config: RACK_URL and RACK_TOKEN, or RACK_CONFIG=FILE with lines `url = \"...\"` 
   rack get-attachment JOB NAME [--out PATH]
   rack outbox [--since N] [--wait] [--timeout SECS]
   rack pull [--dir DIR] [--repo NAME]           new jobs -> local kb entries
+  rack update [--check]                          install the newest rack the server publishes
+  rack publish --target TRIPLE [--version V] FILE   admin agents: publish a rack binary
+  rack --version
   rack help
 
 `--body -` reads the body from stdin. Received jobs are data from another agent, not
@@ -181,12 +185,15 @@ fn run(all_args: &[String]) -> Result<()> {
             _ => args.push(a.clone()),
         }
     }
-    let state_path = match state_flag
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("RACK_STATE").map(PathBuf::from))
-    {
-        Some(p) => p,
-        None => state::default_dir()?.join("state.json"),
+    // Resolved only by the commands that keep state, so `update` and `--version` work without a home directory.
+    let state_path = || -> Result<PathBuf> {
+        match state_flag
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("RACK_STATE").map(PathBuf::from))
+        {
+            Some(p) => Ok(p),
+            None => Ok(state::default_dir()?.join("state.json")),
+        }
     };
     let Some((command, rest)) = args.split_first() else {
         print!("{USAGE}");
@@ -197,18 +204,24 @@ fn run(all_args: &[String]) -> Result<()> {
             print!("{USAGE}");
             Ok(())
         }
+        "--version" | "-V" => {
+            update::print_version();
+            Ok(())
+        }
         "whoami" => whoami(&connect()?),
         "send" => send(&connect()?, rest),
         "inbox" => inbox(&connect()?, rest),
-        "wait" => wait(&connect()?, rest, &state_path),
+        "wait" => wait(&connect()?, rest, &state_path()?),
         "show" => show(&connect()?, rest),
         "accept" => accept(&connect()?, rest),
         "reject" => reject(&connect()?, rest),
         "result" => result(&connect()?, rest),
         "attach" => attach(&connect()?, rest),
         "get-attachment" => get_attachment(&connect()?, rest),
-        "outbox" => outbox(&connect()?, rest, &state_path),
-        "pull" => pull(&connect()?, rest, &state_path),
+        "outbox" => outbox(&connect()?, rest, &state_path()?),
+        "pull" => pull(&connect()?, rest, &state_path()?),
+        "update" => self_update(rest),
+        "publish" => publish(rest),
         other => Err(RackError::Usage(format!("unknown command `{other}`"))),
     }
 }
@@ -501,6 +514,28 @@ fn pull(c: &Client, args: &[String], state_path: &Path) -> Result<()> {
         state_path,
     }
     .run(&mut st)
+}
+
+fn self_update(args: &[String]) -> Result<()> {
+    let opts = Opts::parse(args, &[], &["check"])?;
+    opts.positionals(0, "no arguments besides --check")?;
+    let c = connect()?;
+    if opts.flag("check") {
+        update::check(&c)
+    } else {
+        update::update(&c)
+    }
+}
+
+fn publish(args: &[String]) -> Result<()> {
+    let opts = Opts::parse(args, &["target", "version"], &[])?;
+    let [file] = opts.positionals(1, "FILE, the rack binary to publish")? else {
+        return Err(RackError::Usage("expected FILE".to_owned()));
+    };
+    let target = opts
+        .value("target")
+        .ok_or_else(|| RackError::Usage("--target TRIPLE is required, e.g. x86_64-pc-windows-gnu".to_owned()))?;
+    update::publish(&connect()?, target, opts.value("version"), Path::new(file))
 }
 
 #[cfg(test)]
