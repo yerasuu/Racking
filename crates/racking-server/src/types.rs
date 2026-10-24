@@ -239,6 +239,59 @@ impl FromStr for Version {
     }
 }
 
+/// What an agent says about itself in `GET /agents`: one line of at most
+/// `MAX_CHARS` chars. Other agents read it, so it is kept short and single-line.
+pub struct About(String);
+
+impl About {
+    pub const MAX_CHARS: usize = 200;
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl FromStr for About {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        if s.chars().count() <= Self::MAX_CHARS && !s.chars().any(char::is_control) {
+            Ok(Self(s.to_owned()))
+        } else {
+            Err(format!("at most {} chars on one line", Self::MAX_CHARS))
+        }
+    }
+}
+
+/// A short label an agent reports about its own software (`rack_version`, `os`):
+/// 1 to `MAX_CHARS` of `A-Za-z0-9._+-` and spaces.
+pub struct Label(String);
+
+impl Label {
+    pub const MAX_CHARS: usize = 40;
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl FromStr for Label {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        let ok = (1..=Self::MAX_CHARS).contains(&s.len())
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-' | b' '));
+        if ok {
+            Ok(Self(s.to_owned()))
+        } else {
+            Err(format!("1 to {} of A-Za-z0-9._+- and spaces", Self::MAX_CHARS))
+        }
+    }
+}
+
 pub fn hex(bytes: &[u8]) -> String {
     use fmt::Write;
     bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut out, b| {
@@ -339,5 +392,25 @@ mod tests {
         assert!("zz".parse::<Sha256Hex>().is_err());
         assert_eq!(truncate("añb", 2), "añ");
         assert_eq!(hex(&[0, 255]), "00ff");
+    }
+
+    #[test]
+    fn about_and_labels() {
+        assert_eq!(
+            "  on the Windows PC  ".parse::<About>().map(About::into_inner),
+            Ok("on the Windows PC".to_owned())
+        );
+        assert!(
+            "ñ".repeat(About::MAX_CHARS).parse::<About>().is_ok(),
+            "counted in chars, not bytes"
+        );
+        assert!("x".repeat(About::MAX_CHARS + 1).parse::<About>().is_err());
+        assert!("two\nlines".parse::<About>().is_err());
+        assert!("".parse::<About>().is_ok());
+        assert!("0.1.0".parse::<Label>().is_ok());
+        assert!("windows x86_64".parse::<Label>().is_ok());
+        assert!("".parse::<Label>().is_err());
+        assert!("a;b".parse::<Label>().is_err());
+        assert!("x".repeat(Label::MAX_CHARS + 1).parse::<Label>().is_err());
     }
 }

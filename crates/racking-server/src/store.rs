@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 
 use crate::clock;
 use crate::error::{ApiError, ApiResult, Code};
+use crate::presence;
 use crate::types::{AgentName, AttachmentName, JobId, Seq, Sha256Hex, hex, truncate};
 
 pub mod limits {
@@ -523,6 +524,13 @@ CREATE TABLE IF NOT EXISTS idempotency (
     response TEXT,
     created_at INTEGER NOT NULL,
     PRIMARY KEY (agent, key)
+) STRICT;
+CREATE TABLE IF NOT EXISTS agents (
+    name TEXT PRIMARY KEY,
+    last_seen INTEGER,
+    about TEXT,
+    rack_version TEXT,
+    os TEXT
 ) STRICT;
 ";
 
@@ -1037,6 +1045,47 @@ impl Store {
         self.db().execute(
             "DELETE FROM idempotency WHERE agent = ?1 AND key = ?2",
             params![me.as_str(), key],
+        )?;
+        Ok(())
+    }
+
+    /// Presence rows kept from earlier runs, for `Presence::new`.
+    pub fn load_agents(&self) -> Result<Vec<presence::Stored>, String> {
+        let conn = self.db();
+        let mut stmt = conn
+            .prepare("SELECT name, last_seen, about, rack_version, os FROM agents")
+            .map_err(|e| format!("cannot read the agents table: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(presence::Stored {
+                    name: row.get(0)?,
+                    last_seen: row.get(1)?,
+                    info: presence::Info {
+                        about: row.get(2)?,
+                        rack_version: row.get(3)?,
+                        os: row.get(4)?,
+                    },
+                })
+            })
+            .map_err(|e| format!("cannot read the agents table: {e}"))?;
+        rows.collect::<Result<_, _>>()
+            .map_err(|e| format!("cannot read the agents table: {e}"))
+    }
+
+    pub fn save_last_seen(&self, agent: &AgentName, at: i64) -> ApiResult<()> {
+        self.db().execute(
+            "INSERT INTO agents (name, last_seen) VALUES (?1, ?2) \
+             ON CONFLICT (name) DO UPDATE SET last_seen = max(coalesce(last_seen, ?2), ?2)",
+            params![agent.as_str(), at],
+        )?;
+        Ok(())
+    }
+
+    pub fn save_agent_info(&self, agent: &AgentName, info: &presence::Info) -> ApiResult<()> {
+        self.db().execute(
+            "INSERT INTO agents (name, about, rack_version, os) VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT (name) DO UPDATE SET about = ?2, rack_version = ?3, os = ?4",
+            params![agent.as_str(), info.about, info.rack_version, info.os],
         )?;
         Ok(())
     }
@@ -1909,6 +1958,31 @@ mod tests {
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
             "woken, not timed out"
+        );
+    }
+
+    #[test]
+    fn presence_rows_round_trip() {
+        let (_dir, s) = store();
+        let windows = agent("windows");
+        s.save_last_seen(&windows, 100).expect("seen");
+        s.save_last_seen(&windows, 50).expect("older write");
+        let info = presence::Info {
+            about: Some("desk PC".to_owned()),
+            rack_version: Some("0.1.0".to_owned()),
+            os: None,
+        };
+        s.save_agent_info(&windows, &info).expect("info");
+        let rows = s.load_agents().expect("load");
+        let row = rows.iter().find(|r| r.name == "windows").expect("row");
+        assert_eq!(row.last_seen, Some(100), "last_seen never goes back");
+        assert_eq!(
+            (
+                row.info.about.as_deref(),
+                row.info.rack_version.as_deref(),
+                row.info.os.as_deref()
+            ),
+            (Some("desk PC"), Some("0.1.0"), None)
         );
     }
 }

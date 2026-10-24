@@ -7,6 +7,7 @@ mod clock;
 pub mod config;
 mod dist;
 mod error;
+mod presence;
 mod store;
 mod types;
 
@@ -15,6 +16,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 pub use api::guide;
+pub use clock::Clock;
 pub use config::Config;
 
 /// A started server. Dropping it leaves the server running; call `stop` to end it.
@@ -50,9 +52,18 @@ impl Running {
 ///
 /// When the data directory or database cannot be opened, or the address cannot be bound.
 pub fn start(config: &Config) -> Result<Running, String> {
+    start_with_clock(config, Clock::system())
+}
+
+/// Like `start`, with the clock presence (`GET /agents`) reads; tests pass a manual one.
+///
+/// # Errors
+///
+/// As `start`.
+pub fn start_with_clock(config: &Config, clock: Clock) -> Result<Running, String> {
     let store = store::Store::open(&config.data_dir)?;
     let dist = dist::Dist::open(&config.data_dir)?;
-    let app = Arc::new(api::App::new(config, store, dist));
+    let app = Arc::new(api::App::new(config, store, dist, clock)?);
     let server = tiny_http::Server::http(config.bind).map_err(|e| format!("cannot listen on {}: {e}", config.bind))?;
     let addr = server
         .server_addr()

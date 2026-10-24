@@ -19,6 +19,10 @@ struct Server {
 
 impl Server {
     fn start() -> Self {
+        Self::start_with(racking_server::Clock::system())
+    }
+
+    fn start_with(clock: racking_server::Clock) -> Self {
         static RUNS: AtomicUsize = AtomicUsize::new(0);
         let run = RUNS.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("racking-it-{}-{run}", std::process::id()));
@@ -29,7 +33,7 @@ impl Server {
             dir.display().to_string()
         ))
         .expect("config");
-        let running = racking_server::start(&config).expect("start");
+        let running = racking_server::start_with_clock(&config, clock).expect("start");
         let base = format!("http://{}", running.addr());
         let http = ureq::Agent::config_builder()
             .http_status_as_error(false)
@@ -582,4 +586,104 @@ fn messages_notices_and_reports() {
             .as_str()
             .is_some_and(|g| g.contains("## Kinds") && g.contains("answered"))
     );
+}
+
+#[test]
+fn presence_follows_requests_and_waits() {
+    let clock = racking_server::Clock::manual(1_800_000_000);
+    let s = Server::start_with(clock.clone());
+    let windows_entry = |s: &Server| {
+        let (status, all) = s.call("GET", "/agents", Some(LINUX), None);
+        assert_eq!(status, 200, "{all}");
+        let text = all.to_string();
+        assert!(
+            !text.contains(LINUX) && !text.contains(WINDOWS) && !text.contains("admin"),
+            "no token or admin flag in {text}"
+        );
+        assert_eq!(
+            all["agents"].as_array().map(Vec::len),
+            Some(2),
+            "every agent, the caller included"
+        );
+        all["agents"]
+            .as_array()
+            .and_then(|a| a.iter().find(|e| e["name"] == "windows").cloned())
+            .expect("windows entry")
+    };
+
+    let w = windows_entry(&s);
+    assert_eq!(
+        (w["online"].clone(), w["last_seen"].clone()),
+        (json!(false), Value::Null)
+    );
+
+    let (status, me) = s.call(
+        "PUT",
+        "/agents/me",
+        Some(WINDOWS),
+        Some(json!({"about": "Windows PC, GPU tests", "rack_version": "0.1.0", "os": "windows"})),
+    );
+    assert_eq!((status, me["name"].as_str()), (200, Some("windows")), "{me}");
+    let (status, err) = s.call(
+        "PUT",
+        "/agents/windows",
+        Some(LINUX),
+        Some(json!({"about": "hijacked"})),
+    );
+    assert_eq!((status, err["error"]["code"].as_str()), (404, Some("not_found")));
+    let (status, err) = s.call(
+        "PUT",
+        "/agents/me",
+        Some(LINUX),
+        Some(json!({"about": "x".repeat(201)})),
+    );
+    assert_eq!((status, err["error"]["code"].as_str()), (400, Some("bad_request")));
+    let (status, _) = s.call("PUT", "/agents/me", None, Some(json!({"about": "anonymous"})));
+    assert_eq!(status, 401);
+
+    let w = windows_entry(&s);
+    assert_eq!(w["online"], true);
+    assert_eq!(w["last_seen"], "2027-01-15T08:00:00Z");
+    assert_eq!(
+        (w["about"].as_str(), w["rack_version"].as_str(), w["os"].as_str()),
+        (Some("Windows PC, GPU tests"), Some("0.1.0"), Some("windows"))
+    );
+
+    clock.advance(600);
+    assert_eq!(windows_entry(&s)["online"], false, "idle 10 min");
+
+    let waiter = {
+        let base = s.base.clone();
+        let http = s.http.clone();
+        std::thread::spawn(move || {
+            http.get(format!("{base}/inbox/wait?since=0&timeout=3"))
+                .header("Authorization", format!("Bearer {WINDOWS}"))
+                .call()
+                .expect("wait")
+                .status()
+                .as_u16()
+        })
+    };
+    let started = Instant::now();
+    while windows_entry(&s)["online"] != true {
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the wait never showed windows online"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    clock.advance(600);
+    let w = windows_entry(&s);
+    assert_eq!(
+        (w["online"].clone(), w["idle_secs"].clone()),
+        (json!(true), json!(0)),
+        "online while it waits"
+    );
+    assert_eq!(waiter.join().expect("join"), 200);
+
+    let w = windows_entry(&s);
+    assert_eq!(w["online"], true, "the end of the wait is activity");
+    clock.advance(91);
+    let w = windows_entry(&s);
+    assert_eq!((w["online"].clone(), w["idle_secs"].clone()), (json!(false), json!(91)));
 }

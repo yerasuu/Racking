@@ -1,7 +1,40 @@
 //! Wall-clock helpers. Times are stored as Unix seconds and shown as RFC 3339 UTC,
 //! which avoids a date crate for the one format the protocol uses.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// The time source of presence (`GET /agents`), in Unix seconds. Injectable so
+/// tests can move time past the online window instead of sleeping through it;
+/// job timestamps always use the system clock.
+#[derive(Clone)]
+pub struct Clock(Option<Arc<AtomicI64>>);
+
+impl Clock {
+    pub fn system() -> Self {
+        Self(None)
+    }
+
+    /// A clock that stands still at `start` until `advance` moves it; clones share it.
+    pub fn manual(start: i64) -> Self {
+        Self(Some(Arc::new(AtomicI64::new(start))))
+    }
+
+    /// Moves a manual clock forward; a system clock ignores it.
+    pub fn advance(&self, secs: i64) {
+        if let Some(t) = &self.0 {
+            t.fetch_add(secs, Ordering::Relaxed);
+        }
+    }
+
+    pub fn now(&self) -> i64 {
+        match &self.0 {
+            Some(t) => t.load(Ordering::Relaxed),
+            None => now(),
+        }
+    }
+}
 
 pub fn now() -> i64 {
     SystemTime::now()
