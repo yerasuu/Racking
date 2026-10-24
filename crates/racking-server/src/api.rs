@@ -14,7 +14,7 @@ use tiny_http::{Header, Request, Response, ResponseBox};
 
 use crate::clock::Clock;
 use crate::config::Config;
-use crate::dist::{self, Dist};
+use crate::dist::{self, Dist, Slot};
 use crate::error::{ApiError, ApiResult, Code};
 use crate::presence::{self, Flush, InfoUpdate, Presence, Software};
 use crate::store::{self, Claim, Download, Kind, Move, NewJob, Origin, Outcome, Priority, State, Store, View, limits};
@@ -352,8 +352,10 @@ static ROUTES: &[Route] = &[
         auth: true,
         body: BodyKind::None,
         summary: "The `rack` binaries `rack update` installs: `{\"version\", \"targets\": {<target triple>: \
-                  {\"version\", \"file\", \"size\", \"sha256\"}}}`. `version` is the one published last (null while \
-                  none is). Integrity is the SHA-256 only; nothing is signed.",
+                  {\"version\", \"file\", \"size\", \"sha256\"}}, \"prerelease\": {\"version\", \"targets\"}}`. The \
+                  top level lists the stable releases, `prerelease` the test builds (`X.Y.Z-N`, served under \
+                  `/dist/pre/`). Each `version` is the one published last in its slot (null while none is). \
+                  Integrity is the SHA-256 only; nothing is signed.",
         query: &[],
         input: "",
         example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" $RACK_URL/dist/manifest",
@@ -373,16 +375,30 @@ static ROUTES: &[Route] = &[
         handler: get_dist_file,
     },
     Route {
+        method: Method::Get,
+        path: "/dist/pre/{target}/{file}",
+        auth: true,
+        body: BodyKind::None,
+        summary: "Download the test build (`prerelease` in the manifest) of a target, like `/dist/{target}/{file}`.",
+        query: &[],
+        input: "",
+        example: "curl -s -o rack -H \"Authorization: Bearer $RACK_TOKEN\" \
+                  $RACK_URL/dist/pre/x86_64-unknown-linux-gnu/rack",
+        handler: get_dist_pre_file,
+    },
+    Route {
         method: Method::Put,
         path: "/dist/{target}/{file}",
         auth: true,
         body: BodyKind::Raw,
         summary: "Admin agents only (`admin = true` in the server config): publish the `rack` binary of a target. \
-                  It replaces the one there; only the latest is kept.",
+                  The version picks the slot: `X.Y.Z` replaces the stable release, a pre-release such as \
+                  `X.Y.Z-1` replaces the test build; the other slot is left as it is. Only the latest of each \
+                  is kept.",
         query: &[],
-        input: "Raw body. Headers `X-Sha256` (hex SHA-256 of the body) and `X-Version` (semver, e.g. `0.2.0`) are \
-                required. `target` is one of `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-gnu`, \
-                `aarch64-unknown-linux-gnu`. Limit: 32 MiB.",
+        input: "Raw body. Headers `X-Sha256` (hex SHA-256 of the body) and `X-Version` (semver without build \
+                metadata, e.g. `0.2.0` or `0.2.0-1`) are required. `target` is one of `x86_64-unknown-linux-gnu`, \
+                `x86_64-pc-windows-gnu`, `aarch64-unknown-linux-gnu`. Limit: 32 MiB.",
         example: "curl -s -T rack -H \"Authorization: Bearer $RACK_TOKEN\" -H 'X-Version: 0.2.0' \
                   -H \"X-Sha256: $(sha256sum rack | cut -d' ' -f1)\" $RACK_URL/dist/x86_64-unknown-linux-gnu/rack",
         handler: put_dist_file,
@@ -1503,7 +1519,13 @@ fn dist_target(call: &Call<'_>) -> ApiResult<Target> {
 fn get_dist_file(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
     call.me()?;
     let target = dist_target(call)?;
-    Ok(Reply::File(app.dist.download(target)?))
+    Ok(Reply::File(app.dist.download(Slot::Stable, target)?))
+}
+
+fn get_dist_pre_file(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
+    call.me()?;
+    let target = dist_target(call)?;
+    Ok(Reply::File(app.dist.download(Slot::Pre, target)?))
 }
 
 fn put_dist_file(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
@@ -1526,6 +1548,14 @@ fn put_dist_file(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
         .ok_or_else(|| ApiError::bad_request("X-Version header is required"))?
         .parse()
         .map_err(|e: String| ApiError::bad_request(format!("X-Version: {e}")))?;
+    // Build metadata does not count for SemVer precedence, so `1.0.0+a` and `1.0.0+b` would be one version.
+    if version.has_build() {
+        return Err(ApiError::new(
+            Code::BadRequest,
+            format!("X-Version `{}` has build metadata", truncate(version.as_str(), 70)),
+            "Publish without the `+...` part: `X.Y.Z` for a stable release, `X.Y.Z-N` for a test build.",
+        ));
+    }
     if call
         .request
         .body_length()
@@ -1535,7 +1565,14 @@ fn put_dist_file(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
     }
     let me = me.clone();
     let published = app.dist.publish(target, &version, call.request.as_reader(), &claimed)?;
-    tracing::info!(target: "racking::dist", agent = %me, %target, version = version.as_str(), "published rack");
+    tracing::info!(
+        target: "racking::dist",
+        agent = %me,
+        %target,
+        version = version.as_str(),
+        slot = Slot::of(&version).as_str(),
+        "published rack"
+    );
     ok(published)
 }
 

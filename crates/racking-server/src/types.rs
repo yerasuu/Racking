@@ -208,6 +208,16 @@ impl Version {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// `X.Y.Z-N`: a test build that comes before the stable `X.Y.Z`.
+    pub fn is_prerelease(&self) -> bool {
+        // A `-` inside build metadata (`1.0.0+a-b`) does not make a pre-release.
+        self.0.split_once('+').map_or(self.0.as_str(), |(v, _)| v).contains('-')
+    }
+
+    pub fn has_build(&self) -> bool {
+        self.0.contains('+')
+    }
 }
 
 impl FromStr for Version {
@@ -417,31 +427,26 @@ mod tests {
 
     #[test]
     fn versions() {
-        for ok in [
-            "0.1.0",
-            "1.2.3",
-            "10.20.30",
-            "1.0.0-rc.1",
-            "1.0.0-0.3.7",
-            "1.0.0-x-y.z",
-            "1.0.0+build.5",
-        ] {
-            assert!(ok.parse::<Version>().is_ok(), "{ok}");
+        // The same table as rack's update::version tests, so both parsers accept the same grammar.
+        let mut cases = 0;
+        for line in include_str!("../../../testdata/versions.txt").lines() {
+            let Some((expect, v)) = line.split_once(' ').filter(|_| !line.starts_with('#')) else {
+                continue;
+            };
+            let v = if v == "<empty>" { "" } else { v };
+            match expect {
+                "ok" => assert!(v.parse::<Version>().is_ok(), "{v}"),
+                "bad" => assert!(v.parse::<Version>().is_err(), "{v}"),
+                other => panic!("unknown case `{other}`"),
+            }
+            cases += 1;
         }
-        for bad in [
-            "",
-            "1.2",
-            "1.2.3.4",
-            "01.2.3",
-            "1.2.3-",
-            "1.2.3-01",
-            "1.2.3+",
-            "1.2.3-a..b",
-            "v1.2.3",
-            "1.2.x",
-        ] {
-            assert!(bad.parse::<Version>().is_err(), "{bad}");
-        }
+        assert!(cases > 20, "the table was read");
+        let parse = |v: &str| v.parse::<Version>().unwrap_or_else(|e| panic!("{e}"));
+        assert!(parse("0.1.4-1").is_prerelease());
+        assert!(!parse("0.1.4").is_prerelease());
+        assert!(!parse("0.1.4+a-b").is_prerelease());
+        assert!(parse("0.1.4+a-b").has_build() && !parse("0.1.4-1").has_build());
     }
 
     #[test]

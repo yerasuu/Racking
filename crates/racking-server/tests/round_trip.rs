@@ -337,7 +337,11 @@ fn dist_publish_and_download() {
     let path = "/dist/x86_64-unknown-linux-gnu/rack";
 
     let (status, m) = s.call("GET", "/dist/manifest", Some(WINDOWS), None);
-    assert_eq!((status, m), (200, json!({"version": null, "targets": {}})));
+    let empty = json!({"version": null, "targets": {}});
+    assert_eq!(
+        (status, m),
+        (200, json!({"version": null, "targets": {}, "prerelease": empty}))
+    );
     let (status, err) = s.call("GET", "/dist/manifest", None, None);
     assert_eq!((status, err["error"]["code"].as_str()), (401, Some("no_token")));
     let (status, err) = s.call("GET", path, Some(WINDOWS), None);
@@ -406,11 +410,97 @@ fn dist_publish_and_download() {
 
     let (status, guide) = s.call("GET", "/help", None, None);
     assert_eq!(status, 200);
-    assert!(
-        guide
-            .as_str()
-            .is_some_and(|g| g.contains("PUT /dist/{target}/{file}") && g.contains("not_admin"))
+    assert!(guide.as_str().is_some_and(|g| g.contains("PUT /dist/{target}/{file}")
+        && g.contains("GET /dist/pre/{target}/{file}")
+        && g.contains("not_admin")));
+}
+
+/// What `rack update` 0.1.0 to 0.1.2 deserializes from the manifest, copied from
+/// `git show v0.1.2:crates/rack/src/update/origin.rs` (unknown keys are ignored there too).
+#[derive(serde::Deserialize)]
+struct OldManifest {
+    #[serde(default)]
+    targets: std::collections::HashMap<String, OldEntry>,
+}
+
+#[derive(serde::Deserialize)]
+struct OldEntry {
+    version: String,
+    file: String,
+    size: u64,
+    sha256: String,
+}
+
+#[test]
+fn dist_prerelease_slot() {
+    let s = Server::start();
+    let path = "/dist/x86_64-unknown-linux-gnu/rack";
+    let pre_path = "/dist/pre/x86_64-unknown-linux-gnu/rack";
+    let (stable, test) = (&b"stable 0.1.3"[..], &b"test 0.1.4-2"[..]);
+
+    let (status, err) = s.call("GET", pre_path, Some(WINDOWS), None);
+    assert_eq!((status, err["error"]["code"].as_str()), (404, Some("not_found")));
+    let (status, published) = s.publish(path, LINUX, stable, &sha(stable), "0.1.3");
+    assert_eq!((status, published["slot"].as_str()), (200, Some("stable")));
+    let (status, published) = s.publish(path, LINUX, test, &sha(test), "0.1.4-2");
+    assert_eq!(
+        (status, published["slot"].as_str(), published["path"].as_str()),
+        (200, Some("pre"), Some(pre_path))
     );
+    // The slot comes from the version, never from the path: there is no PUT under /dist/pre/.
+    let (status, _) = s.publish(pre_path, LINUX, test, &sha(test), "0.1.4-3");
+    assert_eq!(status, 404);
+    for v in ["0.1.4+linux", "0.1.4-3+b7"] {
+        let (status, err) = s.publish(path, LINUX, test, &sha(test), v);
+        assert_eq!(
+            (status, err["error"]["code"].as_str()),
+            (400, Some("bad_request")),
+            "{v}"
+        );
+        assert!(
+            err["error"]["hint"]
+                .as_str()
+                .is_some_and(|h| h.contains("without the `+...` part")),
+            "{err}"
+        );
+    }
+
+    let (status, m) = s.call("GET", "/dist/manifest", Some(WINDOWS), None);
+    assert_eq!(status, 200);
+    let entry = |v: &str, body: &[u8]| json!({"version": v, "file": "rack", "size": body.len(), "sha256": sha(body)});
+    assert_eq!(m["version"], "0.1.3");
+    assert_eq!(m["targets"]["x86_64-unknown-linux-gnu"], entry("0.1.3", stable));
+    assert_eq!(
+        m["prerelease"],
+        json!({"version": "0.1.4-2", "targets": {"x86_64-unknown-linux-gnu": entry("0.1.4-2", test)}})
+    );
+
+    // An old client reads the new manifest as before and sees only the stable release.
+    let old: OldManifest = serde_json::from_value(m).expect("the 0.1.2 client parses the manifest");
+    let e = &old.targets["x86_64-unknown-linux-gnu"];
+    assert_eq!(
+        (e.version.as_str(), e.file.as_str(), e.size, e.sha256.as_str()),
+        ("0.1.3", "rack", stable.len() as u64, sha(stable).as_str())
+    );
+    assert_eq!(old.targets.len(), 1);
+
+    for (p, body) in [(path, stable), (pre_path, test)] {
+        let mut resp = s
+            .http
+            .get(format!("{}{p}", s.base))
+            .header("Authorization", format!("Bearer {WINDOWS}"))
+            .call()
+            .expect("download");
+        let header = resp
+            .headers()
+            .get("x-sha256")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let got = resp.body_mut().read_to_vec().expect("bytes");
+        assert_eq!((got.as_slice(), header), (body, Some(sha(body))), "{p}");
+    }
+    let (status, err) = s.call("GET", pre_path, None, None);
+    assert_eq!((status, err["error"]["code"].as_str()), (401, Some("no_token")));
 }
 
 #[test]

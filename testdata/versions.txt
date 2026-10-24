@@ -1,0 +1,33 @@
+# Semantic Versioning 2.0.0 grammar (https://semver.org/spec/v2.0.0.html), read by the
+# tests of both parsers: racking-server's types::Version and rack's update::version.
+# `ok V` must parse, `bad V` must not; `<empty>` stands for the empty string.
+ok 0.1.0
+ok 1.2.3
+ok 10.20.30
+ok 0.1.4-1
+ok 0.1.4-12
+ok 1.0.0-rc.1
+ok 1.0.0-0.3.7
+ok 1.0.0-x-y.z
+ok 1.0.0-alpha.beta
+ok 1.0.0-0a
+ok 1.0.0-x.7.z.92
+ok 1.0.0+build.5
+ok 1.0.0-rc.1+b5
+bad <empty>
+bad 1
+bad 1.2
+bad 1.2.3.4
+bad 01.2.3
+bad 1.02.3
+bad 1.2.x
+bad v1.2.3
+bad 1.2.3-
+bad 1.2.3-01
+bad 1.2.3-1.01
+bad 1.2.3-a..b
+bad 1.2.3-a_b
+bad 1.2.3+
+bad 1.2.3+a..b
+bad 99999999999999999999.0.0
+bad 1.0.0-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
