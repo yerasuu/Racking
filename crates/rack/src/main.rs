@@ -1,7 +1,6 @@
 //! `rack`: command-line client for a Racking server. Output is short, one line
 //! per job, so agents can read it cheaply.
 
-mod client;
 mod pull;
 mod state;
 
@@ -11,7 +10,8 @@ use std::process::ExitCode;
 
 use serde_json::{Value, json};
 
-use client::{Client, Job, Listing, RackError, Result, local};
+// Imported at the crate root so `pull` and `state` keep reaching it as `crate::client`.
+use rack::client::{self, Client, Job, Listing, Outcome, RackError, Result, job_id, local};
 use state::State;
 
 const USAGE: &str = "\
@@ -386,29 +386,12 @@ fn show(c: &Client, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Job ids go into URL paths, so they are checked before use.
-fn job_id(id: &str) -> Result<&str> {
-    let digits = id.strip_prefix('j').unwrap_or_default();
-    if !digits.is_empty() && digits.len() <= 18 && digits.bytes().all(|b| b.is_ascii_digit()) {
-        Ok(id)
-    } else {
-        Err(RackError::Usage(format!("job id `{id}` must look like j42")))
-    }
-}
-
 fn accept(c: &Client, args: &[String]) -> Result<()> {
     let opts = Opts::parse(args, &[], &[])?;
     let [id] = opts.positionals(1, "JOB")? else {
         return Err(RackError::Usage("expected JOB".to_owned()));
     };
-    let id = job_id(id)?;
-    // Accept needs `received`; receiving first makes `rack accept` work on a job never read.
-    match c.post::<Job>(&format!("/jobs/{id}/receive"), None) {
-        Ok(_) => {}
-        Err(RackError::Api { status: 409, .. }) => {}
-        Err(e) => return Err(e),
-    }
-    let j: Job = c.post(&format!("/jobs/{id}/accept"), None)?;
+    let j = c.accept(job_id(id)?)?;
     println!("{} {}: {}", j.id, j.state, j.title);
     Ok(())
 }
@@ -435,18 +418,12 @@ fn result(c: &Client, args: &[String]) -> Result<()> {
         return Err(RackError::Usage("expected JOB".to_owned()));
     };
     let original: Job = c.get(&format!("/jobs/{}", job_id(id)?))?;
-    let title = match opts.value("title") {
-        Some(t) => t.to_owned(),
-        None => format!("Result: {}", original.title).chars().take(200).collect(),
+    let outcome = if opts.flag("failed") {
+        Outcome::Failed
+    } else {
+        Outcome::Done
     };
-    let job = json!({
-        "to": original.from,
-        "kind": "result",
-        "reply_to": original.id,
-        "outcome": if opts.flag("failed") { "failed" } else { "done" },
-        "title": title,
-        "body": body_arg(&opts)?,
-    });
+    let job = client::result_job(&original, outcome, opts.value("title"), &body_arg(&opts)?);
     let files: Vec<&str> = opts.all("attach").collect();
     create_and_attach(c, &job, &files)
 }
@@ -469,29 +446,11 @@ fn get_attachment(c: &Client, args: &[String]) -> Result<()> {
     let [id, name] = opts.positionals(2, "JOB and NAME")? else {
         return Err(RackError::Usage("expected JOB and NAME".to_owned()));
     };
-    if name.is_empty()
-        || name.starts_with('.')
-        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-    {
-        return Err(RackError::Usage(format!(
-            "attachment name `{name}` must match [A-Za-z0-9._-]"
-        )));
-    }
+    let name = client::download_name(name)?;
     let dest = PathBuf::from(opts.value("out").unwrap_or(name));
-    let got = c.download(job_id(id)?, name, &dest)?;
-    if got.verified() {
-        println!("{} saved, sha256 {} verified", dest.display(), got.actual);
-        Ok(())
-    } else {
-        let bad = client::with_suffix(&dest, ".bad");
-        std::fs::rename(&dest, &bad).map_err(|e| local(&format!("move to {}", bad.display()), e))?;
-        Err(RackError::Local(format!(
-            "sha256 mismatch: server says {}, got {}; kept as {}",
-            got.expected,
-            got.actual,
-            bad.display()
-        )))
-    }
+    let sha = c.download_verified(job_id(id)?, name, &dest)?;
+    println!("{} saved, sha256 {sha} verified", dest.display());
+    Ok(())
 }
 
 fn outbox(c: &Client, args: &[String], state_path: &Path) -> Result<()> {
@@ -565,12 +524,5 @@ mod tests {
         assert!(o.flag("failed"));
         assert!(Opts::parse(&strings(&["--nope"]), &[], &[]).is_err());
         assert!(Opts::parse(&strings(&["--tag"]), &["tag"], &[]).is_err());
-    }
-
-    #[test]
-    fn job_ids() {
-        assert!(job_id("j12").is_ok());
-        assert!(job_id("12").is_err());
-        assert!(job_id("j1/../x").is_err());
     }
 }

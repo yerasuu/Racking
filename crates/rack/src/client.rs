@@ -1,4 +1,4 @@
-//! Thin blocking client over the Racking HTTP API.
+//! Thin blocking client over the Racking HTTP API, shared by `rack` and `racking-mcp`.
 
 use std::fmt;
 use std::fs::{self, File};
@@ -221,6 +221,32 @@ impl Client {
         })
     }
 
+    /// Accept needs `received`; receiving first makes accept work on a job never read.
+    pub fn accept(&self, id: &str) -> Result<Job> {
+        match self.post::<Job>(&format!("/jobs/{id}/receive"), None) {
+            Ok(_) | Err(RackError::Api { status: 409, .. }) => {}
+            Err(e) => return Err(e),
+        }
+        self.post(&format!("/jobs/{id}/accept"), None)
+    }
+
+    /// Downloads to `dest` and returns the verified SHA-256. On a mismatch the
+    /// file is kept as `<dest>.bad`, never under `dest`, so nobody uses it by mistake.
+    pub fn download_verified(&self, job: &str, name: &str, dest: &Path) -> Result<String> {
+        let got = self.download(job, name, dest)?;
+        if got.verified() {
+            return Ok(got.actual);
+        }
+        let bad = with_suffix(dest, ".bad");
+        fs::rename(dest, &bad).map_err(|e| local(&format!("move to {}", bad.display()), e))?;
+        Err(RackError::Local(format!(
+            "sha256 mismatch: server says {}, got {}; kept as {}",
+            got.expected,
+            got.actual,
+            bad.display()
+        )))
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base)
     }
@@ -240,6 +266,64 @@ impl Client {
                 Err(e) => return Err(RackError::Transport(format!("{}: {e}", self.base))),
             }
         }
+    }
+}
+
+/// How a `result` job ends the job it answers.
+#[derive(Clone, Copy)]
+pub enum Outcome {
+    Done,
+    Failed,
+}
+
+impl Outcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Outcome::Done => "done",
+            Outcome::Failed => "failed",
+        }
+    }
+}
+
+/// The `result` job answering `original`: it goes back to the sender, and the
+/// default title comes from the original one, cut to the server's 200 chars.
+pub fn result_job(original: &Job, outcome: Outcome, title: Option<&str>, body: &str) -> Value {
+    let title: String = match title {
+        Some(t) => t.to_owned(),
+        None => format!("Result: {}", original.title).chars().take(200).collect(),
+    };
+    serde_json::json!({
+        "to": original.from,
+        "kind": "result",
+        "reply_to": original.id,
+        "outcome": outcome.as_str(),
+        "title": title,
+        "body": body,
+    })
+}
+
+/// Job ids go into URL paths, so they are checked before use.
+pub fn job_id(id: &str) -> Result<&str> {
+    let digits = id.strip_prefix('j').unwrap_or_default();
+    if !digits.is_empty() && digits.len() <= 18 && digits.bytes().all(|b| b.is_ascii_digit()) {
+        Ok(id)
+    } else {
+        Err(RackError::Usage(format!("job id `{id}` must look like j42")))
+    }
+}
+
+/// An attachment name to download: it goes into the URL and becomes a local
+/// file name, so a leading dot (`..`, hidden files) is refused too.
+pub fn download_name(name: &str) -> Result<&str> {
+    if (1..=100).contains(&name.len())
+        && !name.starts_with('.')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    {
+        Ok(name)
+    } else {
+        Err(RackError::Usage(format!(
+            "attachment name `{name}` must match [A-Za-z0-9._-]{{1,100}} and not start with a dot"
+        )))
     }
 }
 
@@ -370,5 +454,21 @@ mod tests {
         );
         assert!(attachment_name(Path::new("my file.txt")).is_err());
         assert!(attachment_name(Path::new("ñ.txt")).is_err());
+    }
+
+    #[test]
+    fn job_ids() {
+        assert!(job_id("j12").is_ok());
+        assert!(job_id("12").is_err());
+        assert!(job_id("j1/../x").is_err());
+    }
+
+    #[test]
+    fn download_names() {
+        assert!(download_name("probe.log").is_ok());
+        assert!(download_name("..").is_err());
+        assert!(download_name(".env").is_err());
+        assert!(download_name("a/b").is_err());
+        assert!(download_name("").is_err());
     }
 }
