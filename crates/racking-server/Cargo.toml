@@ -1,0 +1,20 @@
+[package]
+name = "racking-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tiny_http = "0.12"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+ureq = { version = "3", default-features = false, features = ["json"] }
+
+[lints]
+workspace = true
