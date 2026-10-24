@@ -9,11 +9,16 @@ mod rpc;
 mod server;
 mod tools;
 
-// Ties the build to `tag-changelog/vX.Y.Z.md` of the version being built (see rack::release).
+// Ties the build to `tag-changelog/vX.Y.Z.md` of the version being built, test builds X.Y.Z-N
+// included (see rack::release).
 const _: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tag-changelog/v",
-    env!("CARGO_PKG_VERSION"),
+    env!("CARGO_PKG_VERSION_MAJOR"),
+    ".",
+    env!("CARGO_PKG_VERSION_MINOR"),
+    ".",
+    env!("CARGO_PKG_VERSION_PATCH"),
     ".md"
 ));
 

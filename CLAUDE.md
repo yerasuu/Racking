@@ -10,6 +10,7 @@ holds a just-written executable open); `racking-mcp` tests spawn the real binary
 Every release updates `docs/agent-guide.md` (the overview) and `docs/commands/<name>.md` (one help file per `rack` command): `rack guide`, `rack help COMMAND` and `racking_guide` embed them with `include_str!` through the table `rack::guide::COMMANDS`.
 Tests fail if a command in `USAGE` or the dispatch has no table entry or no complete help file (Purpose, Options, Examples, Exit codes, MCP), if an option the parser accepts is missing from its help, or if an MCP tool is undocumented.
 A new command or MCP tool therefore needs its table entry, its `docs/commands/<name>.md`, and a mention in the agent guide.
+Version numbers (decision #41): `X.Y.Z` is a stable release, tagged `vX.Y.Z` and pushed; `X.Y.Z-N` (N = 1, 2, ...) is a test build before the stable `X.Y.Z`, tagged locally `vX.Y.Z-N` and never pushed. Precedence is SemVer 2.0.0 (`X.Y.Z-N < X.Y.Z`); build metadata `+...` is not used. A test build shares the release notes of its `X.Y.Z`: the `release.rs` gate and `racking-mcp`'s `main.rs` embed `tag-changelog/vMAJOR.MINOR.PATCH.md`. The SemVer grammar is parsed twice (server `types::Version`, `rack`'s `update::version`); both test against `testdata/versions.txt`, so change it there.
 
 <!-- kanbrain:start -->
 ## Project memory: kanbrain
