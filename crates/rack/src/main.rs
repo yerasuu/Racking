@@ -51,7 +51,7 @@ Config: RACK_URL and RACK_TOKEN, or RACK_CONFIG=FILE with lines `url = \"...\"` 
   rack pull [--dir DIR] [--repo NAME] [--notes] new tasks -> kb entries; --notes: reports -> kb notes
   rack update [--check]                          install the newest rack the server publishes
   rack publish --target TRIPLE [--version V] FILE   admin agents: publish a rack binary
-  rack --version
+  rack version                                   (also --version, -V)
   rack help
 
 `--body -` and a TEXT of `-` read stdin. Notices, messages and reports need no reply
@@ -221,7 +221,7 @@ fn run(all_args: &[String]) -> Result<()> {
             print!("{USAGE}");
             Ok(())
         }
-        "--version" | "-V" => {
+        "version" | "--version" | "-V" => {
             update::print_version();
             Ok(())
         }
