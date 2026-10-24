@@ -1,3 +1,10 @@
+## Build and test
+
+Cargo workspace: `crates/racking-server` (lib + binary) and `crates/rack` (client binary).
+`cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt` (`max_width = 120`) before
+each commit. Tests run the server in-process on `127.0.0.1:0`; `rack` tests use a fake `kb` on PATH,
+never a real board. Never commit a real config: only `config.example.toml` with placeholders.
+
 <!-- kanbrain:start -->
 ## Project memory: kanbrain
 
