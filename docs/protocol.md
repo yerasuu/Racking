@@ -28,15 +28,17 @@ Named by the server config, e.g. `linux`, `windows`. The token maps to exactly o
 | `id` | string | Server id, `j` + increasing integer (`j42`). Global, never reused. |
 | `from` | string | Sender agent. Set by the server from the token, never by the client. |
 | `to` | string | Recipient agent. |
-| `kind` | string | `task`, `comment`, `result`. |
-| `title` | string | 1 to 200 chars, one line. |
-| `body` | string | Markdown, up to 64 KiB. |
+| `kind` | string | `task`, `message`, `notice`, `report`, `comment`, `result`. |
+| `title` | string | 1 to 200 chars, one line. Optional for `message` and `notice`: the server takes the first line of the body with text, cut to 80 chars. |
+| `body` | string | Markdown, up to 64 KiB; a `notice` up to 1 KiB, a `report` up to 1 MiB. |
 | `tags` | string[] | Up to 16, each 1 to 40 of `A-Za-z0-9._:/-`, not starting with `-`. |
 | `origin` | object or null | `{"repo": "decanter", "id": "873", "url": null}`: the entry on the sender's board. |
-| `reply_to` | string or null | Job id this job answers. Required for `comment` and `result`. Goes to the other party of that job. |
+| `reply_to` | string or null | Job id this job answers. Required for `comment` and `result`, refused for `notice`. Goes to the other party of that job. |
 | `outcome` | string | `result` only: `done` (default) or `failed`. |
+| `priority` | string | `low`, `normal` (default) or `high`. Shown to the recipient; the service never orders or filters by it. |
+| `expects_reply` | boolean | Whether the sender wants an answer. Default `true` for `task`, `false` for the others; never `true` on a `notice`. |
 | `state` | string | See states. |
-| `attachments` | object[] | Summaries only: `name`, `size`, `sha256`. |
+| `attachments` | object[] | Summaries only: `name`, `size`, `sha256`. Listed in inbox entries too. |
 | `reason` | string | Present once rejected. |
 | `created_at`, `updated_at` | string | UTC, RFC 3339. |
 | `seq` | integer | Position in the recipient inbox. Used as the inbox cursor. |
@@ -44,9 +46,16 @@ Named by the server config, e.g. `linux`, `windows`. The token maps to exactly o
 
 Kinds:
 
-- `task`: asks the recipient to do work. Creates a task on the recipient board.
-- `comment`: adds information to an earlier job. Becomes a comment on the task made for `reply_to`.
-- `result`: reports the outcome of a task. Like `comment`, and also moves the original job to `done` (or `failed` with `"outcome": "failed"`). Only the recipient of the original job sends it, and only once that job is `accepted`.
+| Kind | For | Body | Files | Answer |
+|---|---|---|---|---|
+| `notice` | A heads-up: "CI is red", "deploying now". | 1 KiB | No | Never; `reply_to` a notice answers 409. |
+| `message` | Conversation: a question, an answer, a short update. | 64 KiB | Yes | Another `message` with `reply_to`, only if wanted. |
+| `report` | Findings or results to read later: an analysis, a test run. | 1 MiB | Yes | As a message. |
+| `task` | Work for the recipient, with states. | 64 KiB | Yes | `result`, after `accept`. |
+| `comment` | Adds information to an earlier job. Becomes a comment on the task made for `reply_to`. | 64 KiB | Yes | No. |
+| `result` | Reports the outcome of a task. Like `comment`, and also moves the original job to `done` (or `failed` with `"outcome": "failed"`). Only the recipient of the original job sends it, and only once that job is `accepted`. | 64 KiB | Yes | No. |
+
+`notice`, `message` and `report` are delivered, not worked on: they have no accept, reject, receive or result (409 `bad_transition`, with a hint to answer with a message), and they need no reply unless `expects_reply` is true. A `comment` or `result` whose `reply_to` is a message or report answers 409 too.
 
 ### States
 
@@ -66,13 +75,27 @@ sent -> received -> accepted -> done
 | `done` | recipient (via `result`) | Finished. |
 | `failed` | recipient (via `result`) | Tried and could not. |
 
-Only the recipient moves a job forward. The sender can `cancel` while the state is `sent`. Moves not in the graph return `409 bad_transition`. Repeating the same move is a no-op (200), so retries are safe.
+Notices, messages and reports have a shorter graph:
+
+```
+sent -> received -> answered   (only with expects_reply)
+```
+
+| State | Set by | Meaning |
+|---|---|---|
+| `sent` | service | Stored, not yet delivered. The sender can still cancel it. |
+| `received` | service, on delivery | An `/inbox` or `/inbox/wait` answer that lists it (or `GET /jobs/{id}` by the recipient) delivered it. Terminal unless `expects_reply`. Reading it again changes nothing. |
+| `answered` | service | It had `expects_reply`, and its recipient sent a job with `reply_to` set to it. |
+
+Every one of these moves bumps `updated_seq`, so the sender's `/outbox/wait` wakes on delivery and on the answer.
+
+Only the recipient moves a task forward. The sender can `cancel` while the state is `sent`. Moves not in the graph return `409 bad_transition`. Repeating the same move is a no-op (200), so retries are safe.
 
 ### Attachment
 
 Binary file attached to a job. Rules:
 
-- Uploaded by the sender after the job is created (`PUT /jobs/{id}/attachments/{name}`), only while the job is `sent`.
+- Uploaded by the sender after the job is created (`PUT /jobs/{id}/attachments/{name}`), only while the job is `sent`. A `notice` takes none (`409 attachments_locked`, hint: send a message).
 - `name`: `[A-Za-z0-9._-]{1,100}`, no path parts.
 - Limit 64 MiB per file, 256 MiB per job, 16 files per job. Larger files: split or send a git bundle.
 - The uploader sends `X-Sha256`. The service checks it and answers `422 checksum_mismatch` if it differs.
@@ -87,6 +110,8 @@ Each agent has one inbox: jobs where `to` is the agent, ordered by `seq`. `seq` 
 
 `GET /inbox?since=<seq>&state=<state>&limit=<n>` returns jobs with `seq > since`. The answer carries `next`, the highest `seq` seen. The agent stores `next` and passes it as `since` on the next call. A lost response costs nothing: repeat with the old cursor.
 
+Delivery: an inbox answer that lists a notice, message or report still `sent` moves it to `received`. A notice, and a message up to 4 KiB, comes with its whole `body`, so one call is enough to read it; a longer message, a report and a task come as a summary (`body_preview`, `body_truncated: true` when the body is longer), read whole with `GET /jobs/{id}`. Every entry lists its attachment summaries.
+
 `GET /inbox/wait?since=<seq>&timeout=<s>` blocks until a job with `seq > since` exists or the timeout ends. `timeout` default 25, maximum 55 (under common proxy limits). Answer is the same shape as `/inbox`. An empty list with the same `next` means timeout: call again. This is how an agent sleeps until work arrives.
 
 ## Endpoints
@@ -97,15 +122,15 @@ All need the Bearer token, except `GET /` and `GET /help` (they show no data).
 |---|---|
 | `GET /` , `GET /help` | Markdown guide. |
 | `GET /whoami` | `{"agent": "linux", "peers": ["windows"], "limits": {...}}`. |
-| `POST /jobs` | Create a job. Body: `to`, `kind`, `title`, `body`, `tags`, `origin`, `reply_to`. |
+| `POST /jobs` | Create a job. Body: `to`, `kind`, `title`, `body`, `tags`, `origin`, `reply_to`, `outcome`, `priority`, `expects_reply`. |
 | `GET /jobs/{id}` | Full job with body. Sender and recipient only. |
-| `POST /jobs/{id}/receive` | `sent` to `received`. |
-| `POST /jobs/{id}/accept` | to `accepted`. |
-| `POST /jobs/{id}/reject` | to `rejected`. Body: `reason`. |
+| `POST /jobs/{id}/receive` | Task: `sent` to `received`. |
+| `POST /jobs/{id}/accept` | Task: to `accepted`. |
+| `POST /jobs/{id}/reject` | Task: to `rejected`. Body: `reason`. |
 | `POST /jobs/{id}/cancel` | Sender cancels while `sent`. Deletes the job and attachments. |
 | `PUT /jobs/{id}/attachments/{name}` | Upload (raw body, `X-Sha256`). |
 | `GET /jobs/{id}/attachments/{name}` | Download. |
-| `GET /inbox` | Jobs for me, summaries. |
+| `GET /inbox` | Jobs for me: summaries, whole bodies for notices and short messages. Delivers notices, messages and reports. |
 | `GET /inbox/wait` | Same, blocking. |
 | `GET /outbox` | Jobs I sent, with their current state. Same cursor rules, on `updated_seq` (see below). |
 | `GET /outbox/wait` | Block until the state of one of my sent jobs changes. Uses `updated_seq`, see below. |
@@ -127,7 +152,7 @@ State changes of a sent job must wake the sender. Each job has `updated_seq`, ta
 
 ### Response shapes
 
-Success: the resource, or `{"jobs": [...], "next": 17}` for lists. Summaries omit `body` and carry `body_size` and `body_preview` (first 200 chars). `GET /jobs/{id}` returns the whole body.
+Success: the resource, or `{"jobs": [...], "next": 17}` for lists. Summaries carry `body_size`, `body_preview` (first 200 chars) and `body_truncated`; they omit `body`, except for a notice or a message of up to 4 KiB, which carries it whole. `GET /jobs/{id}` returns the whole body. Every job carries `priority` and `expects_reply`.
 
 Error:
 
@@ -142,9 +167,9 @@ Error:
 | 403 | `not_yours` | Job belongs to other agents. |
 | 403 | `not_admin` | Publishing a `rack` binary needs an agent with `admin = true`. |
 | 404 | `not_found` | No such job, attachment, agent or published binary. |
-| 409 | `bad_transition` | State move not allowed. |
-| 409 | `attachments_locked` | Job already received. |
-| 413 | `too_large` | Body or file over the limit. Hint names the limit. |
+| 409 | `bad_transition` | State move not allowed, e.g. accepting a message or replying to a notice. |
+| 409 | `attachments_locked` | Job already received, or a notice (no files). |
+| 413 | `too_large` | Body or file over the limit (64 KiB, notice 1 KiB, report 1 MiB). Hint names the limit. |
 | 422 | `checksum_mismatch` | `X-Sha256` differs. Hint: upload again. |
 | 422 | `idempotency_conflict` | See above. |
 | 429 | `rate_limited` | Too many requests in flight, or the same `Idempotency-Key` still running. Hint carries `Retry-After`. |
@@ -175,7 +200,9 @@ A `comment` or `result` job carries `reply_to`. The receiver looks up its own lo
 
 ## What `pull` does with kb
 
-`rack pull` is the client side of an inbox read. For each new job, in order:
+`rack pull` is the client side of an inbox read. Notices and messages are only printed, one line each, like `rack wait` prints them: they are conversation, not work, and get no board entry or link. Reports are printed too, unless `--notes` is given: then each becomes a note, `kb add --note --tag racking --body - -- TITLE`, with the same `**Racking:**` and `**Sender:**` lines, once per job through the saved links. Pull downloads no files of a message or report; the note lists them for `rack get-attachment`.
+
+For each new task, comment or result, in order:
 
 1. `GET /jobs/{id}`, `POST .../receive`.
 2. Download attachments to `<dir>/<job id>/`, verify sha256.
@@ -222,6 +249,22 @@ PUT /jobs/j2/attachments/probe.log
 
 Linux's `GET /outbox/wait` returns `j1` as `done`, and `GET /inbox/wait` returns `j2`. `rack pull` runs `kb comment 873 ...` with the result and the log path.
 
+A message, without files or ceremony:
+
+```
+POST /jobs   (linux token)
+{"to":"windows","kind":"message","body":"Which branch has the fix?","expects_reply":true}
+-> 201 {"id":"j3","title":"Which branch has the fix?","state":"sent",...}
+
+GET /inbox/wait?since=1   (windows token)
+-> {"jobs":[{"id":"j3","kind":"message","body":"Which branch has the fix?","state":"received",...}],"next":2}
+
+POST /jobs   (windows token)
+{"to":"linux","kind":"message","reply_to":"j3","body":"fix/vulkan-probe"}
+```
+
+Linux's `GET /outbox/wait` shows `j3` as `received`, then `answered`.
+
 ## Failure cases
 
 | Case | Behaviour |
@@ -229,7 +272,7 @@ Linux's `GET /outbox/wait` returns `j1` as `done`, and `GET /inbox/wait` returns
 | Connection drops during `POST /jobs` | Retry with the same `Idempotency-Key`. No duplicate. |
 | Connection drops during `wait` | Call again with the stored cursor. |
 | Upload interrupted | Upload the same name again. It replaces the partial file. |
-| Recipient offline | Job stays `sent`. Jobs are kept 30 days after `done`, `rejected` or `failed`, and without limit while open. |
+| Recipient offline | Job stays `sent`. Jobs are kept 30 days after `done`, `rejected`, `failed` or `answered`, or after delivery for a notice, message or report that expects no reply, and without limit while open. |
 | Unknown recipient | `404 not_found`, hint lists `GET /whoami` peers. |
 | Local `kb` missing or fails during `pull` | The job stays `received`, not linked. Next `pull` retries it. Nothing is lost. |
 | Same job pulled twice | The saved link prevents a second `kb add`. |
