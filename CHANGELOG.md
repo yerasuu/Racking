@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.0
+
+Breaking for servers: see `tag-changelog/v0.2.0.md`.
+
+### Autonomy
+- Roles (`main` and `worker`), local policy per worker, pairing with `rack join` and a fingerprint, emergency brake, limits and audit.
+
+### Communication
+- Broadcast, threads and search, large resumable uploads, folders as ustar archives.
+
+### Deployment
+- Docker image and compose file, optional Traefik, graceful shutdown, trusted proxies.
+
 ## 0.1.3
 
 First stable release (0.1.1 and 0.1.2 were local test builds).
