@@ -1,18 +1,21 @@
-//! Big files: an attachment over `CHUNKED_ABOVE` goes through the server's
-//! resumable upload, in chunks read from the file one at a time, so neither
-//! side ever holds the whole file in memory and a cut connection costs at most
-//! one chunk. The SHA-256 the server checks at the end is computed in a first
-//! pass over the file, so a chunked upload reads the file twice.
+//! Big files and folders. An attachment over `CHUNKED_ABOVE` goes through the
+//! server's resumable upload, in chunks read from the file one at a time, so
+//! neither side ever holds the whole file in memory and a cut connection costs
+//! at most one chunk. The SHA-256 the server checks at the end is computed in
+//! a first pass over the file, so a chunked upload reads the file twice. A
+//! directory travels as one `NAME.tar`, packed into a temporary directory
+//! first; a received `.tar` is unpacked by `crate::tar` after its download.
 
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::fs::{self, File};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::client::{AttachmentInfo, Client, RackError, Result, attachment_name, local, sha256_file};
+use crate::client::{AttachmentInfo, Client, RackError, Result, attachment_name, local, new_key, sha256_file};
+use crate::tar;
 
 /// Files up to this size go in one `PUT`, as before; bigger ones in chunks.
 pub const CHUNKED_ABOVE: u64 = 32 * 1024 * 1024;
@@ -35,7 +38,8 @@ pub enum Mode {
 pub struct Options<'a> {
     pub mode: Mode,
     pub chunked_above: u64,
-    /// Where `FILE 512/2048 MiB` lines go, at most once per `progress_every`.
+    /// Where `FILE 512/2048 MiB` lines go, at most once per `progress_every`,
+    /// and the entries a packed directory left out (symlinks, special files).
     pub progress: Option<&'a mut dyn Write>,
     pub progress_every: Duration,
 }
@@ -100,6 +104,77 @@ impl<'a> Progress<'a> {
             self.last = Some(Instant::now());
         }
     }
+}
+
+/// A directory under the system temp dir for one packed or downloaded
+/// archive, removed with everything in it when dropped.
+struct Staging(PathBuf);
+
+impl Staging {
+    fn new() -> Result<Self> {
+        let dir = std::env::temp_dir().join(format!("rack-{}", new_key()));
+        fs::create_dir(&dir).map_err(|e| local(&format!("create {}", dir.display()), e))?;
+        Ok(Self(dir))
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Uploads `path` as an attachment of `job`: a file as itself, a directory as
+/// `NAME.tar` (ustar, see `crate::tar::pack_dir`), sent like any file of that size.
+pub fn upload_path(c: &Client, job: &str, path: &Path, mut opts: Options<'_>) -> Result<AttachmentInfo> {
+    if !path.is_dir() {
+        return upload_file(c, job, path, opts);
+    }
+    let name = path
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.file_name().and_then(|n| n.to_str()).map(|n| format!("{n}.tar")))
+        .ok_or_else(|| RackError::Usage(format!("{} has no name to pack it under", path.display())))?;
+    let staging = Staging::new()?;
+    let archive = staging.0.join(&name);
+    attachment_name(&archive)?;
+    let mut out = BufWriter::new(File::create(&archive).map_err(|e| local(&format!("create {name}"), e))?);
+    let packed = tar::pack_dir(path, &mut out).map_err(RackError::Local)?;
+    out.flush().map_err(|e| local(&format!("write {name}"), e))?;
+    drop(out);
+    if let Some(w) = opts.progress.as_mut() {
+        for skipped in &packed.skipped {
+            // A warning that cannot be written is not worth failing the upload for.
+            let _ = writeln!(w, "rack: {skipped}");
+        }
+    }
+    upload_file(c, job, &archive, opts)
+}
+
+/// Downloads attachment `name` of `job`, checks its SHA-256 and unpacks it
+/// into `dest` (created if missing) within `limits`. The archive goes to a
+/// temporary directory, never next to the files it holds, and is deleted
+/// after. Returns the verified SHA-256 and what was unpacked.
+pub fn extract_attachment(
+    c: &Client,
+    job: &str,
+    name: &str,
+    dest: &Path,
+    limits: &tar::Limits,
+) -> Result<(String, tar::Extracted)> {
+    let staging = Staging::new()?;
+    let archive = staging.0.join(name);
+    let got = c.download(job, name, &archive)?;
+    if !got.verified() {
+        return Err(RackError::Local(format!(
+            "sha256 mismatch: server says {}, got {}; nothing was unpacked",
+            got.expected, got.actual
+        )));
+    }
+    fs::create_dir_all(dest).map_err(|e| local(&format!("create {}", dest.display()), e))?;
+    let done =
+        tar::extract(&archive, dest, limits).map_err(|e| RackError::Local(format!("{name} not unpacked: {e}")))?;
+    Ok((got.actual, done))
 }
 
 /// Uploads `file` as an attachment of `job`: one `PUT` up to

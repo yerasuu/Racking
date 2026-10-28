@@ -362,7 +362,7 @@ fn rack(args: &[String], cwd: &str, scope: &Scope) -> Verdict {
         match name {
             "--state" => return Verdict::Deny("rack --state is the owner's".to_owned()),
             "--attach" | "--file" => reads.extend(value(&mut it)),
-            "--out" => writes.extend(value(&mut it)),
+            "--out" | "--extract" => writes.extend(value(&mut it)),
             n if n.starts_with('-') => {}
             _ => positional.push(a.clone()),
         }
@@ -646,6 +646,10 @@ network = ["example.org:443"]
         ));
         assert!(matches!(
             h.bash(Some(&a), "rack get-attachment j1 x.bin --out /etc/x.bin"),
+            Verdict::Deny(_)
+        ));
+        assert!(matches!(
+            h.bash(Some(&a), "rack get-attachment j1 x.tar --extract /etc --overwrite"),
             Verdict::Deny(_)
         ));
     }

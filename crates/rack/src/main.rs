@@ -74,9 +74,11 @@ Config: RACK_URL and RACK_TOKEN, or RACK_CONFIG=FILE, or the default file
   rack accept JOB
   rack reject JOB --reason TEXT
   rack result JOB [--failed] [--title T] [--body TEXT|-] [--attach FILE]...
-  rack attach JOB FILE... [--resume]              files over 32 MiB go in resumable chunks;
-                                                 --resume continues an upload that was cut
+  rack attach JOB FILE|DIR... [--resume]          files over 32 MiB go in resumable chunks, a DIR
+                                                 as DIR.tar; --resume continues a cut upload
   rack get-attachment JOB NAME [--out PATH]
+  rack get-attachment JOB NAME.tar --extract DIR [--overwrite] [--max-bytes N] [--max-files N]
+                                                 unpack a received .tar safely into DIR
   rack outbox [--since N] [--wait] [--timeout SECS]
   rack pull [--dir DIR] [--repo NAME] [--notes] new tasks -> kb entries; --notes: reports -> kb notes
   rack guide [COMMAND|--list|--changes]          how to use Racking: the overview, or the detailed help of
@@ -988,8 +990,9 @@ fn result(c: &Client, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Uploads one file of `rack attach` or `--attach`: in one request when it is
-/// small, otherwise in resumable chunks with a progress line on stderr.
+/// Uploads one path of `rack attach` or `--attach`: a file in one request when
+/// it is small, otherwise in resumable chunks with a progress line on stderr; a
+/// directory packed into `NAME.tar` first.
 fn attach_path(c: &Client, job: &str, path: &Path, mode: Mode) -> Result<AttachmentInfo> {
     let mut stderr = std::io::stderr();
     let opts = upload::Options {
@@ -997,7 +1000,7 @@ fn attach_path(c: &Client, job: &str, path: &Path, mode: Mode) -> Result<Attachm
         progress: Some(&mut stderr),
         ..upload::Options::default()
     };
-    upload::upload_file(c, job, path, opts)
+    upload::upload_path(c, job, path, opts)
 }
 
 fn attach(c: &Client, args: &[String]) -> Result<()> {
@@ -1015,11 +1018,45 @@ fn attach(c: &Client, args: &[String]) -> Result<()> {
 }
 
 fn get_attachment(c: &Client, args: &[String]) -> Result<()> {
-    let opts = Opts::parse(args, &["out"], &[])?;
+    let opts = Opts::parse(args, &["out", "extract", "max-bytes", "max-files"], &["overwrite"])?;
     let [id, name] = opts.positionals(2, "JOB and NAME")? else {
         return Err(RackError::Usage("expected JOB and NAME".to_owned()));
     };
     let name = client::download_name(name)?;
+    let extract_only = opts.flag("overwrite") || opts.value("max-bytes").is_some() || opts.value("max-files").is_some();
+    if let Some(dir) = opts.value("extract") {
+        if opts.value("out").is_some() {
+            return Err(RackError::Usage("--out and --extract do not go together".to_owned()));
+        }
+        if !name.ends_with(".tar") {
+            return Err(RackError::Usage(format!(
+                "--extract unpacks a .tar attachment; {name} is not one (download it without --extract)"
+            )));
+        }
+        let defaults = rack::tar::Limits::default();
+        let limits = rack::tar::Limits {
+            max_bytes: opts.number("max-bytes")?.map_or(defaults.max_bytes, i64::unsigned_abs),
+            max_entries: opts
+                .number("max-files")?
+                .map_or(defaults.max_entries, i64::unsigned_abs),
+            overwrite: if opts.flag("overwrite") {
+                rack::tar::Overwrite::Allow
+            } else {
+                rack::tar::Overwrite::Refuse
+            },
+        };
+        let (sha, done) = upload::extract_attachment(c, job_id(id)?, name, Path::new(dir), &limits)?;
+        println!(
+            "{name} extracted into {dir}: {} files, {} dirs, {} bytes (sha256 {sha} verified)",
+            done.files, done.dirs, done.bytes
+        );
+        return Ok(());
+    }
+    if extract_only {
+        return Err(RackError::Usage(
+            "--overwrite, --max-bytes and --max-files go with --extract DIR".to_owned(),
+        ));
+    }
     let dest = PathBuf::from(opts.value("out").unwrap_or(name));
     let sha = c.download_verified(job_id(id)?, name, &dest)?;
     println!("{} saved, sha256 {sha} verified", dest.display());

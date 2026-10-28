@@ -50,11 +50,17 @@ impl Env {
     }
 
     fn rack(&self, args: &[&str]) -> Output {
+        self.rack_as(LINUX, args)
+    }
+
+    /// `rack` with `token`, run in the scratch root so relative paths land there.
+    fn rack_as(&self, token: &str, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_rack"))
             .args(["--state", &self.root.join("state.json").display().to_string()])
             .args(args)
+            .current_dir(&self.root)
             .env("RACK_URL", &self.url)
-            .env("RACK_TOKEN", LINUX)
+            .env("RACK_TOKEN", token)
             .env_remove("RACK_CONFIG")
             .output()
             .expect("run rack")
@@ -236,4 +242,85 @@ fn a_plain_attach_continues_an_open_session_of_the_same_file() {
         Some("complete"),
         "the same session was finished"
     );
+}
+
+#[test]
+fn a_directory_travels_as_a_tar_and_unpacks_safely() {
+    let env = Env::new();
+    let job = env.task();
+    let src = env.root.join("traces");
+    fs::create_dir_all(src.join("gpu")).expect("tree");
+    fs::write(src.join("summary.md"), b"# two devices\n").expect("file");
+    fs::write(src.join("gpu/frame-001.bin"), vec![9u8; 70_000]).expect("file");
+
+    let out = env.rack(&["attach", &job, "traces"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.starts_with(&format!("{job} attached traces.tar (")), "{stdout}");
+
+    let out = env.rack_as(
+        WINDOWS,
+        &["get-attachment", &job, "traces.tar", "--extract", "received"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        stdout.starts_with("traces.tar extracted into received: 2 files, 2 dirs, 70014 bytes (sha256 "),
+        "{stdout}"
+    );
+    let got = env.root.join("received/traces");
+    assert_eq!(
+        fs::read(got.join("summary.md")).ok().as_deref(),
+        Some(&b"# two devices\n"[..])
+    );
+    assert_eq!(fs::read(got.join("gpu/frame-001.bin")).ok(), Some(vec![9u8; 70_000]));
+    assert!(!env.root.join("traces.tar").exists(), "the archive is not left behind");
+
+    // A second unpack meets the files of the first: refused, nothing replaced, unless --overwrite.
+    fs::write(got.join("summary.md"), b"edited\n").expect("edit");
+    let out = env.rack_as(
+        WINDOWS,
+        &["get-attachment", &job, "traces.tar", "--extract", "received"],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--overwrite"));
+    assert_eq!(fs::read(got.join("summary.md")).ok().as_deref(), Some(&b"edited\n"[..]));
+    let out = env.rack_as(
+        WINDOWS,
+        &[
+            "get-attachment",
+            &job,
+            "traces.tar",
+            "--extract",
+            "received",
+            "--overwrite",
+        ],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        fs::read(got.join("summary.md")).ok().as_deref(),
+        Some(&b"# two devices\n"[..])
+    );
+
+    let out = env.rack_as(
+        WINDOWS,
+        &[
+            "get-attachment",
+            &job,
+            "traces.tar",
+            "--extract",
+            "small",
+            "--max-bytes",
+            "100",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--max-bytes"));
+    let out = env.rack_as(WINDOWS, &["get-attachment", &job, "traces.tar", "--overwrite"]);
+    assert_eq!(out.status.code(), Some(2), "--overwrite goes with --extract");
+    let out = env.rack_as(
+        WINDOWS,
+        &["get-attachment", &job, "traces.tar", "--extract", "x", "--out", "y"],
+    );
+    assert_eq!(out.status.code(), Some(2));
 }

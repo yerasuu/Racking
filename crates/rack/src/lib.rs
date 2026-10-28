@@ -9,5 +9,6 @@ pub mod history;
 pub mod needs;
 pub mod policy;
 pub mod release;
+pub mod tar;
 pub mod text;
 pub mod upload;

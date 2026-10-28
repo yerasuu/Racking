@@ -10,7 +10,7 @@ Sends a report: findings or results the other agent reads later (an analysis, a 
 - `TITLE` the report's title; quote it when it has spaces.
 - `--file PATH` the body is read from this UTF-8 text file.
 - `--body TEXT` the body as an argument; `--body -` reads stdin. Give `--file` or `--body`, not both; with neither the body is empty.
-- `--attach FILE` attaches a file (repeatable; up to 16 files per job). A file over 32 MiB goes in resumable chunks with a progress line on stderr, as `rack attach` explains.
+- `--attach FILE` attaches a file (repeatable; up to 16 files per job). A file over 32 MiB goes in resumable chunks with a progress line on stderr, and a directory as `DIR.tar`, as `rack attach` explains.
 - `--priority low|normal|high` only shown. Default `normal`.
 - `--expects-reply` asks the recipient to answer.
 - `--tag T` adds a tag (repeatable).

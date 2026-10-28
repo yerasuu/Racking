@@ -10,7 +10,7 @@ Sends the result of a task you accepted to its sender and moves the task to `don
 - `--failed` marks the outcome `failed` instead of `done`.
 - `--title T` the result's title. Default `Result: ` plus the task's title.
 - `--body TEXT` a short body; `--body -` reads stdin. Default empty.
-- `--attach FILE` attaches a file (repeatable). A file over 32 MiB goes in resumable chunks, as `rack attach` explains.
+- `--attach FILE` attaches a file (repeatable). A file over 32 MiB goes in resumable chunks, and a directory as `DIR.tar`, as `rack attach` explains.
 
 ## Examples
 
