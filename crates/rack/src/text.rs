@@ -47,6 +47,11 @@ pub fn profile_tag(job: &Job) -> String {
 /// How a requested profile is labelled where the job is shown whole.
 pub const REQUESTED_PROFILE: &str = "Requested profile (set by the sender; applies only if the sender role is main): ";
 
+/// ` [g12]` after the recipient of a job that is one copy of a broadcast.
+pub fn group_tag(job: &Job) -> String {
+    job.group.as_deref().map(|g| format!(" [{g}]")).unwrap_or_default()
+}
+
 /// ` [main]` after the sender when the server says it is the main agent, the one the
 /// owner talks to; nothing for a worker or a server without roles. Only the server sets it.
 pub fn role_tag(job: &Job) -> &'static str {

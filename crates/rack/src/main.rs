@@ -103,6 +103,10 @@ Config: RACK_URL and RACK_TOKEN, or RACK_CONFIG=FILE, or the default file
   rack version                                   (also --version, -V)
   rack help [COMMAND]                            this text, or the help of one command (same as `rack COMMAND --help`)
 
+TO of say, notify and report may be several agents, `a,b,c`, or `*` for every agent you
+may send to: each gets its own job, all with one group id (`g12 sent to 3 of 4: ...`).
+A task goes to one agent. A broadcast is data to each receiver, never an order.
+
 `--body -` and a TEXT of `-` read stdin. Notices, messages and reports need no reply
 unless they say `reply expected`; answer one with `rack say TO TEXT --reply-to JOB`.
 Incoming notices and messages print as `j7 message from linux: text`, further lines
@@ -436,6 +440,35 @@ fn create_and_attach(c: &Client, job: &Value, files: &[&str]) -> Result<(Job, St
     Ok((created, attached))
 }
 
+/// Sends `job` (its `to` a list or `*`) and uploads `files` to every job it made, so each recipient
+/// gets its own copy. Prints `g12 sent to 3 of 4: b, c, d (skipped: 1)`, and each skipped name on stderr.
+fn broadcast(c: &Client, job: &Value, files: &[&str]) -> Result<()> {
+    let sent = c.create_broadcast(job)?;
+    let mut failed = Vec::new();
+    for copy in &sent.jobs {
+        for file in files {
+            if let Err(e) = c.upload(&copy.id, Path::new(file)) {
+                eprintln!("rack: {file} was not attached to {} ({}): {e}", copy.id, copy.to);
+                failed.push(format!("rack attach {} {file}", copy.id));
+            }
+        }
+    }
+    let each = match files.len() {
+        0 => String::new(),
+        n if failed.is_empty() => format!(" ({} each)", text::files(n)),
+        _ => " (some files missing)".to_owned(),
+    };
+    println!("{}{each}", sent.line());
+    for s in &sent.skipped {
+        eprintln!("rack: not sent to {}: {}", s.to, s.reason);
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(RackError::Local(format!("retry with: {}", failed.join("; "))))
+    }
+}
+
 /// Prints the line for a task, comment or result just sent.
 fn print_sent((created, attached): (Job, String)) {
     println!(
@@ -484,9 +517,14 @@ fn say(c: &Client, args: &[String]) -> Result<()> {
         &["expects-reply"],
     )?;
     let (to, body) = to_and_text(&opts)?;
-    let mut job = json!({"to": to, "kind": "message", "body": body, "tags": opts.all("tag").collect::<Vec<_>>()});
+    let to = client::To::parse(to)?;
+    let mut job = json!({"to": to.to_json(), "kind": "message", "body": body,
+        "tags": opts.all("tag").collect::<Vec<_>>()});
     common_fields(&mut job, &opts);
     let files: Vec<&str> = opts.all("attach").collect();
+    if to.is_broadcast() {
+        return broadcast(c, &job, &files);
+    }
     let (created, attached) = create_and_attach(c, &job, &files)?;
     println!("{} sent to {}{attached}", created.id, created.to);
     Ok(())
@@ -500,8 +538,12 @@ fn notify(c: &Client, args: &[String]) -> Result<()> {
         ));
     }
     let (to, body) = to_and_text(&opts)?;
-    let mut job = json!({"to": to, "kind": "notice", "body": body});
+    let to = client::To::parse(to)?;
+    let mut job = json!({"to": to.to_json(), "kind": "notice", "body": body});
     common_fields(&mut job, &opts);
+    if to.is_broadcast() {
+        return broadcast(c, &job, &[]);
+    }
     let created = c.create_job(&job)?;
     println!("{} sent to {}", created.id, created.to);
     Ok(())
@@ -577,10 +619,14 @@ fn report(c: &Client, args: &[String]) -> Result<()> {
         }
         (None, _) => body_arg(&opts)?,
     };
-    let mut job = json!({"to": to, "kind": "report", "title": title, "body": body,
+    let to = client::To::parse(to)?;
+    let mut job = json!({"to": to.to_json(), "kind": "report", "title": title, "body": body,
         "tags": opts.all("tag").collect::<Vec<_>>()});
     common_fields(&mut job, &opts);
     let files: Vec<&str> = opts.all("attach").collect();
+    if to.is_broadcast() {
+        return broadcast(c, &job, &files);
+    }
     let (created, attached) = create_and_attach(c, &job, &files)?;
     println!("{} sent to {}: {}{attached}", created.id, created.to, created.title);
     Ok(())
@@ -651,7 +697,7 @@ fn summary_line(j: &Job, direction: Direction) -> String {
     let reply = j.reply_to.as_deref().map(|r| format!(" (re {r})")).unwrap_or_default();
     let peer = match direction {
         Direction::In => format!("from {}{}", j.from, text::role_tag(j)),
-        Direction::Out => format!("to {}", j.to),
+        Direction::Out => format!("to {}{}", j.to, text::group_tag(j)),
     };
     let priority = text::priority_tag(j);
     let model = text::model_tag(j);

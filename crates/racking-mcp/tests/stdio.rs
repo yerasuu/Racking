@@ -642,6 +642,71 @@ fn profile_through_mcp() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn broadcast_through_mcp() {
+    const MAC: &str = "mac-token-0123456789abcdef00";
+    let dir = std::env::temp_dir().join(format!("racking-mcp-bcast-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let config = racking_server::Config::parse(&format!(
+        "bind = \"127.0.0.1:0\"\ndata_dir = {:?}\n[agents.linux]\ntoken = \"{LINUX}\"\n\
+         [agents.windows]\ntoken = \"{WINDOWS}\"\n[agents.mac]\ntoken = \"{MAC}\"\n",
+        dir.join("data").display().to_string()
+    ))
+    .expect("config");
+    let server = racking_server::start(&config).expect("start");
+    let url = format!("http://{}", server.addr());
+    let linux_root = dir.join("linux");
+    let mut linux = Mcp::spawn(&url, LINUX, &linux_root);
+    let mut mac = Mcp::spawn(&url, MAC, &dir.join("mac"));
+
+    fs::write(linux_root.join("notes.txt"), "branch list\n").expect("file");
+    let said = linux.ok(
+        "racking_say",
+        json!({"to": ["windows", "mac"], "text": "standup at 10", "attachments": ["notes.txt"]}),
+    );
+    assert_eq!(
+        said,
+        "g1 sent to 2 of 2: windows, mac. Jobs: j1 to windows, j2 to mac. Attached 1 file to each."
+    );
+    let all = linux.ok("racking_notify", json!({"to": "*", "text": "deploying now"}));
+    assert!(
+        all.starts_with("g2 sent to 2 of 2: mac, windows."),
+        "agents in registry order: {all}"
+    );
+    let part = linux.ok(
+        "racking_report",
+        json!({"to": "mac,ghost", "title": "Probe", "body": "two devices"}),
+    );
+    assert_eq!(
+        part,
+        "g3 sent to 1 of 2: mac (skipped: 1). Jobs: j5 to mac. Not sent to ghost: not_allowed."
+    );
+    let refused = linux.error("racking_say", json!({"to": ["ghost"], "text": "hi"}));
+    assert!(refused.contains("403 not_allowed"), "{refused}");
+    assert!(
+        linux
+            .error("racking_say", json!({"to": [], "text": "hi"}))
+            .contains("empty list")
+    );
+
+    let woke = mac.ok("racking_wait", json!({"since": 0, "timeout": 5}));
+    for line in [
+        "j2 message from linux (1 file): standup at 10",
+        "j3 notice from linux: deploying now",
+        "j5 report from linux: Probe (11 bytes)",
+    ] {
+        assert!(woke.lines().any(|l| l == line), "missing `{line}` in {woke}");
+    }
+    let out = linux.ok("racking_outbox", json!({"since": 0}));
+    assert!(out.contains("j1 sent message to windows [g1]"), "{out}");
+    assert!(out.contains("j2 received message to mac [g1]"), "{out}");
+
+    linux.close();
+    mac.close();
+    server.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// The text between the fence markers of an answer, checked to be there once.
 fn fenced(text: &str) -> &str {
     let start = text

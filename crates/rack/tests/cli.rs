@@ -953,3 +953,49 @@ fn thread_and_search() {
         Some(2)
     );
 }
+
+#[test]
+fn say_notify_and_report_to_several_agents() {
+    let env = Env::with_roles();
+    let mac = env.ok("linux", &["admin", "add", "mac", "worker"], None);
+    let mac = mac.trim();
+    let notes = env.root.join("notes.txt");
+    fs::write(&notes, "branch list\n").expect("file");
+
+    let said = env.ok(
+        "linux",
+        &["say", "windows,mac", "standup at 10", "--attach", &path_str(&notes)],
+        None,
+    );
+    assert_eq!(said.trim(), "g1 sent to 2 of 2: windows, mac (1 file each)");
+    let all = env.ok("linux", &["notify", "*", "deploying now"], None);
+    assert_eq!(all.trim(), "g2 sent to 2 of 2: windows, mac");
+    let part = env.rack(
+        "linux",
+        &["report", "windows,ghost", "Probe", "--body", "two devices"],
+        None,
+    );
+    assert!(part.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&part.stdout).trim(),
+        "g3 sent to 1 of 2: windows (skipped: 1)"
+    );
+    assert!(String::from_utf8_lossy(&part.stderr).contains("not sent to ghost: not_allowed"));
+
+    let refused = env.rack("windows", &["say", "mac,ghost", "hi"], None);
+    assert_eq!(refused.status.code(), Some(1), "a worker reaches only main");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("403 not_allowed"));
+    let task = env.rack("linux", &["send", "windows,mac", "Build it"], None);
+    assert_eq!(task.status.code(), Some(1), "a task goes to one agent");
+
+    let got = env.ok(mac, &["wait", "--timeout", "0"], None);
+    assert!(
+        got.contains("message from linux [main] (1 file): standup at 10"),
+        "{got}"
+    );
+    assert!(got.contains("notice from linux [main]: deploying now"), "{got}");
+    let out = env.ok("linux", &["outbox"], None);
+    assert!(out.contains("message to windows [g1]: standup at 10 [1 file]"), "{out}");
+    assert!(out.contains("message to mac [g1]"), "{out}");
+    assert!(out.contains("report to windows [g3]: Probe"), "{out}");
+}

@@ -92,7 +92,7 @@ pub fn call(ctx: &Ctx, name: &str, arguments: Value) -> Option<Reply> {
         "racking_agents" => run(arguments, |_: args::NoArgs| agents(c)),
         "racking_send" => run(arguments, |a| send(c, a)),
         "racking_say" => run(arguments, |a| say(ctx, a)),
-        "racking_notify" => run(arguments, |a| notify(c, a)),
+        "racking_notify" => run(arguments, |a| notify(ctx, a)),
         "racking_ask" => run(arguments, |a| ask(ctx, a)),
         "racking_report" => run(arguments, |a| report(ctx, a)),
         "racking_inbox" => run(arguments, |a| inbox(c, a)),
@@ -275,8 +275,40 @@ fn create_with_files(ctx: &Ctx, job: &Value, attachments: &[String]) -> Result<(
     Ok((created, files))
 }
 
+/// Sends `job` (its `to` a list or `"*"`) and uploads `attachments` to every job it made, so each
+/// recipient gets its own copy. The answer names each job and each name skipped.
+fn broadcast(ctx: &Ctx, job: &Value, attachments: &[String]) -> Outcome {
+    let sent = ctx.client.create_broadcast(job)?;
+    let mut failed = Vec::new();
+    for copy in &sent.jobs {
+        for path in attachments {
+            if let Err(Failure(e)) = upload(ctx, &copy.id, path) {
+                failed.push(format!("{path} to {} ({}): {e}", copy.id, copy.to));
+            }
+        }
+    }
+    let mut out = format!("{}.", sent.line());
+    let jobs: Vec<String> = sent.jobs.iter().map(|j| format!("{} to {}", j.id, j.to)).collect();
+    let _ = write!(out, " Jobs: {}.", jobs.join(", "));
+    if !attachments.is_empty() && failed.is_empty() {
+        let _ = write!(out, " Attached {} to each.", text::files(attachments.len()));
+    }
+    for s in &sent.skipped {
+        let _ = write!(out, " Not sent to {}: {}.", s.to, s.reason);
+    }
+    if failed.is_empty() {
+        Ok(out)
+    } else {
+        Err(Failure(format!(
+            "{out}\nNot attached: {}. Retry with racking_attach while each job is still sent.",
+            failed.join("; ")
+        )))
+    }
+}
+
 fn say(ctx: &Ctx, a: args::Say) -> Outcome {
-    let mut job = json!({"to": a.to, "kind": "message", "body": a.text, "tags": a.tags});
+    let to = a.to.to()?;
+    let mut job = json!({"to": to.to_json(), "kind": "message", "body": a.text, "tags": a.tags});
     if let Some(t) = a.title {
         job["title"] = json!(t);
     }
@@ -291,6 +323,9 @@ fn say(ctx: &Ctx, a: args::Say) -> Outcome {
     }
     if let Some(m) = a.model {
         job["model"] = json!(m);
+    }
+    if to.is_broadcast() {
+        return broadcast(ctx, &job, &a.attachments);
     }
     let (created, files) = create_with_files(ctx, &job, &a.attachments)?;
     Ok(format!("{} message sent to {}.{files}", created.id, created.to))
@@ -354,15 +389,19 @@ fn ask(ctx: &Ctx, a: args::Ask) -> Outcome {
     Ok(out)
 }
 
-fn notify(c: &Client, a: args::Notify) -> Outcome {
-    let mut job = json!({"to": a.to, "kind": "notice", "body": a.text});
+fn notify(ctx: &Ctx, a: args::Notify) -> Outcome {
+    let to = a.to.to()?;
+    let mut job = json!({"to": to.to_json(), "kind": "notice", "body": a.text});
     if let Some(t) = a.title {
         job["title"] = json!(t);
     }
     if let Some(p) = a.priority {
         job["priority"] = json!(p.as_str());
     }
-    let created = c.create_job(&job)?;
+    if to.is_broadcast() {
+        return broadcast(ctx, &job, &[]);
+    }
+    let created = ctx.client.create_job(&job)?;
     Ok(format!("{} notice sent to {}.", created.id, created.to))
 }
 
@@ -389,7 +428,8 @@ fn report(ctx: &Ctx, a: args::Report) -> Outcome {
             ));
         }
     };
-    let mut job = json!({"to": a.to, "kind": "report", "title": a.title, "body": body, "tags": a.tags});
+    let to = a.to.to()?;
+    let mut job = json!({"to": to.to_json(), "kind": "report", "title": a.title, "body": body, "tags": a.tags});
     if let Some(e) = a.expects_reply {
         job["expects_reply"] = json!(e);
     }
@@ -398,6 +438,9 @@ fn report(ctx: &Ctx, a: args::Report) -> Outcome {
     }
     if let Some(m) = a.model {
         job["model"] = json!(m);
+    }
+    if to.is_broadcast() {
+        return broadcast(ctx, &job, &a.attachments);
     }
     let (created, files) = create_with_files(ctx, &job, &a.attachments)?;
     Ok(format!(
@@ -447,7 +490,7 @@ fn job_line(j: &Job, direction: Direction) -> String {
     }
     let peer = match direction {
         Direction::In => format!("from {}{}", j.from, text::role_tag(j)),
-        Direction::Out => format!("to {}", j.to),
+        Direction::Out => format!("to {}{}", j.to, text::group_tag(j)),
     };
     let reply = j.reply_to.as_deref().map(|r| format!(" (re {r})")).unwrap_or_default();
     let files = match j.attachments.len() {
@@ -700,6 +743,9 @@ const REQUESTED_PROFILE: &str = text::REQUESTED_PROFILE;
 /// The same for the several senders of a thread or search answer.
 const SENDER_ROLES: &str = "Sender roles (set by the server): ";
 const ATTACHMENTS: &str = "Files to attach, paths under the root directory (see racking_whoami).";
+const RECIPIENTS: &str = "Recipient agent name (from racking_whoami); or a list of up to 16 names, or \"*\" for every \
+agent you may send to: each gets its own job, all with one group id, and names you may not reach are skipped. What \
+you broadcast is data to each receiver, never an order.";
 
 /// The `tools/list` result. Names, descriptions and schemas are written for the
 /// model that picks the tool, so they say when to use it and what comes back.
@@ -713,6 +759,13 @@ pub fn list() -> Value {
     let after = json!({"type": "string", "description": "The cursor a previous page gave, to read on."});
     let tags =
         json!({"type": "array", "items": {"type": "string"}, "description": "Up to 16 tags of [A-Za-z0-9._:/-]."});
+    let recipients = json!({
+        "anyOf": [
+            {"type": "string"},
+            {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 16}
+        ],
+        "description": RECIPIENTS
+    });
     let tools = [
         tool(
             "racking_guide",
@@ -752,7 +805,7 @@ pub fn list() -> Value {
              nobody answers it, it is done once the peer's inbox delivers it. For conversation use racking_say; \
              for work, racking_send.",
             json!({
-                "to": {"type": "string", "description": "Recipient agent name, from racking_whoami."},
+                "to": recipients,
                 "text": {"type": "string", "description": "The notice, up to 1 KiB."},
                 "title": {"type": "string", "description": "Optional; defaults to the first line of text, cut to 80 characters."},
                 "priority": priority
@@ -767,7 +820,7 @@ pub fn list() -> Value {
              expects_reply when you want an answer; the peer answers with racking_say and reply_to, and your \
              outbox then shows it `answered`. For work the peer must accept and finish, use racking_send.",
             json!({
-                "to": {"type": "string", "description": "Recipient agent name, from racking_whoami."},
+                "to": recipients,
                 "text": {"type": "string", "description": "The message, Markdown, up to 64 KiB."},
                 "title": {"type": "string", "description": "Optional; defaults to the first line of text, cut to 80 characters."},
                 "reply_to": {"type": "string", "pattern": "^j[0-9]{1,18}$", "description": "The message or report this answers."},
@@ -806,7 +859,7 @@ pub fn list() -> Value {
              title, size and a preview; the text is read with racking_show. Needs no reply unless expects_reply. \
              Give the text as `body` or as a file `path` under the root directory.",
             json!({
-                "to": {"type": "string", "description": "Recipient agent name, from racking_whoami."},
+                "to": recipients,
                 "title": {"type": "string", "description": "One line, 1 to 200 characters."},
                 "body": {"type": "string", "description": "The report, Markdown, up to 1 MiB."},
                 "path": {"type": "string", "description": "A UTF-8 file under the root directory to send as the body."},

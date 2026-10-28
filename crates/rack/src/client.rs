@@ -118,9 +118,98 @@ pub struct Job {
     /// The local-policy profile a task asks for, set by its sender (only main may).
     #[serde(default)]
     pub profile: ProfileField,
+    /// The broadcast this job is one copy of (`g12`); absent for a job sent to one agent.
+    #[serde(default)]
+    pub group: Option<String>,
     /// UTC, RFC 3339.
     #[serde(default)]
     pub created_at: Option<String>,
+}
+
+/// `TO` of a notice, message or report: one agent, a list (`a,b,c`), or `*` for every agent
+/// the sender may send to. The server checks the names; this only splits them.
+pub enum To<'a> {
+    One(&'a str),
+    Many(Vec<&'a str>),
+    Everyone,
+}
+
+impl<'a> To<'a> {
+    pub fn parse(text: &'a str) -> Result<Self> {
+        let text = text.trim();
+        if text == "*" {
+            return Ok(To::Everyone);
+        }
+        if !text.contains(',') {
+            return Ok(To::One(text));
+        }
+        let names: Vec<&str> = text.split(',').map(str::trim).filter(|n| !n.is_empty()).collect();
+        if names.is_empty() {
+            return Err(RackError::Usage(format!(
+                "TO `{text}` names no agent; give NAME, NAME,NAME... or *"
+            )));
+        }
+        Ok(To::Many(names))
+    }
+
+    /// The `to` of `POST /jobs`.
+    pub fn to_json(&self) -> Value {
+        match self {
+            To::One(name) => Value::from(*name),
+            To::Many(names) => Value::from(names.as_slice()),
+            To::Everyone => Value::from("*"),
+        }
+    }
+
+    /// Whether the server answers with a `Broadcast` rather than one job.
+    pub fn is_broadcast(&self) -> bool {
+        !matches!(self, To::One(_))
+    }
+}
+
+/// The answer to a broadcast: one job per recipient, and the names left out.
+#[derive(Deserialize)]
+pub struct Broadcast {
+    pub group: String,
+    pub jobs: Vec<BroadcastJob>,
+    /// Names given that the sender may not reach (unknown ones look the same).
+    #[serde(default)]
+    pub skipped: Vec<Skipped>,
+    /// How many were skipped; for `*` the only thing said about them.
+    #[serde(default)]
+    pub skipped_count: usize,
+}
+
+/// One recipient's job of a broadcast.
+#[derive(Deserialize)]
+pub struct BroadcastJob {
+    pub to: String,
+    pub id: String,
+    pub state: String,
+}
+
+#[derive(Deserialize)]
+pub struct Skipped {
+    pub to: String,
+    pub reason: String,
+}
+
+impl Broadcast {
+    /// `g12 sent to 3 of 4: b, c, d (skipped: 1)`.
+    pub fn line(&self) -> String {
+        let names: Vec<&str> = self.jobs.iter().map(|j| j.to.as_str()).collect();
+        let mut line = format!(
+            "{} sent to {} of {}: {}",
+            self.group,
+            self.jobs.len(),
+            self.jobs.len() + self.skipped_count,
+            names.join(", ")
+        );
+        if self.skipped_count > 0 {
+            line.push_str(&format!(" (skipped: {})", self.skipped_count));
+        }
+        line
+    }
 }
 
 /// A job's `profile` as the server sent it. A server from before the field sends no key at all,
@@ -379,6 +468,16 @@ impl Client {
             )),
             ok => ok,
         }
+    }
+
+    /// `POST /jobs` with `to` a list or `*`. A server from before broadcasts refuses both with a
+    /// 400 on `to`; that answer gets a hint saying so.
+    pub fn create_broadcast(&self, job: &Value) -> Result<Broadcast> {
+        self.post("/jobs", Some(job)).map_err(|e| {
+            let hint =
+                "This Racking server predates broadcasts; update racking-server, or send to one agent at a time.";
+            older_server(older_server(e, "invalid type: sequence", hint), "agent name `*`", hint)
+        })
     }
 
     /// `PUT /agents/me` with the whole `capabilities` list; empty clears it.
@@ -698,6 +797,31 @@ mod tests {
             job(serde_json::json!({"profile": "app-test"})),
             ProfileField::Named("app-test".to_owned())
         );
+    }
+
+    #[test]
+    fn recipients_and_the_broadcast_line() {
+        assert!(matches!(To::parse("windows"), Ok(To::One("windows"))));
+        assert!(matches!(To::parse(" * "), Ok(To::Everyone)));
+        let many = To::parse("a, b,,c").expect("list");
+        assert_eq!(many.to_json(), serde_json::json!(["a", "b", "c"]));
+        assert!(many.is_broadcast() && !To::One("a").is_broadcast());
+        assert_eq!(To::Everyone.to_json(), "*");
+        assert!(matches!(To::parse(",,"), Err(RackError::Usage(_))));
+
+        let answer: Broadcast = serde_json::from_value(serde_json::json!({
+            "group": "g12",
+            "jobs": [{"to": "b", "id": "j40", "state": "sent"}, {"to": "c", "id": "j41", "state": "sent"},
+                     {"to": "d", "id": "j42", "state": "sent"}],
+            "skipped": [{"to": "e", "reason": "not_allowed"}], "skipped_count": 1
+        }))
+        .expect("answer");
+        assert_eq!(answer.line(), "g12 sent to 3 of 4: b, c, d (skipped: 1)");
+        let all: Broadcast = serde_json::from_value(
+            serde_json::json!({"group": "g1", "jobs": [{"to": "b", "id": "j1", "state": "sent"}]}),
+        )
+        .expect("answer");
+        assert_eq!(all.line(), "g1 sent to 1 of 1: b");
     }
 
     #[test]

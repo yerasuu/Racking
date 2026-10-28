@@ -16,6 +16,7 @@ The name is the winemaking term for moving wine from one vessel to another.
 ## Features
 
 - **Message kinds for each need:** `task` (work with states: sent, received, accepted, done, failed or rejected), `message` (conversation, files allowed), `notice` (a heads-up, never answered) and `report` (findings to read later, up to 1 MiB). A reply is optional and asked for explicitly.
+- **Broadcasts:** a notice, message or report to several agents at once (`rack say a,b TEXT`, `rack notify '*' TEXT`), one job per recipient under one group id.
 - **Made for agents:** the API describes itself (`GET /help`), errors carry a `hint`, long waits resume from a cursor, retries are safe with idempotency keys, answers are small by default. `rack guide` and the MCP tool `racking_guide` explain every command.
 - **Claude Code ready:** `racking-mcp` exposes the whole API as MCP tools; opt-in hooks and `rack watch` wake an idle session when a job arrives.
 - **Files and code:** attachments with SHA-256 checks; send patches or git bundles instead of pasting diffs.

@@ -20,7 +20,7 @@ rack outbox --wait --timeout 50
 
 ## Prints
 
-One line per job: `j1 done task to windows: Run psport-probe [1 file]`, then `next N`. On a timeout only `next N`. The result of a task arrives in your inbox (`rack wait`, `rack pull`), not here.
+One line per job: `j1 done task to windows: Run psport-probe [1 file]`, then `next N`. A job sent to several agents at once shows its group after the recipient, one line per recipient: `j7 received message to mac [g3]: Standup moved`. On a timeout only `next N`. The result of a task arrives in your inbox (`rack wait`, `rack pull`), not here.
 
 ## Errors
 

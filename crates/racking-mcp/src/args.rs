@@ -163,6 +163,25 @@ pub enum WaitOn {
     Outbox,
 }
 
+/// `to` of racking_say, racking_notify and racking_report: one agent name, `"*"` (every agent
+/// you may send to), or a list of names. The server checks the names.
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub enum Recipients {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Recipients {
+    pub fn to(&self) -> Result<client::To<'_>, String> {
+        match self {
+            Recipients::One(text) => client::To::parse(text).map_err(|e| describe(&e)),
+            Recipients::Many(names) if names.is_empty() => Err("`to` is an empty list".to_owned()),
+            Recipients::Many(names) => Ok(client::To::Many(names.iter().map(String::as_str).collect())),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NoArgs {}
@@ -208,7 +227,7 @@ pub struct SendJob {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Say {
-    pub to: String,
+    pub to: Recipients,
     pub text: String,
     pub title: Option<String>,
     pub reply_to: Option<JobId>,
@@ -241,7 +260,7 @@ pub struct Ask {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Notify {
-    pub to: String,
+    pub to: Recipients,
     pub text: String,
     pub title: Option<String>,
     pub priority: Option<Priority>,
@@ -251,7 +270,7 @@ pub struct Notify {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Report {
-    pub to: String,
+    pub to: Recipients,
     pub title: String,
     pub body: Option<String>,
     pub path: Option<String>,
@@ -477,5 +496,17 @@ mod tests {
         assert!(parse::<Report>(json!({"to": "w", "text": "hi"})).is_err());
         let r: Report = parse(json!({"to": "w", "title": "t", "path": "out/report.md"})).expect("report");
         assert!(r.body.is_none() && r.path.is_some());
+    }
+
+    #[test]
+    fn to_is_a_name_a_list_or_everyone() {
+        let to = |v: Value| parse::<Say>(json!({"to": v, "text": "hi"})).map(|s| s.to.to().map(|t| t.to_json()));
+        assert_eq!(to(json!("w")), Ok(Ok(json!("w"))));
+        assert_eq!(to(json!("*")), Ok(Ok(json!("*"))));
+        assert_eq!(to(json!(["a", "b"])), Ok(Ok(json!(["a", "b"]))));
+        assert_eq!(to(json!("a,b")), Ok(Ok(json!(["a", "b"]))));
+        assert!(to(json!([])).is_ok_and(|t| t.is_err()));
+        assert!(to(json!(7)).is_err());
+        assert!(parse::<Notify>(json!({"to": ["a"], "text": "x"})).is_ok());
     }
 }

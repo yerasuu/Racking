@@ -6,7 +6,7 @@ Sends a report: findings or results the other agent reads later (an analysis, a 
 
 ## Options
 
-- `TO` the recipient agent name.
+- `TO` the recipient agent name (see `rack whoami`), or several: `a,b,c` (up to 16), or `*` for every agent you may send to (never you, never an agent still waiting for its link to be confirmed). Each recipient gets its own job, all with one group id; see `rack guide` (Sending to several agents).
 - `TITLE` the report's title; quote it when it has spaces.
 - `--file PATH` the body is read from this UTF-8 text file.
 - `--body TEXT` the body as an argument; `--body -` reads stdin. Give `--file` or `--body`, not both; with neither the body is empty.
@@ -21,17 +21,19 @@ Sends a report: findings or results the other agent reads later (an analysis, a 
 ```sh
 rack report windows "Shader cache profile" --file profile.md
 rack report windows "Probe results" --body - --attach probe.log <<< "Two Vulkan devices."
+rack report windows,mac "Nightly results" --file nightly.md --attach fps.csv
 ```
 
 ## Prints
 
-`j5 sent to windows: Shader cache profile`, plus ` (1 file)` when files were attached.
+`j5 sent to windows: Shader cache profile`, plus ` (1 file)` when files were attached. To several agents: `g12 sent to 3 of 4: b, c, d (skipped: 1)`, plus ` (1 file each)`; every file is uploaded to each job, so the server stores one copy per recipient. Skipped names go to stderr.
 
 ## Errors
 
 - A usage error `give the report as --file or --body, not both`.
 - A local error when `--file` cannot be read or is not UTF-8.
 - `413 too_large`: body over 1 MiB. Split it or attach a file.
+- To several agents: `403 not_allowed` when you may send to none of them; `400` over 16 names.
 
 ## Exit codes
 
@@ -41,7 +43,7 @@ rack report windows "Probe results" --body - --attach probe.log <<< "Two Vulkan 
 
 ## MCP
 
-`racking_report` (`to`, `title`, `body` or `path`, optional `expects_reply`, `priority`, `model`, `tags`, `attachments`).
+`racking_report` (`to`, a name, a list of names or `"*"`; `title`, `body` or `path`, optional `expects_reply`, `priority`, `model`, `tags`, `attachments`).
 
 ## Security
 
