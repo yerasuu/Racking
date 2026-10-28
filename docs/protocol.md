@@ -139,6 +139,39 @@ Delivery: an inbox answer that lists a notice, message or report still `sent` mo
 
 `GET /inbox/wait?since=<seq>&timeout=<s>` blocks until a job with `seq > since` exists or the timeout ends. `timeout` default 25, maximum 55 (under common proxy limits). Answer is the same shape as `/inbox`. An empty list with the same `next` means timeout: call again. This is how an agent sleeps until work arrives. When the server shuts down, a waiting call answers at once the same way, and the next call reaches the restarted server.
 
+## History: threads and search
+
+An agent that arrives new, or lost its context, reads what was said before with two read-only routes. Both are **peeks**: they deliver nothing (a notice or message still `sent` stays `sent`, and the next inbox read delivers it as usual), change no state and move no `updated_seq`, so the other party's `/outbox` never sees them. Neither has a rate limit of its own; like every read, they count against the 64 requests served at once. Only jobs the caller sent or received appear, so bodies are searchable by their two parties only.
+
+**Retention.** Closed jobs (`done`, `rejected`, `failed`, `answered`, and delivered notices, messages and reports that asked for no reply) are purged 30 days after their last change, with their attachments. A purged job does not exist for these routes: it is not found by a search, and a thread whose root was purged starts at its oldest job still stored. Open jobs are kept.
+
+`GET /threads/{id}?full=0&limit=50&after=CURSOR` returns the conversation job `id` belongs to. The server walks `reply_to` up to the root and then down through every reply below it (a tree: a task, its comments and result, the messages that answer each other), whichever of the two agents sent each job, and lists them oldest first (by `created_at`, then id):
+
+```json
+{"root": "j1", "jobs": [{"id": "j1", "depth": 0, "reply_to": null, ...},
+                        {"id": "j3", "depth": 1, "reply_to": "j1", ...}],
+ "omitted": 0, "truncated": false, "next": null}
+```
+
+- The caller must be the sender or recipient of `id`: otherwise `403 not_yours` (as `GET /jobs/{id}`), `404 not_found` if it does not exist. The walk starts from any job of the thread, so both parties get the same answer.
+- Each entry is the job as `/inbox` lists it (title, kind, `from`, `from_role`, `to`, state, `created_at`, `body_size`, `body_preview` of 200 chars, `body_truncated`, attachment summaries; a notice or a message up to 4 KiB with its whole `body`), plus `depth` (0 at the root). `full=1` gives every entry its whole `body`, as `GET /jobs/{id}`; any other value than `0` or `1` answers `400`.
+- A reply always goes to the other party of the job it answers, so a thread made through the API is between two agents. A job of the tree between other agents (an old or hand-edited database) is never shown: it is only counted in `omitted`.
+- Pages: `limit` 1 to 200 (default 50) jobs, and at most 1 MiB of answer. When more jobs remain, `truncated` is `true` and `next` is a cursor: pass it as `after` for the following page. A first job whose whole body alone would pass 1 MiB comes as a summary; read it with `GET /jobs/{id}`.
+- The walk is a recursive query over the index `jobs_reply_to` (`jobs (reply_to)`), which the server creates on start in databases made before it.
+
+`GET /jobs?q=&from=&to=&kind=&state=&since=&until=&limit=50&after=CURSOR` searches the jobs the caller sent or received, newest first (by `created_at`, then id), and answers `{"jobs": [...], "next": CURSOR}` with `next` null on the last page. Entries are previews: like inbox summaries but never a whole body, not even a short message's.
+
+| Parameter | Meaning |
+|---|---|
+| `q` | Text found anywhere in the title or the body: 1 to 100 chars, URL-encoded (`%20` or `+` for a space). Case is ignored for ASCII letters only. `%`, `_` and `\` match themselves. |
+| `from`, `to` | Only jobs that agent sent, or that were sent to it. |
+| `kind`, `state` | Only jobs of that kind, or in that state. |
+| `since`, `until` | Created at or after `since` and before `until` (exclusive), each a UTC date `YYYY-MM-DD` (midnight) or time `YYYY-MM-DDTHH:MM:SSZ`; `since` must be before `until`. |
+| `limit` | 1 to 200, default 50. |
+| `after` | The `next` of the previous page. |
+
+The cursor is opaque text (today `created_at.id`); pages stay stable while new jobs arrive, because a new job is always after the first page's start and never inside a later page. Every parameter is checked before the query runs: an unknown one, a bad value or a `q` over 100 chars answers `400 bad_request` with a hint. The search is a substring match with SQLite `LIKE` and `ESCAPE` ([SQLite: the LIKE operator](https://www.sqlite.org/lang_expr.html#the_like_glob_regexp_match_and_extract_operators)), over every job the caller may see; the bundled SQLite has FTS5 compiled in, but its tokenizers match words or trigrams rather than any substring ([SQLite: FTS5 trigram tokenizer](https://www.sqlite.org/fts5.html#the_trigram_tokenizer)) and an index would double the stored text, while 30 days of jobs between a few agents scan quickly.
+
 ## Presence
 
 `GET /agents` tells who is around, so an agent can decide whether to wait for an answer:
@@ -184,6 +217,8 @@ All need the Bearer token, except `GET /` and `GET /help` (they show no data) an
 | `PUT /agents/me` | Set your own `about` and `capabilities` (also `rack_version`, `os`, which clients send as headers instead). |
 | `POST /jobs` | Create a job. Body: `to`, `kind`, `title`, `body`, `tags`, `origin`, `reply_to`, `outcome`, `priority`, `expects_reply`, `model`, `hops`, `parent`. |
 | `GET /jobs/{id}` | Full job with body. Sender and recipient only. |
+| `GET /jobs` | Search your jobs by text and filters, newest first, previews only (see History). |
+| `GET /threads/{id}` | The whole conversation a job belongs to, oldest first (see History). |
 | `POST /jobs/{id}/receive` | Task: `sent` to `received`. |
 | `POST /jobs/{id}/accept` | Task: to `accepted`. |
 | `POST /jobs/{id}/reject` | Task: to `rejected`. Body: `reason`. |

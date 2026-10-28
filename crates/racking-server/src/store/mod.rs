@@ -17,9 +17,11 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 mod admin;
+mod history;
 mod pairing;
 
 pub use admin::{AuditEntry, Managed};
+pub use history::{SearchQuery, ThreadQuery};
 pub use pairing::{Decision, Invite, InviteState, NewInvite, Redeem, bad_code};
 
 use crate::clock;
@@ -53,6 +55,10 @@ pub mod limits {
     pub const IDEMPOTENCY_KEY_CHARS: usize = 80;
     pub const LIST_DEFAULT: u32 = 50;
     pub const LIST_MAX: u32 = 200;
+    /// One answer of `GET /threads/{id}`; a thread of whole reports goes on over pages.
+    pub const THREAD_BYTES: usize = 1024 * 1024;
+    /// Search text, so one query cannot make every row's `LIKE` scan arbitrarily long.
+    pub const SEARCH_CHARS: usize = 100;
     pub const REASON_CHARS: usize = 2000;
     pub const LINK_FIELD_CHARS: usize = 200;
     /// How far a chain of jobs may go from the job that started it, so agents that
@@ -319,11 +325,13 @@ pub enum Delivery {
     Peek,
 }
 
-/// Whether a job is shown whole or as an inbox summary.
+/// Whether a job is shown whole, as an inbox summary, or as a preview.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Full,
     Summary,
+    /// Like `Summary`, but never a whole body, not even a short message's: search answers.
+    Preview,
 }
 
 pub struct Job {
@@ -333,7 +341,8 @@ pub struct Job {
     pub kind: Kind,
     pub title: String,
     /// The whole body for `View::Full`; for `View::Summary`, the whole body of a
-    /// message or notice that `Kind::inlines`, else the first 200 chars.
+    /// message or notice that `Kind::inlines`, else the first 200 chars; for
+    /// `View::Preview`, always the first 200 chars.
     pub body: String,
     pub body_size: i64,
     pub tags: Vec<String>,
@@ -393,7 +402,7 @@ impl Job {
                     insert("body_preview", Value::from(truncate(&self.body, limits::PREVIEW_CHARS)));
                     insert("body_truncated", Value::from(false));
                 }
-                View::Summary => {
+                View::Summary | View::Preview => {
                     insert("body_preview", Value::from(self.body.as_str()));
                     insert("body_truncated", Value::from(self.body_size > self.body.len() as i64));
                 }
@@ -523,6 +532,10 @@ const SUMMARY_COLUMNS: &str = "id, from_agent, to_agent, kind, title, \
                                THEN body ELSE substr(body, 1, 200) END, length(CAST(body AS BLOB)), \
                                tags, origin, reply_to, outcome, reason, state, created_at, updated_at, seq, updated_seq, \
                                priority, expects_reply, model, from_role, hops, parent";
+/// The body column must agree with `limits::PREVIEW_CHARS`.
+const PREVIEW_COLUMNS: &str = "id, from_agent, to_agent, kind, title, substr(body, 1, 200), length(CAST(body AS BLOB)), \
+                               tags, origin, reply_to, outcome, reason, state, created_at, updated_at, seq, updated_seq, \
+                               priority, expects_reply, model, from_role, hops, parent";
 
 const SCHEMA: &str = "
 PRAGMA journal_mode = WAL;
@@ -554,6 +567,8 @@ CREATE TABLE IF NOT EXISTS jobs (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS jobs_inbox ON jobs (to_agent, seq);
 CREATE INDEX IF NOT EXISTS jobs_outbox ON jobs (from_agent, updated_seq);
+-- Walks down a thread (GET /threads/{id}); every schema since the first has reply_to, so old databases get it too.
+CREATE INDEX IF NOT EXISTS jobs_reply_to ON jobs (reply_to);
 CREATE TABLE IF NOT EXISTS attachments (
     job INTEGER NOT NULL REFERENCES jobs (id) ON DELETE CASCADE,
     name TEXT NOT NULL,
@@ -1534,6 +1549,7 @@ fn load_job(conn: &Connection, id: JobId, view: View) -> ApiResult<Job> {
     let columns = match view {
         View::Full => JOB_COLUMNS,
         View::Summary => SUMMARY_COLUMNS,
+        View::Preview => PREVIEW_COLUMNS,
     };
     let job = conn
         .query_row(
@@ -1624,10 +1640,10 @@ mod tests {
     static DIRS: AtomicUsize = AtomicUsize::new(0);
 
     /// A fresh data directory under the system temp dir, removed on drop.
-    struct TempDir(PathBuf);
+    pub(super) struct TempDir(pub(super) PathBuf);
 
     impl TempDir {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let n = DIRS.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!("racking-store-{}-{n}", std::process::id()));
             let _ = fs::remove_dir_all(&path);
@@ -1641,11 +1657,11 @@ mod tests {
         }
     }
 
-    fn agent(name: &str) -> AgentName {
+    pub(super) fn agent(name: &str) -> AgentName {
         name.parse().unwrap_or_else(|e: String| panic!("{e}"))
     }
 
-    fn task(to: &str) -> NewJob {
+    pub(super) fn task(to: &str) -> NewJob {
         NewJob {
             to: agent(to),
             kind: Kind::Task,
@@ -1668,7 +1684,7 @@ mod tests {
         }
     }
 
-    fn delivery(kind: Kind, to: &str, body: &str) -> NewJob {
+    pub(super) fn delivery(kind: Kind, to: &str, body: &str) -> NewJob {
         NewJob {
             kind,
             title: "Hello".to_owned(),
@@ -2054,7 +2070,7 @@ mod tests {
             .expect("a closed task frees a slot");
     }
 
-    fn store() -> (TempDir, Store) {
+    pub(super) fn store() -> (TempDir, Store) {
         let dir = TempDir::new();
         let store = Store::open(&dir.0).expect("open store");
         (dir, store)

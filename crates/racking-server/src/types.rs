@@ -372,6 +372,88 @@ pub fn hex(bytes: &[u8]) -> String {
     })
 }
 
+/// A place in a list of jobs ordered by creation time: the `created_at` and id
+/// of the last job seen. Ties on `created_at` (whole seconds) are broken by the
+/// id, so a job created later never lands before a cursor already handed out.
+/// Clients treat the text as opaque.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cursor {
+    pub created_at: i64,
+    pub id: i64,
+}
+
+impl FromStr for Cursor {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let number = |part: &str| part.parse::<i64>().ok().filter(|n| *n >= 0 && !part.starts_with('+'));
+        s.split_once('.')
+            .and_then(|(at, id)| Some((number(at)?, number(id)?)))
+            .map(|(created_at, id)| Self { created_at, id })
+            .ok_or_else(|| {
+                format!(
+                    "cursor `{}` is not one this server handed out; pass `next` as it came",
+                    truncate(s, 40)
+                )
+            })
+    }
+}
+
+impl fmt::Display for Cursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}", self.created_at, self.id)
+    }
+}
+
+/// A UTC instant from `YYYY-MM-DD` (midnight) or `YYYY-MM-DDTHH:MM:SSZ`, in Unix seconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UtcTime(i64);
+
+impl UtcTime {
+    pub fn get(self) -> i64 {
+        self.0
+    }
+}
+
+impl FromStr for UtcTime {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let bad = || {
+            format!(
+                "`{}` must be a UTC date YYYY-MM-DD or time YYYY-MM-DDTHH:MM:SSZ",
+                truncate(s, 40)
+            )
+        };
+        let full = match s.len() {
+            10 => format!("{s}T00:00:00Z"),
+            20 => s.to_owned(),
+            _ => return Err(bad()),
+        };
+        let shape_ok = full.bytes().enumerate().all(|(i, b)| match i {
+            4 | 7 => b == b'-',
+            10 => b == b'T',
+            13 | 16 => b == b':',
+            19 => b == b'Z',
+            _ => b.is_ascii_digit(),
+        });
+        if !shape_ok {
+            return Err(bad());
+        }
+        let field = |range: std::ops::Range<usize>| full[range].parse::<i64>().unwrap_or(-1);
+        let secs = crate::clock::days_from_civil(field(0..4), field(5..7), field(8..10)) * 86_400
+            + field(11..13) * 3600
+            + field(14..16) * 60
+            + field(17..19);
+        // Formatting back catches what the arithmetic would roll over: Feb 30, hour 24, minute 60.
+        if crate::clock::rfc3339(secs) == full {
+            Ok(Self(secs))
+        } else {
+            Err(bad())
+        }
+    }
+}
+
 /// Cuts `s` to at most `max` chars, on a char boundary, for echoing input in errors.
 pub fn truncate(s: &str, max: usize) -> &str {
     s.char_indices().nth(max).map_or(s, |(i, _)| &s[..i])
@@ -480,6 +562,36 @@ mod tests {
         assert!("a;b".parse::<Label>().is_err());
         assert!("1.0.0+build".parse::<Label>().is_err());
         assert!("x".repeat(Label::MAX_CHARS + 1).parse::<Label>().is_err());
+    }
+
+    #[test]
+    fn cursors_and_times() {
+        let c = Cursor {
+            created_at: 1_792_847_565,
+            id: 42,
+        };
+        assert_eq!(c.to_string().parse::<Cursor>(), Ok(c));
+        for bad in ["", "12", "12.", ".3", "-1.2", "1.-2", "+1.2", "a.b", "1.2.3"] {
+            assert!(bad.parse::<Cursor>().is_err(), "{bad}");
+        }
+        assert_eq!("2026-10-24".parse::<UtcTime>().map(UtcTime::get), Ok(1_792_800_000));
+        assert_eq!(
+            "2026-10-24T13:12:45Z".parse::<UtcTime>().map(UtcTime::get),
+            Ok(1_792_847_565)
+        );
+        assert_eq!("2000-02-29".parse::<UtcTime>().map(UtcTime::get), Ok(951_782_400));
+        for bad in [
+            "2026-02-30",
+            "2026-13-01",
+            "2026-10-24T24:00:00Z",
+            "2026-10-24T13:12:45",
+            "2026-10-24 13:12:45Z",
+            "2026-10-24T13:12:45+00:00",
+            "26-10-24",
+            "yesterday",
+        ] {
+            assert!(bad.parse::<UtcTime>().is_err(), "{bad}");
+        }
     }
 
     #[test]

@@ -2,6 +2,7 @@
 //! idempotency, and the Markdown guide generated from the same table.
 
 mod admin;
+mod history;
 mod pairing;
 
 use std::fmt::Write as _;
@@ -269,6 +270,40 @@ static ROUTES: &[Route] = &[
         input: "",
         example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" $RACK_URL/jobs/j1",
         handler: get_job,
+        secret: false,
+    },
+    Route {
+        method: Method::Get,
+        path: "/jobs",
+        auth: true,
+        body: BodyKind::None,
+        summary: "Search the jobs you sent or received, newest first, as previews (`body_preview`, 200 chars; \
+                  never a whole body): `{\"jobs\": [...], \"next\": CURSOR}`. `next` is null on the last page; \
+                  pass it as `after` for the next one, which stays stable while new jobs arrive. Jobs between \
+                  other agents never match. Closed jobs are purged 30 days after their last change, so older \
+                  ones are simply not found. A search is a peek: it delivers nothing and changes no state.",
+        query: history::SEARCH_QUERY,
+        input: "",
+        example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" \"$RACK_URL/jobs?q=vulkan%20probe&kind=report\"",
+        handler: history::search,
+        secret: false,
+    },
+    Route {
+        method: Method::Get,
+        path: "/threads/{id}",
+        auth: true,
+        body: BodyKind::None,
+        summary: "The whole conversation a job belongs to: from the root it answers (by `reply_to`) down through \
+                  every reply, in both directions, oldest first. `{\"root\", \"jobs\": [...], \"omitted\", \
+                  \"truncated\", \"next\"}`: each job carries `reply_to` and `depth` (0 at the root); summaries \
+                  as in `/inbox` unless `full=1`. You must be the sender or recipient of `id`; jobs of the thread \
+                  between other agents are left out and only counted in `omitted`. When `truncated` is true, pass \
+                  `next` as `after` for the rest. Reading a thread is a peek: it delivers nothing, changes no \
+                  state and moves no `updated_seq`.",
+        query: history::THREAD_QUERY,
+        input: "",
+        example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" \"$RACK_URL/threads/j3?full=1\"",
+        handler: history::thread,
         secret: false,
     },
     Route {

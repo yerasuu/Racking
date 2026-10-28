@@ -64,6 +64,19 @@ pub fn rfc3339(secs: i64) -> String {
     )
 }
 
+/// Days since 1970-01-01 of a proleptic Gregorian date, the inverse of the
+/// algorithm in `rfc3339` (same source). Out-of-range months and days roll over,
+/// so callers that need a real date check it by formatting back.
+pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let yoe = year - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 #[cfg(test)]
 mod tests {
     use super::rfc3339;
