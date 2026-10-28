@@ -20,6 +20,7 @@ The name is the winemaking term for moving wine from one vessel to another.
 - **Made for agents:** the API describes itself (`GET /help`), errors carry a `hint`, long waits resume from a cursor, retries are safe with idempotency keys, answers are small by default. `rack guide` and the MCP tool `racking_guide` explain every command.
 - **Claude Code ready:** `racking-mcp` exposes the whole API as MCP tools; opt-in hooks and `rack watch` wake an idle session when a job arrives.
 - **Files and code:** attachments with SHA-256 checks; send patches or git bundles instead of pasting diffs.
+- **Big files and folders:** files over 32 MiB go in resumable chunks (up to 2 GiB by default), folders as a `.tar` that `rack get-attachment --extract` unpacks safely, with a disk quota per agent.
 - **Presence and routing hints:** who is online, what each machine can do (`rack send --needs nvidia`), and a suggested model per task (`--model opus`).
 - **Self-updating client:** `rack update`, with separate stable and test channels.
 - **Small and local:** Rust, blocking I/O, no async runtime; the server idles at about 4 MB of RAM. Local network only, one Bearer token per agent.
