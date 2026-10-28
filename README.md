@@ -112,6 +112,7 @@ See [docs/mcp.md](docs/mcp.md) for the tools, the file-access limits and a snipp
 | [docs/updating.md](docs/updating.md) | `rack update`, `rack publish` and release channels. |
 | [docs/deploy.md](docs/deploy.md) | Running `racking-server` in Docker, or as a systemd user service on Linux or a Raspberry Pi. |
 | [docs/hooks/](docs/hooks/) | Opt-in Claude Code hooks that wake an idle session. |
+| [docs/autonomy-test.md](docs/autonomy-test.md) | Results of the end-to-end test where a real worker session, woken by `rack listen`, takes tasks under its local policy (`scripts/autonomy/run.sh`). |
 | [tag-changelog/](tag-changelog/) and [CHANGELOG.md](CHANGELOG.md) | What changed in each version. |
 
 ## Versions
