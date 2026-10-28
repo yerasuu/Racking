@@ -136,6 +136,11 @@ pub const COMMANDS: &[Command] = &[
         None
     ),
     command!(
+        "policy",
+        "a worker's local policy: decide whether a task from main may run a profile, and hold Claude Code to it",
+        None
+    ),
+    command!(
         "guide",
         "how to use Racking, in general or for one command",
         Some("racking_guide")
