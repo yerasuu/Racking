@@ -37,6 +37,16 @@ impl Env {
     }
 
     fn with_clock(clock: racking_server::Clock) -> Self {
+        Self::build(clock, "")
+    }
+
+    /// `linux` as the main agent and an admin, `windows` a worker.
+    fn with_roles() -> Self {
+        Self::build(racking_server::Clock::system(), "role = \"main\"\nadmin = true\n")
+    }
+
+    /// `linux_keys` go into the `[agents.linux]` section of the server config.
+    fn build(clock: racking_server::Clock, linux_keys: &str) -> Self {
         static RUNS: AtomicUsize = AtomicUsize::new(0);
         let run = RUNS.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!("rack-cli-{}-{run}", std::process::id()));
@@ -46,7 +56,7 @@ impl Env {
         fs::write(&kb, FAKE_KB).expect("fake kb");
         fs::set_permissions(&kb, fs::Permissions::from_mode(0o755)).expect("chmod");
         let config = racking_server::Config::parse(&format!(
-            "bind = \"127.0.0.1:0\"\ndata_dir = {:?}\n[agents.linux]\ntoken = \"{LINUX}\"\n\
+            "bind = \"127.0.0.1:0\"\ndata_dir = {:?}\n[agents.linux]\ntoken = \"{LINUX}\"\n{linux_keys}\
              [agents.windows]\ntoken = \"{WINDOWS}\"\n",
             root.join("data").display().to_string()
         ))
@@ -62,7 +72,11 @@ impl Env {
 
     /// `rack` as `agent`, with every pipe captured; the caller spawns it.
     fn command(&self, agent: &str, args: &[&str]) -> Command {
-        let token = if agent == "linux" { LINUX } else { WINDOWS };
+        let token = match agent {
+            "linux" => LINUX,
+            "windows" => WINDOWS,
+            token => token,
+        };
         let path = format!(
             "{}:{}",
             self.root.join("bin").display(),
@@ -127,12 +141,72 @@ fn path_str(p: &Path) -> String {
 }
 
 #[test]
+fn roles_show_and_admin_manages_agents() {
+    let env = Env::with_roles();
+    assert_eq!(
+        env.ok("linux", &["whoami"], None).trim(),
+        "linux (role main, admin, peers: windows)"
+    );
+    env.ok("linux", &["send", "windows", "Build it", "--body", "make"], None);
+    let line = env.ok("windows", &["wait", "--timeout", "0"], None);
+    assert!(line.contains("task from linux [main]: Build it"), "{line}");
+
+    let refused = env.rack("windows", &["admin", "agents"], None);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("not_admin"));
+
+    let token = env.ok("linux", &["admin", "add", "mac", "worker"], None);
+    let token = token.trim();
+    assert_eq!(token.len(), 64, "the token alone on stdout");
+    assert_eq!(
+        env.ok(token, &["whoami"], None).trim(),
+        "mac (role worker, peers: linux)"
+    );
+    let agents = env.ok("linux", &["admin", "agents"], None);
+    assert!(agents.contains("mac worker (api), token from "), "{agents}");
+    assert!(agents.contains("linux main admin (file)"), "{agents}");
+    assert!(!agents.contains(token));
+
+    env.ok("linux", &["admin", "pause"], None);
+    let out = env.rack("windows", &["inbox"], None);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("the server is paused"));
+    let blocked = env.rack(token, &["say", "linux", "hi"], None);
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("paused"));
+    env.ok("linux", &["admin", "resume"], None);
+
+    let rotated = env.ok("linux", &["admin", "rotate", "mac"], None);
+    assert_eq!(
+        env.rack(token, &["whoami"], None).status.code(),
+        Some(1),
+        "old token is dead"
+    );
+    env.ok("linux", &["admin", "remove", "mac"], None);
+    assert_eq!(env.rack(rotated.trim(), &["whoami"], None).status.code(), Some(1));
+    let audit = env.ok("linux", &["admin", "audit", "--limit", "3"], None);
+    assert!(audit.contains("linux agent.remove mac ok"), "{audit}");
+    assert!(audit.contains("more: rack admin audit --before "), "{audit}");
+    assert_eq!(
+        env.rack("linux", &["admin", "agents", "--limit", "2"], None)
+            .status
+            .code(),
+        Some(2)
+    );
+    assert_eq!(
+        env.rack("linux", &["admin", "remove", "../x"], None).status.code(),
+        Some(2)
+    );
+}
+
+#[test]
 fn send_wait_pull_result_round_trip() {
     let env = Env::new();
     let bat = env.root.join("psport-probe.bat");
     fs::write(&bat, "@echo off\r\npsport-probe.exe > probe.log\r\n").expect("bat");
 
-    assert_eq!(env.ok("linux", &["whoami"], None).trim(), "linux (peers: windows)");
+    assert_eq!(
+        env.ok("linux", &["whoami"], None).trim(),
+        "linux (role worker, peers: windows)"
+    );
     let sent = env.ok(
         "linux",
         &[

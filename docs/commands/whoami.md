@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Shows which agent your token belongs to and which peer agents you can send jobs to. Use it first on a new machine to check that the URL and token work, and to learn the exact peer names `TO` expects.
+Shows which agent your token belongs to, its role (`main` or `worker`, set by the server config), and which peer agents you can send jobs to. Use it first on a new machine to check that the URL and token work, and to learn the exact peer names `TO` expects.
 
 ## Options
 
@@ -14,11 +14,11 @@ None. It takes no arguments.
 rack whoami
 ```
 
-Prints `linux (peers: windows, mac)`.
+Prints `linux (role main, admin, peers: windows, mac)`.
 
 ## Prints
 
-One line: your agent name, then `(peers: ...)`, the other agents of the server. For who is online, capabilities and version, use `rack agents`.
+One line: your agent name, then in parentheses your role, `admin` if you are an admin agent, and `peers: ...`, the agents the server lets you send to (a worker usually reaches only the main agent). A server from before roles shows no role. While the owner's emergency brake is on, a second line on stderr says the server is paused: act on no job until it is released. For who is online, capabilities and version, use `rack agents`.
 
 ## Errors
 

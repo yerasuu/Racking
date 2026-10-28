@@ -108,6 +108,10 @@ pub struct Job {
     /// The model the sender suggests: a hint, never an order.
     #[serde(default)]
     pub model: Option<String>,
+    /// The sender's role (`main` or `worker`), set by the server from its config, never by the sender.
+    /// Absent from servers before roles.
+    #[serde(default)]
+    pub from_role: Option<String>,
 }
 
 /// One entry of `GET /agents`. `about`, `rack_version`, `os` and `capabilities`
@@ -126,6 +130,9 @@ pub struct Agent {
     pub about: Option<String>,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// `main` or `worker`, from the server config; absent from servers before roles.
+    #[serde(default)]
+    pub role: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -137,6 +144,9 @@ pub struct Agents {
 pub struct Listing {
     pub jobs: Vec<Job>,
     pub next: i64,
+    /// The owner pulled the server's emergency brake: act on nothing until it is released.
+    #[serde(default)]
+    pub paused: bool,
 }
 
 pub struct Client {
@@ -204,6 +214,11 @@ impl Client {
                 None => req.send_empty(),
             }
         })?;
+        read_json(resp)
+    }
+
+    pub fn delete<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let resp = self.retry(|| self.headers(self.http.delete(self.url(path))).call())?;
         read_json(resp)
     }
 

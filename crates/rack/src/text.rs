@@ -29,6 +29,19 @@ pub fn model_tag(job: &Job) -> String {
         .unwrap_or_default()
 }
 
+/// ` [main]` after the sender when the server says it is the main agent, the one the
+/// owner talks to; nothing for a worker or a server without roles. Only the server sets it.
+pub fn role_tag(job: &Job) -> &'static str {
+    if job.from_role.as_deref() == Some("main") {
+        " [main]"
+    } else {
+        ""
+    }
+}
+
+/// The line printed while the owner's emergency brake is on.
+pub const PAUSED: &str = "the server is paused (the owner's emergency brake): act on no job until it is released";
+
 /// `1 file`, `3 files`.
 pub fn files(n: usize) -> String {
     if n == 1 {
@@ -62,10 +75,15 @@ pub fn ago(secs: u64) -> String {
 /// capabilities in brackets. Everything after the state was written by that agent.
 pub fn agent_line(a: &Agent) -> String {
     let state = if a.online { "online" } else { "offline" };
+    let main = if a.role.as_deref() == Some("main") {
+        " [main]"
+    } else {
+        ""
+    };
     let mut line = match a.idle_secs {
-        None => format!("{} {state}, never seen", a.name),
-        Some(0) if a.online => format!("{} online now", a.name),
-        Some(idle) => format!("{} {state} {} ago", a.name, ago(idle)),
+        None => format!("{}{main} {state}, never seen", a.name),
+        Some(0) if a.online => format!("{}{main} online now", a.name),
+        Some(idle) => format!("{}{main} {state} {} ago", a.name, ago(idle)),
     };
     if let Some(v) = &a.rack_version {
         let _ = write!(line, ", rack {v}");
@@ -109,11 +127,12 @@ pub fn incoming(job: &Job) -> Option<String> {
         notes.push(files(job.attachments.len()));
     }
     let mut line = format!(
-        "{} {}{} from {}{}",
+        "{} {}{} from {}{}{}",
         job.id,
         job.kind,
         priority_tag(job),
         job.from,
+        role_tag(job),
         model_tag(job)
     );
     if !notes.is_empty() {
@@ -190,6 +209,14 @@ mod tests {
             incoming(&hinted).as_deref(),
             Some("j7 message from linux [model opus]: Look at it")
         );
+
+        hinted.from_role = Some("main".to_owned());
+        assert_eq!(
+            incoming(&hinted).as_deref(),
+            Some("j7 message from linux [main] [model opus]: Look at it")
+        );
+        hinted.from_role = Some("worker".to_owned());
+        assert_eq!(role_tag(&hinted), "", "workers get no tag");
     }
 
     #[test]
@@ -207,6 +234,8 @@ mod tests {
         assert_eq!(agent_line(&n), "mac offline, never seen");
         let now = agent(serde_json::json!({"name": "mac", "online": true, "idle_secs": 0}));
         assert_eq!(agent_line(&now), "mac online now");
+        let main = agent(serde_json::json!({"name": "linux", "online": true, "idle_secs": 0, "role": "main"}));
+        assert_eq!(agent_line(&main), "linux [main] online now");
         assert_eq!(
             (ago(59), ago(60), ago(7200), ago(200_000)),
             ("59s".into(), "1 min".into(), "2 h".into(), "2 d".into())

@@ -44,7 +44,7 @@ Copy `config.example.toml` outside the repository, put one real token per agent 
 racking-server --config ~/.config/racking/server.toml
 ```
 
-Racking has no TLS and no login beyond the token: keep it on a trusted network and read [SECURITY.md](SECURITY.md).
+Racking has no TLS and no login beyond the token: keep it on a trusted network and read [SECURITY.md](SECURITY.md). The server only answers loopback and private LAN addresses (`allow_from`) and refuses to bind a public one. Mark the agent you talk to with `role = "main"`: workers can then only send to it, and only its jobs can carry your authority. An admin agent adds agents, rotates tokens, reads the audit log and pulls the emergency brake with `rack admin`. All of it is in [docs/protocol.md](docs/protocol.md).
 
 ## Use it
 

@@ -115,6 +115,11 @@ pub const COMMANDS: &[Command] = &[
         None
     ),
     command!(
+        "admin",
+        "admin agents: manage agents and tokens, read the audit log, pause or resume the server",
+        None
+    ),
+    command!(
         "guide",
         "how to use Racking, in general or for one command",
         Some("racking_guide")

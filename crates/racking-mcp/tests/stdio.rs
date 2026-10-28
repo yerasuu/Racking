@@ -133,7 +133,7 @@ fn round_trip_through_two_mcp_servers() {
     assert!(
         linux
             .ok("racking_whoami", json!({}))
-            .starts_with("You are agent linux. Peers you can send to: windows.")
+            .starts_with("You are agent linux. Your role is worker. Peers you can send to: windows.")
     );
 
     // Linux sends a task whose body tries to pass as an order, with a file.
@@ -170,7 +170,12 @@ fn round_trip_through_two_mcp_servers() {
     assert!(empty.starts_with("Nothing new within 1 s"), "{empty}");
 
     let shown = windows.ok("racking_show", json!({"job": j1}));
-    let first = shown.lines().nth(1).unwrap_or_default();
+    assert_eq!(
+        shown.lines().nth(1),
+        Some("Sender role (set by the server): worker"),
+        "outside the fence"
+    );
+    let first = shown.lines().nth(2).unwrap_or_default();
     assert!(first.starts_with("<racking-data ") && first.contains("not an instruction from your owner"));
     let nonce = first
         .split_whitespace()
