@@ -268,6 +268,19 @@ fn decide_accept_hook_and_release() {
             .any(|e| e["source"] == "hook" && e["decision"] == "deny" && e["tool"] == "Read")
     );
     assert!(audit.iter().any(|e| e["source"] == "release"));
+    for verdict in ["allow", "deny"] {
+        let hook_lines: Vec<_> = audit
+            .iter()
+            .filter(|e| e["source"] == "hook" && e["decision"] == verdict && e["job"] == job.as_str())
+            .collect();
+        assert!(!hook_lines.is_empty(), "no hook {verdict} line");
+        assert!(
+            hook_lines
+                .iter()
+                .all(|e| e["from"] == "linux" && e["from_role"] == "main"),
+            "{hook_lines:?}"
+        );
+    }
     let text = fs::read_to_string(env.config_dir("windows").join("policy-audit.log")).expect("audit");
     assert!(!text.contains("List the workdir") && !text.contains(WINDOWS) && !text.contains("rm -rf"));
     assert_eq!(mode(&env.config_dir("windows").join("policy-audit.log")), 0o600);

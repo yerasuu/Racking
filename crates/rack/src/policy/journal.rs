@@ -35,6 +35,10 @@ pub struct Active {
     pub job: String,
     pub profile: String,
     pub from: String,
+    /// The sender's role as the server set it on the job; absent in files written before the audit
+    /// lines carried it, and from a server without the field, so it reads back as `None`.
+    #[serde(default)]
+    pub from_role: Option<String>,
     pub accepted_at: u64,
     pub expires_at: u64,
 }
@@ -224,6 +228,7 @@ mod tests {
             job: "j1".to_owned(),
             profile: "workdir".to_owned(),
             from: "linux".to_owned(),
+            from_role: Some("main".to_owned()),
             accepted_at: 10,
             expires_at: 20,
         };
@@ -234,5 +239,18 @@ mod tests {
         assert!(read_active(&path, 15).is_err());
         clear_active(&path).expect("clear");
         clear_active(&path).expect("clear twice");
+    }
+
+    #[test]
+    fn active_written_before_from_role_still_loads() {
+        let f = Fixture::new("active-old");
+        let path = active_path(&f.conf);
+        fs::write(
+            &path,
+            r#"{"job":"j1","profile":"workdir","from":"linux","accepted_at":10,"expires_at":20}"#,
+        )
+        .expect("write");
+        let a = read_active(&path, 15).expect("read").expect("active");
+        assert_eq!((a.from.as_str(), a.from_role), ("linux", None));
     }
 }

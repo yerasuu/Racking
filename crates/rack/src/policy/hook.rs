@@ -493,6 +493,7 @@ network = ["example.org:443"]
                 job: "j1".to_owned(),
                 profile: "workdir".to_owned(),
                 from: "linux".to_owned(),
+                from_role: Some("main".to_owned()),
                 accepted_at: 0,
                 expires_at: u64::MAX,
             }

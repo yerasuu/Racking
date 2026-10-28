@@ -277,6 +277,7 @@ pub fn decide(job: &str, accept: bool, connect: impl FnOnce() -> Result<Client>)
         job: accepted.id,
         profile: name.as_str().to_owned(),
         from: seen.job.from.clone(),
+        from_role: seen.job.from_role.clone(),
         accepted_at: now,
         expires_at: now + policy.max_runtime_secs,
     };
@@ -309,7 +310,7 @@ pub fn release() -> Result<()> {
         job: Some(&a.job),
         profile: Some(&a.profile),
         from: Some(&a.from),
-        from_role: None,
+        from_role: a.from_role.as_deref(),
         tool: None,
         reason: "released by rack policy release",
     };
@@ -355,7 +356,7 @@ pub fn hook() -> Result<()> {
                 job: active.as_ref().map(|a| a.job.as_str()),
                 profile: active.as_ref().map(|a| a.profile.as_str()),
                 from: active.as_ref().map(|a| a.from.as_str()),
-                from_role: None,
+                from_role: active.as_ref().and_then(|a| a.from_role.as_deref()),
                 tool: tool.as_deref(),
                 reason: verdict.reason(),
             };
