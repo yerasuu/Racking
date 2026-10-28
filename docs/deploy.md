@@ -47,7 +47,7 @@ Agents are the `[agents.*]` sections of the config: give each machine its URL an
 git pull && docker compose build && docker compose up -d
 ```
 
-The volume and the config are kept. The server does not handle SIGTERM, so a stop waits Docker's 10 s grace period and then kills it; SQLite's WAL recovers from that.
+The volume and the config are kept. The server does not handle SIGTERM. The compose file runs it with `init: true` ([compose init](https://docs.docker.com/reference/compose-file/services/#init)), so the stop signal reaches the process and ends it at once (Podman test: 0.06 s, against the full timeout without init) and `stop_grace_period` is 15 s. A kill loses at most the requests in flight; the SQLite docs say that the next connection to open the database after a crash runs recovery ([SQLite WAL](https://www.sqlite.org/wal.html)), though they do not state it for a killed process specifically.
 
 ### Backup
 
@@ -78,11 +78,19 @@ Cross-building needs QEMU emulation on the PC and is slow; `--push` to a registr
 
 ### Behind Traefik (TLS)
 
-For Internet exposure, the only supported route is [Traefik](https://doc.traefik.io/traefik/) v3 (pinned to `v3.6.25` in `compose.yaml`) terminating TLS with Let's Encrypt. It is off by default (`profiles: ["traefik"]`).
+For Internet exposure, the only supported route is [Traefik](https://doc.traefik.io/traefik/) v3 (pinned to `v3.6.25` in `compose.yaml`) terminating TLS with Let's Encrypt. It is off by default (`profiles: ["traefik"]`). Traefik gets its routes from a file ([file provider](https://doc.traefik.io/traefik/v3.6/reference/install-configuration/providers/others/file/)), not from the Docker socket, so it has no access to the Docker API.
 
-1. DNS: an A/AAAA record for the domain pointing at the host, and the host's port 443 reachable from the Internet (the TLS-ALPN challenge needs only 443, not 80).
-2. Set the variables (shell or `.env`): `RACKING_DOMAIN=racking.example.org` and `ACME_EMAIL=you@example.org` (Let's Encrypt expiry notices).
-3. Start with the override file, which removes the host port of `racking`, so only Traefik is reachable and Racking is on the compose network alone:
+1. DNS: an A/AAAA record for the domain pointing at the host, and the host's port 443 reachable from the Internet (the TLS-ALPN challenge needs only 443; port 80 only redirects to HTTPS).
+2. Create the dynamic file and put your domain in it. The file provider does not expand environment or compose variables, so the domain is written in the file:
+
+```sh
+cp config/traefik-dynamic.yml.example config/traefik-dynamic.yml   # ignored by version control
+# edit the Host(`racking.example.org`) rule, or generate it:
+RACKING_DOMAIN=racking.example.org
+sed "s/racking\.example\.org/$RACKING_DOMAIN/" config/traefik-dynamic.yml.example > config/traefik-dynamic.yml
+```
+
+3. Set `ACME_EMAIL=you@example.org` (shell or `.env`, Let's Encrypt expiry notices) and start with the override file, which removes the host port of `racking`, so only Traefik is reachable and Racking is on the compose network alone:
 
 ```sh
 docker compose -f compose.yaml -f compose.traefik.yaml --profile traefik up -d
@@ -91,16 +99,38 @@ docker compose logs -f traefik
 
 What the configuration sets, from the Traefik docs ([entrypoints](https://doc.traefik.io/traefik/v3.6/reference/install-configuration/entrypoints/), [ACME](https://doc.traefik.io/traefik/v3.6/reference/install-configuration/tls/certificate-resolvers/acme/), [RateLimit](https://doc.traefik.io/traefik/v3.6/reference/routing-configuration/http/middlewares/ratelimit/), [Buffering](https://doc.traefik.io/traefik/v3.6/reference/routing-configuration/http/middlewares/buffering/)):
 
-- Entrypoint `websecure` on 443 with read 60 s, write 90 s and idle 120 s timeouts against slow connections. The write timeout stays above the 55 s maximum of `GET /inbox/wait`.
-- A rate limit of 50 requests/s (burst 100) per source address and a request body limit of 64 MiB (`maxRequestBodyBytes`, the server's largest attachment) through the Buffering middleware.
+- Entrypoint `web` on 80 redirects to `websecure` on 443, which has read 60 s, write 90 s and idle 120 s timeouts against slow connections. The write timeout stays above the 55 s maximum of `GET /inbox/wait`.
+- In `config/traefik-dynamic.yml`: a rate limit of 50 requests/s (burst 100) per source address, a request body limit of 64 MiB (`maxRequestBodyBytes`, the server's largest attachment) through the Buffering middleware, and the service `http://racking:7878`.
 - The certificate is stored in the `traefik-acme` volume as `acme.json`; Traefik creates it with mode 600.
-- The router matches ``Host(`$RACKING_DOMAIN`)`` only; other hosts get 404.
+- The router matches ``Host(`your domain`)`` only; other hosts get 404.
+- Traefik watches the dynamic file (`providers.file.watch=true`); edits apply without a restart.
 
 Known limitations:
 
 - The server sees Traefik's address as the peer, and `X-Forwarded-For` is ignored. Per-IP limits (for example on `/join`) count the proxy as one client. Trusting `X-Forwarded-For` from a known proxy is a later server change.
-- Traefik reads container labels through the Docker socket, which is root-equivalent on the host even when mounted read-only. Accept that, or run Traefik with a static file configuration instead.
-- ACME issuance could not be tested here (no public domain). Traefik starting, parsing these options and routing `Host` to Racking over its self-signed default certificate was tested with Podman.
+- Traefik's timeouts are the only bound on slow connections: the server has no per-connection read timeout.
+- ACME issuance could not be tested here (no public domain). Traefik starting with these options, routing `Host` to Racking over its self-signed default certificate, `/whoami` answering 401 and another host 404 was tested with Podman, with no socket mounted.
+
+Alternative, label discovery. Traefik's own docs say that [unrestricted access to the Docker API is a security concern](https://doc.traefik.io/traefik/v3.6/reference/install-configuration/providers/docker/) (if Traefik is attacked, the attacker might get access to the host) and name the Tecnativa Docker Socket Proxy as a mitigation. It is not enabled here; a sketch, untested:
+
+```yaml
+# Traefik talks to a proxy that allows only the read verbs it needs, on an
+# internal network with no route out; only the proxy mounts the socket.
+#   socket-proxy:
+#     image: tecnativa/docker-socket-proxy
+#     environment: { CONTAINERS: 1, POST: 0 }     # everything else defaults to 0
+#     volumes: ["/var/run/docker.sock:/var/run/docker.sock:ro"]
+#     networks: [socket]
+#   traefik:
+#     command:
+#       - --providers.docker.endpoint=tcp://socket-proxy:2375
+#       - --providers.docker.exposedByDefault=false
+#     networks: [socket, default]
+#   networks:
+#     socket: { internal: true }
+```
+
+You would then put `traefik.*` labels on the `racking` service instead of using the dynamic file.
 
 ## Linking a new machine
 

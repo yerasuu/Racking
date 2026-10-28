@@ -1,0 +1,39 @@
+# Traefik dynamic configuration (file provider) for Racking, see docs/deploy.md.
+# Copy to config/traefik-dynamic.yml (git-ignored) and replace the domain.
+# The file provider does not expand environment variables or compose
+# variables, so the domain is written here. To generate it from a variable:
+#   RACKING_DOMAIN=racking.example.org
+#   sed "s/racking\.example\.org/$RACKING_DOMAIN/" \
+#     config/traefik-dynamic.yml.example > config/traefik-dynamic.yml
+# Traefik watches the file (providers.file.watch=true), so edits apply
+# without a restart.
+http:
+  routers:
+    racking:
+      rule: "Host(`racking.example.org`)"
+      entryPoints:
+        - websecure
+      middlewares:
+        - racking-ratelimit
+        - racking-bodylimit
+      service: racking
+      tls:
+        certResolver: le
+
+  middlewares:
+    # Rate limit per source address (the client address behind Traefik).
+    racking-ratelimit:
+      rateLimit:
+        average: 50
+        period: 1s
+        burst: 100
+    # Largest upload the server accepts is a 64 MiB attachment.
+    racking-bodylimit:
+      buffering:
+        maxRequestBodyBytes: 67108864
+
+  services:
+    racking:
+      loadBalancer:
+        servers:
+          - url: "http://racking:7878"
