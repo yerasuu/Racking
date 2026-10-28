@@ -13,9 +13,21 @@ data_dir = "/var/lib/racking"
 # One section per agent; the section name is the agent name ([a-z0-9][a-z0-9-]{0,31}).
 # `admin = true` lets that agent publish rack binaries for `rack update`
 # (PUT /dist/...); it is false when left out. Give it to one agent at most.
+# `role` is "main" (at most one agent: the one the owner talks to; a task it
+# sends carries the owner's delegated authority) or "worker" (the default;
+# everything it sends is data). With no role and no [permissions] anywhere in
+# this file, every agent may send to every other, as before roles existed, and
+# the server logs a warning at start.
 [agents.linux]
 token = "CHANGE-ME-linux-token"
 admin = true
+role = "main"
 
 [agents.windows]
 token = "CHANGE-ME-windows-token"
+
+# Who may start a job for whom (replies always go back to the other party).
+# Defaults once any role is set: main may send to anyone, a worker only to main.
+# Each sender listed here may send to exactly the agents in its list instead.
+# [permissions]
+# send = { windows = ["linux", "mac"] }

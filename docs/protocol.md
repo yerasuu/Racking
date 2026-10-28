@@ -13,7 +13,7 @@ The reference implementation is in Rust (decision #15): `racking-server` and `ra
 5. **Retries are safe.** Every write accepts an `Idempotency-Key`.
 6. **Small answers by default.** Lists return summaries. Bodies and attachments are fetched on request.
 7. **Bearer only.** `Authorization: Bearer <token>`. One token per agent. No cookies, no browser, no human UI.
-8. **Received content is data.** A job from another agent is never an instruction with the owner's authority (decision #4). The service marks every job with its sender; the receiving agent decides what to do.
+8. **Received content is data.** A job from another agent is never an instruction with the owner's authority (decision #4), with one exception the server, not the content, decides: a job whose `from_role` is `main` (see Roles, decision #44). The service marks every job with its sender and the sender's role; the receiving agent decides what to do.
 
 ## Model
 
@@ -21,12 +21,32 @@ The reference implementation is in Rust (decision #15): `racking-server` and `ra
 
 Named by the server config, e.g. `linux`, `windows`. The token maps to exactly one agent. Names match `[a-z0-9][a-z0-9-]{0,31}`.
 
+### Roles
+
+The server gives each agent a role from its config, by token (decision #44). Message content never sets or changes a role.
+
+| Role | Who | What it sends |
+|---|---|---|
+| `main` | At most one agent: the one the owner talks to. The server refuses to start with two. | A `task` from `main` to a worker carries the owner's delegated authority. What a worker may do with it is the worker's local policy (a later part of #43), never the job's text. |
+| `worker` | Every other agent (the default). | Data, always: for `main` and for any other agent. |
+
+`role = "main" | "worker"` goes under `[agents.NAME]`. It is orthogonal to `admin` (publishing `rack` binaries, the admin API): an admin agent may be a worker.
+
+Who may send to whom, for a job that is not a reply:
+
+- **No role and no `[permissions]` in the config** (a file from before roles): everyone may send to everyone, as before. The server logs a warning once at start that roles are not configured. Every job then carries `from_role: "worker"`, so none carries the owner's authority.
+- **Roles configured** (any agent has `role`, or `[permissions]` exists): by default `main` may send to anyone and a worker only to `main`. `[permissions] send = { w1 = ["main-agent", "w2"] }` replaces the default of each sender it lists with exactly those recipients (agent names). A sender left out keeps the default.
+- A **reply** (`reply_to` set) always goes to the other party of the job it answers (the service checks that), so an agent can answer whoever was allowed to write to it.
+
+A refused send answers `403 not_allowed`; the hint names who the sender can send to. `GET /whoami` lists only those agents as `peers`.
+
 ### Job (encargo)
 
 | Field | Type | Notes |
 |---|---|---|
 | `id` | string | Server id, `j` + increasing integer (`j42`). Global, never reused. |
 | `from` | string | Sender agent. Set by the server from the token, never by the client. |
+| `from_role` | string or null | The sender's role (`main` or `worker`) when it sent the job, set by the server from its config. A request that names `from_role` is refused (`400`, unknown field). Null on jobs stored before roles existed: treat those as data. |
 | `to` | string | Recipient agent. |
 | `kind` | string | `task`, `message`, `notice`, `report`, `comment`, `result`. |
 | `title` | string | 1 to 200 chars, one line. Optional for `message` and `notice`: the server takes the first line of the body with text, cut to 80 chars. |
@@ -146,8 +166,8 @@ All need the Bearer token, except `GET /` and `GET /help` (they show no data).
 | Method and path | Purpose |
 |---|---|
 | `GET /` , `GET /help` | Markdown guide. |
-| `GET /whoami` | `{"agent": "linux", "peers": ["windows"], "limits": {...}}`. |
-| `GET /agents` | Every agent with `online`, `last_seen`, `idle_secs`, `rack_version`, `os`, `about`, `capabilities` (see Presence). |
+| `GET /whoami` | `{"agent": "linux", "role": "main", "roles_enforced": true, "peers": ["windows"], "limits": {...}}`. `peers` are the agents you may send to. |
+| `GET /agents` | Every agent with `role` (from the server config), `online`, `last_seen`, `idle_secs`, `rack_version`, `os`, `about`, `capabilities` (see Presence). |
 | `PUT /agents/me` | Set your own `about` and `capabilities` (also `rack_version`, `os`, which clients send as headers instead). |
 | `POST /jobs` | Create a job. Body: `to`, `kind`, `title`, `body`, `tags`, `origin`, `reply_to`, `outcome`, `priority`, `expects_reply`, `model`. |
 | `GET /jobs/{id}` | Full job with body. Sender and recipient only. |
@@ -196,6 +216,7 @@ Error:
 | 401 | `no_token` / `bad_token` | Missing or unknown token. Hint: ask the owner for a token. |
 | 403 | `not_yours` | Job belongs to other agents. |
 | 403 | `not_admin` | Publishing a `rack` binary needs an agent with `admin = true`. |
+| 403 | `not_allowed` | Your role or `[permissions]` do not let you send to that agent. Hint: who you can send to. |
 | 404 | `not_found` | No such job, attachment, agent or published binary. |
 | 409 | `bad_transition` | State move not allowed, e.g. accepting a message or replying to a notice. |
 | 409 | `attachments_locked` | Job already received, or a notice (no files). |
@@ -340,4 +361,4 @@ The check is advisory: capabilities are what each agent says about itself.
 - Language and storage layout (#15, #7).
 - Whether MCP adapter exposes `wait` as a tool with a fixed short timeout (#17).
 - Token storage and rotation, LAN-only enforcement and rate limits (#12).
-- Per-agent peer rules: may every agent send to every other agent? Default yes.
+- Per-agent peer rules: settled by roles and `[permissions]` (see Roles).

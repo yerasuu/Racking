@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 
 use crate::clock;
 use crate::error::{ApiError, ApiResult, Code};
+use crate::policy::Role;
 use crate::presence;
 use crate::types::{AgentName, AttachmentName, JobId, Seq, Sha256Hex, hex, truncate};
 
@@ -278,6 +279,8 @@ pub struct NewJob {
     pub expects_reply: bool,
     /// The model the sender suggests, already lowercased and checked; a hint, never an order.
     pub model: Option<String>,
+    /// The sender's role when it sent the job, from the server config; never from the request.
+    pub from_role: Role,
 }
 
 pub struct Attachment {
@@ -331,6 +334,8 @@ pub struct Job {
     pub priority: Priority,
     pub expects_reply: bool,
     pub model: Option<String>,
+    /// `main` or `worker`; null for a job stored before roles existed.
+    pub from_role: Option<String>,
     pub attachments: Vec<Attachment>,
 }
 
@@ -355,6 +360,7 @@ impl Job {
             "priority": self.priority.as_str(),
             "expects_reply": self.expects_reply,
             "model": self.model,
+            "from_role": self.from_role,
         });
         if let Some(obj) = v.as_object_mut() {
             let mut insert = |k: &str, value: Value| obj.insert(k.to_owned(), value);
@@ -477,13 +483,13 @@ impl Changes {
 
 const JOB_COLUMNS: &str = "id, from_agent, to_agent, kind, title, body, length(CAST(body AS BLOB)), tags, origin, \
                            reply_to, outcome, reason, state, created_at, updated_at, seq, updated_seq, priority, \
-                           expects_reply, model";
+                           expects_reply, model, from_role";
 /// The body column must agree with `Kind::inlines`, `limits::INLINE_BYTES` and `limits::PREVIEW_CHARS`.
 const SUMMARY_COLUMNS: &str = "id, from_agent, to_agent, kind, title, \
                                CASE WHEN kind IN ('message', 'notice') AND length(CAST(body AS BLOB)) <= 4096 \
                                THEN body ELSE substr(body, 1, 200) END, length(CAST(body AS BLOB)), \
                                tags, origin, reply_to, outcome, reason, state, created_at, updated_at, seq, updated_seq, \
-                               priority, expects_reply, model";
+                               priority, expects_reply, model, from_role";
 
 const SCHEMA: &str = "
 PRAGMA journal_mode = WAL;
@@ -508,7 +514,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     updated_seq INTEGER NOT NULL,
     priority TEXT NOT NULL DEFAULT 'normal',
     expects_reply INTEGER NOT NULL DEFAULT 0,
-    model TEXT
+    model TEXT,
+    from_role TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS jobs_inbox ON jobs (to_agent, seq);
 CREATE INDEX IF NOT EXISTS jobs_outbox ON jobs (from_agent, updated_seq);
@@ -574,7 +581,8 @@ impl Store {
         conn.execute_batch(SCHEMA)
             .map_err(|e| format!("cannot set up the schema: {e}"))?;
         add_reply_columns(&conn).map_err(|e| format!("cannot add the priority columns: {e}"))?;
-        add_hint_columns(&conn).map_err(|e| format!("cannot add the model and capabilities columns: {e}"))?;
+        add_columns(&conn, HINT_COLUMNS).map_err(|e| format!("cannot add the model and capabilities columns: {e}"))?;
+        add_columns(&conn, ROLE_COLUMNS).map_err(|e| format!("cannot add the role columns: {e}"))?;
         Ok(Self {
             conn: Mutex::new(conn),
             files,
@@ -667,8 +675,8 @@ impl Store {
         let outcome = (new.kind == Kind::Result).then(|| new.outcome.unwrap_or(Outcome::Done).state().as_str());
         tx.execute(
             "INSERT INTO jobs (from_agent, to_agent, kind, title, body, tags, origin, reply_to, outcome, state, \
-             created_at, updated_at, seq, updated_seq, priority, expects_reply, model) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'sent', ?10, ?10, ?11, ?12, ?13, ?14, ?15)",
+             created_at, updated_at, seq, updated_seq, priority, expects_reply, model, from_role) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'sent', ?10, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 me.as_str(),
                 new.to.as_str(),
@@ -684,7 +692,8 @@ impl Store {
                 updated_seq,
                 new.priority.as_str(),
                 new.expects_reply,
-                new.model
+                new.model,
+                new.from_role.as_str()
             ],
         )?;
         let id = JobId::new(tx.last_insert_rowid());
@@ -1371,15 +1380,21 @@ fn add_reply_columns(conn: &Connection) -> rusqlite::Result<()> {
 
 /// Databases made before the model hint and capabilities lack those columns.
 /// Both are nullable and null means "none", so old rows need no update.
-fn add_hint_columns(conn: &Connection) -> rusqlite::Result<()> {
-    for (table, column) in [("jobs", "model"), ("agents", "capabilities")] {
+const HINT_COLUMNS: &[(&str, &str, &str)] = &[("jobs", "model", "TEXT"), ("agents", "capabilities", "TEXT")];
+/// Databases made before roles lack `from_role`; null there means the job predates roles, so it is data.
+const ROLE_COLUMNS: &[(&str, &str, &str)] = &[("jobs", "from_role", "TEXT")];
+
+/// Adds each `(table, column, declaration)` a database lacks. Every declaration
+/// is nullable or has a default, so old rows need no update.
+fn add_columns(conn: &Connection, columns: &[(&str, &str, &str)]) -> rusqlite::Result<()> {
+    for (table, column, declaration) in columns {
         let present: i64 = conn.query_row(
             "SELECT count(*) FROM pragma_table_info(?1) WHERE name = ?2",
             [table, column],
             |row| row.get(0),
         )?;
         if present == 0 {
-            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT;"))?;
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {declaration};"))?;
         }
     }
     Ok(())
@@ -1468,6 +1483,7 @@ fn job_from_row(row: &Row<'_>) -> rusqlite::Result<Job> {
         priority: row.get::<_, Parsed<Priority>>(17)?.0,
         expects_reply: row.get(18)?,
         model: row.get(19)?,
+        from_role: row.get(20)?,
         attachments: Vec::new(),
     })
 }
@@ -1523,6 +1539,7 @@ mod tests {
             priority: Priority::Normal,
             expects_reply: true,
             model: None,
+            from_role: Role::Worker,
         }
     }
 
@@ -1820,6 +1837,13 @@ mod tests {
         };
         let job = s.create_job(&linux, new).expect("job with a model");
         assert_eq!(job.to_json(View::Full)["model"], "opus");
+        assert_eq!(
+            old.to_json(View::Full)["from_role"],
+            Value::Null,
+            "old jobs have no role"
+        );
+        assert_eq!(job.to_json(View::Summary)["from_role"], "worker");
+
         let inbox = s.inbox(&windows, Seq::new(0), None, 10).expect("inbox").to_json();
         assert_eq!(inbox["jobs"][1]["model"], "opus", "summaries carry it too");
         drop(s);

@@ -10,6 +10,7 @@ pub enum Code {
     BadToken,
     NotYours,
     NotAdmin,
+    NotAllowed,
     NotFound,
     BadTransition,
     AttachmentsLocked,
@@ -22,7 +23,7 @@ pub enum Code {
 
 impl Code {
     /// Every code with its status and meaning, in the order `/help` lists them.
-    pub const ALL: [(Code, &'static str); 13] = [
+    pub const ALL: [(Code, &'static str); 14] = [
         (
             Code::BadRequest,
             "Malformed JSON or field out of range. `message` names the field.",
@@ -36,6 +37,11 @@ impl Code {
         (
             Code::NotAdmin,
             "Publishing `rack` needs an agent with `admin = true` in the server config.",
+        ),
+        (
+            Code::NotAllowed,
+            "Your role or the `[permissions]` of the server config do not let you send to that agent. The hint \
+             names who you can send to.",
         ),
         (
             Code::NotFound,
@@ -63,7 +69,7 @@ impl Code {
         match self {
             Code::BadRequest => 400,
             Code::NoToken | Code::BadToken => 401,
-            Code::NotYours | Code::NotAdmin => 403,
+            Code::NotYours | Code::NotAdmin | Code::NotAllowed => 403,
             Code::NotFound => 404,
             Code::BadTransition | Code::AttachmentsLocked => 409,
             Code::TooLarge => 413,
@@ -80,6 +86,7 @@ impl Code {
             Code::BadToken => "bad_token",
             Code::NotYours => "not_yours",
             Code::NotAdmin => "not_admin",
+            Code::NotAllowed => "not_allowed",
             Code::NotFound => "not_found",
             Code::BadTransition => "bad_transition",
             Code::AttachmentsLocked => "attachments_locked",

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::policy::{Role, SendRules};
 use crate::types::AgentName;
 
 /// Tokens shorter than this are refused, so a placeholder or a typo cannot become a credential.
@@ -18,6 +19,15 @@ struct RawConfig {
     bind: String,
     data_dir: PathBuf,
     agents: BTreeMap<String, RawAgent>,
+    #[serde(default)]
+    permissions: Option<RawPermissions>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPermissions {
+    #[serde(default)]
+    send: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -26,6 +36,8 @@ struct RawAgent {
     token: String,
     #[serde(default)]
     admin: bool,
+    #[serde(default)]
+    role: Option<String>,
 }
 
 fn default_bind() -> String {
@@ -37,6 +49,7 @@ pub struct Config {
     pub bind: SocketAddr,
     pub data_dir: PathBuf,
     pub agents: Vec<Agent>,
+    pub send_rules: SendRules,
 }
 
 pub struct Agent {
@@ -44,6 +57,8 @@ pub struct Agent {
     pub token: String,
     /// May publish `rack` binaries (`PUT /dist/...`); off unless the config says so.
     pub admin: bool,
+    /// `worker` unless the config says `main`; at most one agent is `main`.
+    pub role: Role,
 }
 
 impl Config {
@@ -59,6 +74,7 @@ impl Config {
             return Err("at least two agents are needed under [agents.NAME]".to_owned());
         }
         let mut agents = Vec::with_capacity(raw.agents.len());
+        let mut any_role = false;
         for (name, agent) in raw.agents {
             let name: AgentName = name.parse()?;
             let token = agent.token;
@@ -73,18 +89,54 @@ impl Config {
             if agents.iter().any(|a: &Agent| a.token == token) {
                 return Err(format!("agents.{name}.token is shared with another agent"));
             }
+            let role = match agent.role {
+                Some(text) => {
+                    any_role = true;
+                    text.parse().map_err(|e| format!("agents.{name}.role: {e}"))?
+                }
+                None => Role::Worker,
+            };
+            if role == Role::Main
+                && let Some(other) = agents.iter().find(|a: &&Agent| a.role == Role::Main)
+            {
+                return Err(format!(
+                    "agents.{name}.role: {} is main already; only one agent may be main",
+                    other.name
+                ));
+            }
             agents.push(Agent {
                 name,
                 token,
                 admin: agent.admin,
+                role,
             });
         }
+        let explicit = match &raw.permissions {
+            Some(p) => send_lists(&p.send)?,
+            None => BTreeMap::new(),
+        };
         Ok(Self {
             bind,
             data_dir: raw.data_dir,
             agents,
+            send_rules: SendRules::new(any_role || raw.permissions.is_some(), explicit),
         })
     }
+}
+
+/// `[permissions] send`, with every name checked. Names that are no agent of the
+/// file are kept: they may be agents added through the admin API.
+fn send_lists(raw: &BTreeMap<String, Vec<String>>) -> Result<BTreeMap<AgentName, Vec<AgentName>>, String> {
+    raw.iter()
+        .map(|(from, to)| {
+            let from: AgentName = from.parse().map_err(|e| format!("permissions.send: {e}"))?;
+            let to = to
+                .iter()
+                .map(|n| n.parse().map_err(|e| format!("permissions.send.{from}: {e}")))
+                .collect::<Result<Vec<AgentName>, String>>()?;
+            Ok((from, to))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -121,6 +173,68 @@ mod tests {
             admins,
             Ok(vec![("linux".to_owned(), true), ("windows".to_owned(), false)])
         );
+    }
+
+    const T3: &str = "cccccccccccccccccccccccccccc";
+
+    fn names(n: &[&str]) -> Vec<AgentName> {
+        n.iter()
+            .map(|n| n.parse().unwrap_or_else(|e: String| panic!("{e}")))
+            .collect()
+    }
+
+    #[test]
+    fn at_most_one_main() {
+        let two = cfg(&format!(
+            "[agents.a]\ntoken = \"{T1}\"\nrole = \"main\"\n[agents.b]\ntoken = \"{T2}\"\nrole = \"main\"\n"
+        ));
+        assert!(two.err().is_some_and(|e| e.contains("only one agent may be main")));
+        let bad = cfg(&format!(
+            "[agents.a]\ntoken = \"{T1}\"\nrole = \"boss\"\n[agents.b]\ntoken = \"{T2}\"\n"
+        ));
+        assert!(bad.is_err());
+    }
+
+    #[test]
+    fn roles_turn_on_the_default_permissions() {
+        let c = cfg(&format!(
+            "[agents.boss]\ntoken = \"{T1}\"\nrole = \"main\"\n[agents.w1]\ntoken = \"{T2}\"\n\
+             [agents.w2]\ntoken = \"{T3}\"\n"
+        ))
+        .expect("config");
+        let [boss, w1, w2] = <[AgentName; 3]>::try_from(names(&["boss", "w1", "w2"])).expect("names");
+        let role = |n: &AgentName| c.agents.iter().find(|a| &a.name == n).map(|a| a.role);
+        assert_eq!(role(&w1), Some(Role::Worker), "worker is the default");
+        assert!(c.send_rules.enforced());
+        assert!(c.send_rules.may_send(&boss, Role::Main, &w1, Role::Worker));
+        assert!(c.send_rules.may_send(&w1, Role::Worker, &boss, Role::Main));
+        assert!(!c.send_rules.may_send(&w1, Role::Worker, &w2, Role::Worker));
+    }
+
+    #[test]
+    fn no_roles_keeps_everyone_reaching_everyone() {
+        let c = cfg(&format!("[agents.a]\ntoken = \"{T1}\"\n[agents.b]\ntoken = \"{T2}\"\n")).expect("config");
+        assert!(!c.send_rules.enforced());
+        let [a, b] = <[AgentName; 2]>::try_from(names(&["a", "b"])).expect("names");
+        assert!(c.send_rules.may_send(&a, Role::Worker, &b, Role::Worker));
+    }
+
+    #[test]
+    fn explicit_permissions() {
+        let c = cfg(&format!(
+            "[agents.a]\ntoken = \"{T1}\"\n[agents.b]\ntoken = \"{T2}\"\n\
+             [permissions]\nsend = {{ a = [\"b\"] }}\n"
+        ))
+        .expect("config");
+        assert!(c.send_rules.enforced(), "a [permissions] section turns the rules on");
+        let [a, b] = <[AgentName; 2]>::try_from(names(&["a", "b"])).expect("names");
+        assert!(c.send_rules.may_send(&a, Role::Worker, &b, Role::Worker));
+        assert!(!c.send_rules.may_send(&b, Role::Worker, &a, Role::Worker));
+        let bad = cfg(&format!(
+            "[agents.a]\ntoken = \"{T1}\"\n[agents.b]\ntoken = \"{T2}\"\n\
+             [permissions]\nsend = {{ a = [\"B!\"] }}\n"
+        ));
+        assert!(bad.is_err());
     }
 
     #[test]
