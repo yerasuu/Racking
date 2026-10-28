@@ -115,6 +115,9 @@ pub struct Job {
     /// How deep the job is in a chain of tasks, computed by the server; 0 from servers before it.
     #[serde(default)]
     pub hops: i64,
+    /// UTC, RFC 3339.
+    #[serde(default)]
+    pub created_at: Option<String>,
 }
 
 /// One entry of `GET /agents`. `about`, `rack_version`, `os` and `capabilities`

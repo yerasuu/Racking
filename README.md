@@ -79,6 +79,7 @@ rack accept j1
 rack result j1 --body "Two Vulkan devices." --attach probe.log
 rack say windows "Which branch has the fix?" --expects-reply
 rack ask windows "Is the log ready?" --timeout 120      # blocks until the answer arrives
+rack thread j1                               # the whole conversation, oldest first; rack search TEXT finds past jobs
 rack notify windows "CI is red"
 rack report windows "Probe results" --file report.md
 rack agents                                  # who is online and what they can do

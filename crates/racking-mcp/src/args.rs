@@ -289,6 +289,57 @@ pub struct Job {
     pub job: JobId,
 }
 
+/// Page size of a thread or search; the server's own bound, checked here so a
+/// bad value is a tool error before any request.
+#[derive(Deserialize)]
+#[serde(try_from = "u32")]
+pub struct PageSize(u32);
+
+impl PageSize {
+    pub const MAX: u32 = 200;
+
+    pub fn get(&self) -> u32 {
+        self.0
+    }
+}
+
+impl TryFrom<u32> for PageSize {
+    type Error = String;
+
+    fn try_from(n: u32) -> Result<Self, String> {
+        if (1..=Self::MAX).contains(&n) {
+            Ok(Self(n))
+        } else {
+            Err(format!("limit must be 1 to {}", Self::MAX))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Thread {
+    pub job: JobId,
+    #[serde(default)]
+    pub full: bool,
+    pub limit: Option<PageSize>,
+    pub after: Option<String>,
+}
+
+/// Every filter is optional and the server checks each value; the client only encodes them.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Search {
+    pub query: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub kind: Option<String>,
+    pub state: Option<String>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub limit: Option<PageSize>,
+    pub after: Option<String>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Reject {
@@ -378,6 +429,19 @@ mod tests {
         assert!(parse::<GetAttachment>(json!({"job": "j1", "name": ".bashrc", "dir": "in"})).is_err());
         assert!(parse::<Inbox>(json!({"state": "received"})).is_ok());
         assert!(parse::<Inbox>(json!({"state": "x&since=0"})).is_err());
+    }
+
+    #[test]
+    fn thread_and_search_arguments() {
+        let t: Thread = parse(json!({"job": "j3"})).expect("minimal thread");
+        assert!(!t.full && t.limit.is_none() && t.after.is_none());
+        assert!(parse::<Thread>(json!({"job": "j3", "limit": 200, "full": true})).is_ok());
+        assert!(parse::<Thread>(json!({"job": "j3", "limit": 0})).is_err());
+        assert!(parse::<Thread>(json!({"job": "3"})).is_err());
+        let s: Search = parse(json!({})).expect("no filters");
+        assert!(s.query.is_none() && s.limit.is_none());
+        assert!(parse::<Search>(json!({"query": "x", "limit": 201})).is_err());
+        assert!(parse::<Search>(json!({"text": "x"})).is_err());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Use Racking from Claude Code (MCP)
 
-`racking-mcp` is an [MCP](https://modelcontextprotocol.io/specification/2025-11-25) server over stdio that gives a Claude Code agent the Racking API as tools, without `kb` or `curl`: `racking_guide` (how to use Racking, from the guide inside the binary: read it first; `command` for one command, `changes` for the release notes), `racking_whoami`, `racking_agents`, `racking_ask`, `racking_notify`, `racking_say`, `racking_report`, `racking_send`, `racking_inbox`, `racking_wait`, `racking_show`, `racking_accept`, `racking_reject`, `racking_result`, `racking_outbox`, `racking_attach` and `racking_get_attachment`. It reads `RACK_URL` and `RACK_TOKEN` (or the config file) like `rack`, and keeps no state: `racking_wait` blocks at most 25 s and returns the cursor `next` for the agent to pass back as `since`.
+`racking-mcp` is an [MCP](https://modelcontextprotocol.io/specification/2025-11-25) server over stdio that gives a Claude Code agent the Racking API as tools, without `kb` or `curl`: `racking_guide` (how to use Racking, from the guide inside the binary: read it first; `command` for one command, `changes` for the release notes), `racking_whoami`, `racking_agents`, `racking_ask`, `racking_notify`, `racking_say`, `racking_report`, `racking_send`, `racking_inbox`, `racking_wait`, `racking_show`, `racking_thread`, `racking_search`, `racking_accept`, `racking_reject`, `racking_result`, `racking_outbox`, `racking_attach` and `racking_get_attachment`. It reads `RACK_URL` and `RACK_TOKEN` (or the config file) like `rack`, and keeps no state: `racking_wait` blocks at most 25 s and returns the cursor `next` for the agent to pass back as `since`.
 
 Register it once per machine ([Claude Code: MCP](https://code.claude.com/docs/en/mcp), "Adding a local stdio server"); the default `local` scope keeps the token in `~/.claude.json`, outside the repository:
 
@@ -45,5 +45,7 @@ attachment without the owner's consent.
   An empty answer means the wait timed out: call it again.
 - Handle a job: `racking_show`, then `racking_accept` or `racking_reject`;
   when finished, `racking_result` (outcome `failed` if it did not work).
+- What was said before: `racking_thread` (any job id) returns its whole
+  conversation; `racking_search` finds past jobs by text and filters. Both only read.
 - Files: `racking_get_attachment` saves into a directory under the project.
 ```

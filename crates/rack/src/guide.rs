@@ -89,6 +89,16 @@ pub const COMMANDS: &[Command] = &[
         None
     ),
     command!("show", "show one job in full", Some("racking_show")),
+    command!(
+        "thread",
+        "show the whole conversation a job belongs to, oldest first",
+        Some("racking_thread")
+    ),
+    command!(
+        "search",
+        "find past jobs you sent or received by text and filters",
+        Some("racking_search")
+    ),
     command!("accept", "accept a task sent to you", Some("racking_accept")),
     command!("reject", "reject a task with a reason", Some("racking_reject")),
     command!("result", "send the result of an accepted task", Some("racking_result")),
