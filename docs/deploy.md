@@ -16,8 +16,10 @@ openssl rand -hex 32     # once per agent; paste each into its `token`, replacin
 
 `config/server.toml` is git-ignored and mounted read-only at `/config/server.toml`. Keep these settings of the example:
 
-- `bind = "0.0.0.0:7878"` and `allow_public_bind = true`: inside the container the server must listen on every interface, or the published port cannot reach it. This is acceptable only because `compose.yaml` publishes the port on **one** host address (`RACKING_BIND_IP`, default `127.0.0.1`) and `allow_from` still refuses peers outside your private ranges. The server logs a warning about the public bind at start; that is expected.
+- `bind = "0.0.0.0:7878"`, `allow_public_bind = true` and `allow_from = ["0.0.0.0/0", "::/0"]`: inside the container the server listens on every interface (or the published port cannot reach it) and accepts any peer. This is intended there and only there: Docker NATs published ports, so the server sees the bridge address instead of the client and `allow_from` cannot tell clients apart. Network exposure is decided **only** by the host address `compose.yaml` publishes the port on (`RACKING_BIND_IP`, default `127.0.0.1`; never `0.0.0.0` or a public address). Access control is the tokens, the agent roles and the limits. The server logs a warning about the public bind at start; that is expected.
 - `data_dir = "/data"`: the `racking-data` volume.
+
+The server is never opened to the Internet directly. If it must be reachable from the Internet, only through [Traefik with TLS](#behind-traefik-tls).
 
 ### Start
 
@@ -31,11 +33,9 @@ docker compose ps                                      # health: healthy
 
 Use your LAN address in `curl` if you published on it. The healthcheck is a bash `/dev/tcp` request for `GET /help` (the image has bash, not curl). The rootfs is read-only, the process runs as uid 10001 with every capability dropped, and logs rotate at 3 files of 10 MB.
 
-### Source address and `allow_from`
+### Peer addresses
 
-The server checks the peer address of the TCP connection (`X-Forwarded-For` is ignored). With a published port on the default bridge network, that may be the bridge gateway or the host instead of the real client, depending on the runtime. Tested with rootless Podman: a request from the host's own shell arrived as the host's LAN address, not `127.0.0.1`. With Docker, traffic from other machines is normally DNATed and keeps its source, while traffic from the host itself arrives from the bridge gateway (172.x); this was not tested. That is why the example `allow_from` lists all private ranges: it works either way, but it is looser than "my LAN only".
-
-For exact client addresses on Linux, use host networking: in `compose.yaml` remove `ports:` and uncomment `network_mode: host`, then set `bind = "192.168.1.20:7878"` (your LAN address; it no longer needs `allow_public_bind`) and `allow_from = ["192.168.1.0/24"]`. Tradeoff: no network isolation and no port mapping, so the bind address in the config and the host firewall are the only limits on exposure.
+With a published port on the default bridge network, the server sees the bridge gateway or the host instead of the real client (tested with rootless Podman: a request from the host's own shell arrived as the host's LAN address, not `127.0.0.1`; Docker was not available to test). Per-peer logs and per-IP limits therefore do not identify clients. If you want real peer addresses on Linux, use host networking: in `compose.yaml` remove `ports:`, uncomment `network_mode: host` and set `bind = "192.168.1.20:7878"` (your LAN address; `allow_public_bind` is then not needed). Tradeoff: no network isolation and no port mapping, so the bind address in the config and the host firewall are the only limits on exposure.
 
 ### Agents
 
@@ -75,6 +75,32 @@ docker buildx build --platform linux/arm64 -t racking-server:local --load .
 ```
 
 Cross-building needs QEMU emulation on the PC and is slow; `--push` to a registry and pull on the Pi works too. Keep backups off the SD card.
+
+### Behind Traefik (TLS)
+
+For Internet exposure, the only supported route is [Traefik](https://doc.traefik.io/traefik/) v3 (pinned to `v3.6.25` in `compose.yaml`) terminating TLS with Let's Encrypt. It is off by default (`profiles: ["traefik"]`).
+
+1. DNS: an A/AAAA record for the domain pointing at the host, and the host's port 443 reachable from the Internet (the TLS-ALPN challenge needs only 443, not 80).
+2. Set the variables (shell or `.env`): `RACKING_DOMAIN=racking.example.org` and `ACME_EMAIL=you@example.org` (Let's Encrypt expiry notices).
+3. Start with the override file, which removes the host port of `racking`, so only Traefik is reachable and Racking is on the compose network alone:
+
+```sh
+docker compose -f compose.yaml -f compose.traefik.yaml --profile traefik up -d
+docker compose logs -f traefik
+```
+
+What the configuration sets, from the Traefik docs ([entrypoints](https://doc.traefik.io/traefik/v3.6/reference/install-configuration/entrypoints/), [ACME](https://doc.traefik.io/traefik/v3.6/reference/install-configuration/tls/certificate-resolvers/acme/), [RateLimit](https://doc.traefik.io/traefik/v3.6/reference/routing-configuration/http/middlewares/ratelimit/), [Buffering](https://doc.traefik.io/traefik/v3.6/reference/routing-configuration/http/middlewares/buffering/)):
+
+- Entrypoint `websecure` on 443 with read 60 s, write 90 s and idle 120 s timeouts against slow connections. The write timeout stays above the 55 s maximum of `GET /inbox/wait`.
+- A rate limit of 50 requests/s (burst 100) per source address and a request body limit of 64 MiB (`maxRequestBodyBytes`, the server's largest attachment) through the Buffering middleware.
+- The certificate is stored in the `traefik-acme` volume as `acme.json`; Traefik creates it with mode 600.
+- The router matches ``Host(`$RACKING_DOMAIN`)`` only; other hosts get 404.
+
+Known limitations:
+
+- The server sees Traefik's address as the peer, and `X-Forwarded-For` is ignored. Per-IP limits (for example on `/join`) count the proxy as one client. Trusting `X-Forwarded-For` from a known proxy is a later server change.
+- Traefik reads container labels through the Docker socket, which is root-equivalent on the host even when mounted read-only. Accept that, or run Traefik with a static file configuration instead.
+- ACME issuance could not be tested here (no public domain). Traefik starting, parsing these options and routing `Host` to Racking over its self-signed default certificate was tested with Podman.
 
 ## Without Docker: systemd user service
 

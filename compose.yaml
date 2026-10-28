@@ -1,4 +1,9 @@
 # docker compose up -d   (see docs/deploy.md)
+#
+# Default: Racking only, published on RACKING_BIND_IP (default 127.0.0.1).
+# Behind Traefik with TLS (off by default; set RACKING_DOMAIN and ACME_EMAIL):
+#   docker compose -f compose.yaml -f compose.traefik.yaml --profile traefik up -d
+# The second file removes the host port of `racking`, so only Traefik is exposed.
 services:
   racking:
     build: .
@@ -14,14 +19,65 @@ services:
     volumes:
       - racking-data:/data
       - ./config/server.toml:/config/server.toml:ro
-    # Published on one host address only. Default: this machine. For the LAN,
-    # set RACKING_BIND_IP=192.168.1.20 (in the shell or in a .env file).
+    # The only thing that decides who can reach the server over the network is
+    # the address Docker publishes this port on (the server inside the
+    # container accepts any peer, see config/server.example.toml). Default:
+    # this machine. For the LAN set RACKING_BIND_IP=192.168.1.20 (shell or
+    # .env file). Never 0.0.0.0 or a public address.
     ports:
       - "${RACKING_BIND_IP:-127.0.0.1}:7878:7878"
-    # LAN alternative on Linux, which keeps the real client addresses (see
-    # docs/deploy.md): remove `ports:` above, set `bind` in server.toml to the
-    # LAN address with port 7878, and uncomment:
+    # Alternative on Linux, only for real peer addresses in the server log:
+    # remove `ports:`, set `bind` in server.toml to the LAN address, and
+    # uncomment:
     # network_mode: host
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    # Read by Traefik only when the traefik profile runs; inert otherwise.
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.racking.rule: "Host(`${RACKING_DOMAIN:-racking.invalid}`)"
+      traefik.http.routers.racking.entrypoints: websecure
+      traefik.http.routers.racking.tls.certresolver: le
+      traefik.http.routers.racking.middlewares: racking-ratelimit,racking-bodylimit
+      traefik.http.services.racking.loadbalancer.server.port: "7878"
+      # Rate limit per source address (the client address behind Traefik).
+      traefik.http.middlewares.racking-ratelimit.ratelimit.average: "50"
+      traefik.http.middlewares.racking-ratelimit.ratelimit.period: 1s
+      traefik.http.middlewares.racking-ratelimit.ratelimit.burst: "100"
+      # Largest upload the server accepts is a 64 MiB attachment.
+      traefik.http.middlewares.racking-bodylimit.buffering.maxRequestBodyBytes: "67108864"
+
+  traefik:
+    profiles: ["traefik"]
+    image: traefik:v3.6.25
+    restart: unless-stopped
+    depends_on: [racking]
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedByDefault=false
+      - --entryPoints.websecure.address=:443
+      # Against slow connections. writeTimeout must stay above the 55 s
+      # maximum of GET /inbox/wait, or long polls are cut.
+      - --entryPoints.websecure.transport.respondingTimeouts.readTimeout=60s
+      - --entryPoints.websecure.transport.respondingTimeouts.writeTimeout=90s
+      - --entryPoints.websecure.transport.respondingTimeouts.idleTimeout=120s
+      # TLS-ALPN challenge: needs port 443 only, no port 80.
+      - --certificatesResolvers.le.acme.tlsChallenge=true
+      - --certificatesResolvers.le.acme.email=${ACME_EMAIL:-webmaster@${RACKING_DOMAIN:-racking.invalid}}
+      - --certificatesResolvers.le.acme.storage=/acme/acme.json
+      - --log.level=INFO
+    ports:
+      - "443:443"
+    volumes:
+      # Read-only, but the Docker socket is still root-equivalent on the host;
+      # see docs/deploy.md.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik-acme:/acme
+    security_opt:
+      - no-new-privileges:true
     logging:
       driver: json-file
       options:
@@ -30,3 +86,4 @@ services:
 
 volumes:
   racking-data:
+  traefik-acme:

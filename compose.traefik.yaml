@@ -1,0 +1,6 @@
+# Override for the Traefik route: Racking is reached only through Traefik on
+# the compose network and is not published on the host at all.
+#   docker compose -f compose.yaml -f compose.traefik.yaml --profile traefik up -d
+services:
+  racking:
+    ports: !reset []

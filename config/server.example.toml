@@ -2,19 +2,17 @@
 # Copy to config/server.toml (never commit it), replace every CHANGE-ME with
 # the output of `openssl rand -hex 32`, then chmod 600.
 
-# Inside the container the server must listen on all interfaces, or the
-# published port cannot reach it. The host side is limited by compose.yaml
-# to ONE address (RACKING_BIND_IP, default 127.0.0.1), and allow_from below
-# still decides which peers are answered. That is the only reason
-# allow_public_bind = true is acceptable here; do not use it outside a container.
+# Inside the container the server listens on every interface, or the published
+# port cannot reach it, and it accepts any peer: Docker NATs published ports,
+# so the server sees the bridge address, not the client, and allow_from cannot
+# tell clients apart. Exposure is decided ONLY by where compose.yaml publishes
+# the port (RACKING_BIND_IP, default 127.0.0.1: never 0.0.0.0 or a public
+# address) and, for the Internet, by Traefik with TLS. Real access control is
+# the tokens, roles and limits below. Do not copy these three lines to a
+# server that runs outside a container.
 bind = "0.0.0.0:7878"
 allow_public_bind = true
-
-# With the default bridge network, a published port reaches the server from the
-# bridge gateway (172.x) or, with some runtimes, from the real client address
-# (see docs/deploy.md). Keep the private ranges; narrow them to your LAN once
-# you know what the server sees. Public addresses stay refused.
-allow_from = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+allow_from = ["0.0.0.0/0", "::/0"]
 
 # The volume mounted by compose.yaml.
 data_dir = "/data"
