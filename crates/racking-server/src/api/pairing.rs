@@ -266,12 +266,7 @@ struct JoinBody {
 
 /// The single validation point of a join: the body's fields, then the code.
 pub(super) fn join(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
-    // `check_peer` refused a request without a peer address before routing.
-    let peer = call
-        .request
-        .remote_addr()
-        .map(|a| a.ip().to_canonical())
-        .ok_or_else(|| ApiError::new(Code::PeerNotAllowed, "no peer address", "Connect over TCP."))?;
+    let peer = call.client.addr;
     if let Some(wait) = app.join_failures.blocked(&peer) {
         return Err(ApiError::new(
             Code::RateLimited,

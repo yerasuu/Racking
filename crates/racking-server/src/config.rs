@@ -22,6 +22,8 @@ struct RawConfig {
     allow_public_bind: bool,
     #[serde(default)]
     allow_from: Option<Vec<String>>,
+    #[serde(default)]
+    trusted_proxies: Vec<String>,
     data_dir: PathBuf,
     agents: BTreeMap<String, RawAgent>,
     #[serde(default)]
@@ -59,6 +61,9 @@ pub struct Config {
     pub public_bind: bool,
     /// Peers that may connect at all; any other gets 403 before authentication.
     pub allow_from: Vec<Cidr>,
+    /// Reverse proxies whose `X-Forwarded-For` names the client; empty trusts no
+    /// forwarded header, which is right whenever clients reach the port directly.
+    pub trusted_proxies: Vec<Cidr>,
     pub data_dir: PathBuf,
     pub agents: Vec<Agent>,
     pub send_rules: SendRules,
@@ -118,6 +123,20 @@ impl Config {
             None => net::DEFAULT_ALLOW_FROM.iter().copied().map(str::parse).collect(),
         }
         .map_err(|e: String| format!("allow_from: {e}"))?;
+        let trusted_proxies = raw
+            .trusted_proxies
+            .iter()
+            .map(|text| {
+                let block: Cidr = text.parse()?;
+                if block.is_everything() {
+                    return Err(format!(
+                        "`{block}` would trust every peer to name its own address; list the proxy's address"
+                    ));
+                }
+                Ok(block)
+            })
+            .collect::<Result<Vec<Cidr>, String>>()
+            .map_err(|e| format!("trusted_proxies: {e}"))?;
         if raw.agents.len() < 2 {
             return Err("at least two agents are needed under [agents.NAME]".to_owned());
         }
@@ -170,6 +189,7 @@ impl Config {
             bind,
             public_bind,
             allow_from,
+            trusted_proxies,
             data_dir: raw.data_dir,
             agents,
             send_rules: SendRules::new(any_role || raw.permissions.is_some(), explicit),
@@ -248,6 +268,19 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn trusted_proxies_default_to_none() {
+        let agents = format!("[agents.a]\ntoken = \"{T1}\"\n[agents.b]\ntoken = \"{T2}\"\n");
+        assert!(cfg(&agents).expect("config").trusted_proxies.is_empty());
+        let with = |list: &str| Config::parse(&format!("trusted_proxies = {list}\ndata_dir = \"/tmp/x\"\n{agents}"));
+        let c = with("[\"172.18.0.0/16\", \"fd00::1\"]").expect("config");
+        assert_eq!(c.trusted_proxies.len(), 2);
+        assert!(with("[\"172.18.0.0/40\"]").is_err());
+        let err = with("[\"0.0.0.0/0\"]").err().unwrap_or_default();
+        assert!(err.contains("trusted_proxies"), "{err}");
+        assert!(with("[\"::/0\"]").is_err());
     }
 
     #[test]

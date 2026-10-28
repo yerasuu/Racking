@@ -21,7 +21,7 @@ use crate::config::Config;
 use crate::dist::{self, Dist, Slot};
 use crate::error::{ApiError, ApiResult, Code};
 use crate::invite::{FAILURE_WINDOW_SECS, MAX_FAILURES};
-use crate::net::Cidr;
+use crate::net::{Cidr, Client};
 use crate::policy::{Links, Role, SendRules};
 use crate::presence::{self, Flush, InfoUpdate, Presence, Software};
 use crate::rate::{PerMinute, PerWindow};
@@ -738,6 +738,8 @@ pub struct App {
     clock: Clock,
     /// `allow_from`: checked on every request before routing and authentication.
     allow_from: Vec<Cidr>,
+    /// `trusted_proxies`: peers whose `X-Forwarded-For` names the client.
+    trusted_proxies: Vec<Cidr>,
     /// The emergency brake, mirrored from the store so a request reads it without a query.
     paused: AtomicBool,
     in_flight: AtomicUsize,
@@ -777,6 +779,7 @@ impl App {
             join_failures,
             clock,
             allow_from: config.allow_from.clone(),
+            trusted_proxies: config.trusted_proxies.clone(),
             paused: AtomicBool::new(paused),
             in_flight: AtomicUsize::new(0),
         })
@@ -827,6 +830,7 @@ impl App {
 /// One request as a handler sees it.
 struct Call<'r> {
     caller: Option<Caller>,
+    client: Client,
     params: Vec<&'r str>,
     query: Vec<(&'r str, &'r str)>,
     json: Vec<u8>,
@@ -886,9 +890,38 @@ pub fn handle(app: &App, mut request: Request) {
     let in_flight = app.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
     let method = request.method().to_string();
     let url = request.url().to_owned();
-    let (status, agent, response) = if let Err(err) = check_peer(app, &request) {
-        (err.code.status(), None, error_response(&err).boxed())
-    } else if in_flight > MAX_IN_FLIGHT {
+    // The one place the forwarded header is read, so nothing further in can trust it by mistake.
+    let client = request.remote_addr().map(|a| {
+        let forwarded = request
+            .headers()
+            .iter()
+            .filter(|h| h.field.as_str().as_str().eq_ignore_ascii_case("X-Forwarded-For"))
+            .map(|h| h.value.as_str());
+        Client::resolve(a.ip(), forwarded, &app.trusted_proxies)
+    });
+    let (status, agent, response) = match check_peer(app, client) {
+        Err(err) => (err.code.status(), None, error_response(&err).boxed()),
+        Ok(client) => answer(app, &mut request, client, in_flight),
+    };
+    if let Err(e) = request.respond(response) {
+        tracing::debug!(target: "racking::http", error = %e, "client went away before the answer");
+    }
+    app.in_flight.fetch_sub(1, Ordering::AcqRel);
+    tracing::info!(
+        target: "racking::http",
+        agent = agent.as_ref().map_or("-", AgentName::as_str),
+        peer = %client.map_or_else(|| "unknown".to_owned(), |c| c.peer.to_string()),
+        client = %client.map_or_else(|| "unknown".to_owned(), |c| c.addr.to_string()),
+        method,
+        url = truncate(&url, 200),
+        status,
+        ms = started.elapsed().as_millis() as u64,
+    );
+}
+
+/// The answer to a request from an allowed client.
+fn answer(app: &App, request: &mut Request, client: Client, in_flight: usize) -> (u16, Option<AgentName>, ResponseBox) {
+    if in_flight > MAX_IN_FLIGHT {
         let err = ApiError::new(Code::RateLimited, "too many requests in flight", "Retry-After: 1");
         (
             err.code.status(),
@@ -898,7 +931,7 @@ pub fn handle(app: &App, mut request: Request) {
     } else {
         app.store.purge_if_due();
         let mut agent = None;
-        let (status, response) = match serve(app, &mut request, &mut agent) {
+        let (status, response) = match serve(app, request, client, &mut agent) {
             Ok(reply) => into_response(reply),
             Err(err) => {
                 let response = error_response(&err);
@@ -916,33 +949,24 @@ pub fn handle(app: &App, mut request: Request) {
             response
         };
         (status, agent, response)
-    };
-    if let Err(e) = request.respond(response) {
-        tracing::debug!(target: "racking::http", error = %e, "client went away before the answer");
     }
-    app.in_flight.fetch_sub(1, Ordering::AcqRel);
-    tracing::info!(
-        target: "racking::http",
-        agent = agent.as_ref().map_or("-", AgentName::as_str),
-        method,
-        url = truncate(&url, 200),
-        status,
-        ms = started.elapsed().as_millis() as u64,
-    );
 }
 
 /// The LAN-only guard, before routing and authentication: a peer outside
-/// `allow_from` learns nothing but the refusal. The peer is the TCP address;
-/// `X-Forwarded-For` is ignored, since any client can write it.
-fn check_peer(app: &App, request: &Request) -> ApiResult<()> {
-    let peer = request.remote_addr().map(|a| a.ip());
-    if peer.is_some_and(|ip| app.allow_from.iter().any(|block| block.contains(ip))) {
-        return Ok(());
+/// `allow_from` learns nothing but the refusal. The client is the TCP peer,
+/// or the address a trusted proxy forwarded for it; behind a proxy that NATs,
+/// that is the NAT's address, so `allow_from` cannot tell its clients apart.
+fn check_peer(app: &App, client: Option<Client>) -> ApiResult<Client> {
+    if let Some(client) = client
+        && app.allow_from.iter().any(|block| block.contains(client.addr))
+    {
+        return Ok(client);
     }
     tracing::warn!(
         target: "racking::http",
-        peer = %peer.map_or_else(|| "unknown".to_owned(), |ip| ip.to_string()),
-        "refused a peer outside allow_from"
+        peer = %client.map_or_else(|| "unknown".to_owned(), |c| c.peer.to_string()),
+        client = %client.map_or_else(|| "unknown".to_owned(), |c| c.addr.to_string()),
+        "refused a client outside allow_from"
     );
     Err(ApiError::new(
         Code::PeerNotAllowed,
@@ -951,7 +975,7 @@ fn check_peer(app: &App, request: &Request) -> ApiResult<()> {
     ))
 }
 
-fn serve(app: &App, request: &mut Request, agent_out: &mut Option<AgentName>) -> ApiResult<Reply> {
+fn serve(app: &App, request: &mut Request, client: Client, agent_out: &mut Option<AgentName>) -> ApiResult<Reply> {
     let url = request.url().to_owned();
     let (path, query_text) = url.split_once('?').unwrap_or((url.as_str(), ""));
     let Some(method) = Method::from_http(request.method()) else {
@@ -1021,6 +1045,7 @@ fn serve(app: &App, request: &mut Request, agent_out: &mut Option<AgentName>) ->
 
     let mut call = Call {
         caller,
+        client,
         params,
         query,
         json,

@@ -27,6 +27,11 @@ pub struct Cidr {
 }
 
 impl Cidr {
+    /// A `/0` block: every address of its family.
+    pub fn is_everything(&self) -> bool {
+        self.prefix == 0
+    }
+
     pub fn contains(&self, ip: IpAddr) -> bool {
         // A peer on an IPv6 socket may show as `::ffff:a.b.c.d`; it is the IPv4 peer.
         match (self.addr, ip.to_canonical()) {
@@ -72,6 +77,53 @@ impl FromStr for Cidr {
 impl fmt::Display for Cidr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}", self.addr, self.prefix)
+    }
+}
+
+/// Who sent a request, worked out once at the edge: `addr` is what `allow_from`,
+/// the per-address counters and the logs use; `peer` is kept for the logs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Client {
+    /// The TCP peer: a reverse proxy when there is one.
+    pub peer: IpAddr,
+    /// The client the request is for: the peer itself unless the peer is a trusted proxy.
+    pub addr: IpAddr,
+}
+
+impl Client {
+    /// Takes `X-Forwarded-For` into account only when `peer` is in `trusted`,
+    /// since anyone else can write the header. `forwarded_for` holds the values of
+    /// every `X-Forwarded-For` line in order; they form one list.
+    ///
+    /// The list is walked from the right, skipping trusted proxies, and the first
+    /// other entry is the client: that one was written by a proxy we trust, while
+    /// everything left of it is whatever the client chose to send
+    /// ([MDN: X-Forwarded-For](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/X-Forwarded-For),
+    /// "Trusted proxy list"). The peer stands in when the header is missing, when
+    /// the walk stops at something that is not an IP address (never guess past it),
+    /// or when every entry is a trusted proxy, since the leftmost one may be spoofed.
+    pub fn resolve<'h, I>(peer: IpAddr, forwarded_for: I, trusted: &[Cidr]) -> Self
+    where
+        I: IntoIterator<Item = &'h str>,
+        I::IntoIter: DoubleEndedIterator,
+    {
+        let peer = peer.to_canonical();
+        let is_trusted = |ip: IpAddr| trusted.iter().any(|block| block.contains(ip));
+        if !is_trusted(peer) {
+            return Self { peer, addr: peer };
+        }
+        let addr = forwarded_for
+            .into_iter()
+            .flat_map(|value| value.split(','))
+            .rev()
+            .find_map(|entry| match entry.trim().parse::<IpAddr>() {
+                Ok(ip) if is_trusted(ip) => None,
+                Ok(ip) => Some(Some(ip.to_canonical())),
+                Err(_) => Some(None),
+            })
+            .flatten()
+            .unwrap_or(peer);
+        Self { peer, addr }
     }
 }
 
@@ -150,6 +202,90 @@ mod tests {
         for public in ["0.0.0.0", "::", "8.8.8.8", "2001:db8::1", "172.32.0.1"] {
             assert!(!is_local(ip(public)), "{public}");
         }
+    }
+
+    fn client(peer: &str, xff: &[&str], trusted: &[&str]) -> IpAddr {
+        let trusted: Vec<Cidr> = trusted.iter().map(|c| cidr(c)).collect();
+        Client::resolve(ip(peer), xff.iter().copied(), &trusted).addr
+    }
+
+    const PROXY_NET: &[&str] = &["10.0.0.0/8"];
+
+    #[test]
+    fn forwarded_for_from_an_untrusted_peer_is_ignored() {
+        assert_eq!(client("192.168.1.5", &["203.0.113.9"], PROXY_NET), ip("192.168.1.5"));
+        assert_eq!(
+            client("10.0.0.2", &["203.0.113.9"], &[]),
+            ip("10.0.0.2"),
+            "no list trusts nobody"
+        );
+    }
+
+    #[test]
+    fn the_proxy_s_entry_wins_over_a_spoofed_leftmost_one() {
+        assert_eq!(client("10.0.0.2", &["203.0.113.9"], PROXY_NET), ip("203.0.113.9"));
+        assert_eq!(
+            client("10.0.0.2", &["1.2.3.4, 203.0.113.9"], PROXY_NET),
+            ip("203.0.113.9"),
+            "the client wrote 1.2.3.4 itself"
+        );
+    }
+
+    #[test]
+    fn trusted_hops_are_skipped() {
+        assert_eq!(
+            client("10.0.0.3", &["6.6.6.6,198.51.100.7, 10.0.0.1 ,10.0.0.2"], PROXY_NET),
+            ip("198.51.100.7")
+        );
+        assert_eq!(
+            client("10.0.0.3", &["10.9.9.9, 10.0.0.2"], PROXY_NET),
+            ip("10.0.0.3"),
+            "all trusted: the peer, never the leftmost"
+        );
+    }
+
+    #[test]
+    fn several_header_lines_form_one_list() {
+        assert_eq!(
+            client("10.0.0.2", &["6.6.6.6", "198.51.100.7, 10.0.0.1"], PROXY_NET),
+            ip("198.51.100.7")
+        );
+        assert_eq!(
+            client("10.0.0.2", &["198.51.100.7", "garbage"], PROXY_NET),
+            ip("10.0.0.2")
+        );
+    }
+
+    #[test]
+    fn malformed_or_missing_falls_back_to_the_peer() {
+        for xff in [
+            &[][..],
+            &[""],
+            &["unknown"],
+            &["203.0.113.9:4711"],
+            &["203.0.113.9, , 10.0.0.1"],
+        ] {
+            assert_eq!(client("10.0.0.2", xff, PROXY_NET), ip("10.0.0.2"), "{xff:?}");
+        }
+        assert_eq!(
+            client("10.0.0.2", &["bogus, 203.0.113.9"], PROXY_NET),
+            ip("203.0.113.9"),
+            "junk left of the client does not matter"
+        );
+    }
+
+    #[test]
+    fn ipv6_entries_and_peers() {
+        assert_eq!(
+            client("fd00::2", &["2001:db8::7, fd00::1"], &["fd00::/8"]),
+            ip("2001:db8::7")
+        );
+        assert_eq!(
+            client("::ffff:10.0.0.2", &["::ffff:203.0.113.9"], PROXY_NET),
+            ip("203.0.113.9"),
+            "mapped IPv4 on both sides"
+        );
+        assert_eq!(client("10.0.0.2", &["[2001:db8::7]"], PROXY_NET), ip("10.0.0.2"));
     }
 
     #[test]

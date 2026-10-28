@@ -480,6 +480,73 @@ fn allow_from_applies_to_join() {
     assert_eq!((status, code(&err)), (403, "peer_not_allowed"));
 }
 
+/// `POST /join` as if a reverse proxy on loopback forwarded it for `client`.
+fn join_for(s: &Server, client: &str, code: &str) -> (u16, Value) {
+    let mut resp = s
+        .http
+        .post(format!("{}/join", s.base))
+        .header("X-Forwarded-For", client)
+        .send_json(json!({ "code": code }))
+        .expect("http");
+    let status = resp.status().as_u16();
+    let text = resp.body_mut().read_to_string().expect("body");
+    (status, serde_json::from_str(&text).unwrap_or(Value::String(text)))
+}
+
+#[test]
+fn a_trusted_proxy_s_client_is_counted_and_audited_by_its_own_address() {
+    let s = Server::start(&format!(
+        "allow_from = [\"0.0.0.0/0\"]\ntrusted_proxies = [\"127.0.0.0/8\"]\n{ROLES}"
+    ));
+    s.invite(json!({"name": "mac", "role": "worker"}));
+    for _ in 0..5 {
+        let (status, err) = join_for(&s, "1.2.3.4, 203.0.113.9", "2222-2222-2222-2222");
+        assert_eq!((status, code(&err)), (403, "bad_code"));
+    }
+    let (_, good) = s.invite(json!({"name": "pc", "role": "worker"}));
+    let (status, err) = join_for(&s, "203.0.113.9", &good);
+    assert_eq!((status, code(&err)), (429, "rate_limited"), "the guesser is locked out");
+    let (status, err) = join_for(&s, "1.2.3.4, 203.0.113.9", &good);
+    assert_eq!(
+        (status, code(&err)),
+        (429, "rate_limited"),
+        "a spoofed leftmost entry changes nothing"
+    );
+    let (status, joined) = join_for(&s, "203.0.113.10", &good);
+    assert_eq!(status, 201, "another client behind the same proxy is not: {joined}");
+    let (_, audit) = s.call("GET", "/admin/audit?limit=100", BOSS, None);
+    let text = audit.to_string();
+    assert!(text.contains("203.0.113.9") && !text.contains("1.2.3.4"), "{text}");
+
+    let lan_only = Server::start(&format!(
+        "allow_from = [\"127.0.0.0/8\"]\ntrusted_proxies = [\"127.0.0.0/8\"]\n{ROLES}"
+    ));
+    let (status, err) = join_for(&lan_only, "203.0.113.9", "2222-2222-2222-2222");
+    assert_eq!(
+        (status, code(&err)),
+        (403, "peer_not_allowed"),
+        "allow_from sees the client"
+    );
+}
+
+#[test]
+fn forwarded_for_is_ignored_without_trusted_proxies() {
+    let s = Server::start(ROLES);
+    s.invite(json!({"name": "mac", "role": "worker"}));
+    for _ in 0..5 {
+        assert_eq!(join_for(&s, "203.0.113.9", "2222-2222-2222-2222").0, 403);
+    }
+    let (_, good) = s.invite(json!({"name": "pc", "role": "worker"}));
+    let (status, err) = join_for(&s, "203.0.113.10", &good);
+    assert_eq!(
+        (status, code(&err)),
+        (429, "rate_limited"),
+        "the TCP peer is what was counted"
+    );
+    let (_, audit) = s.call("GET", "/admin/audit?limit=100", BOSS, None);
+    assert!(!audit.to_string().contains("203.0.113"), "{audit}");
+}
+
 /// The real server binary, so its log can be searched for secrets.
 struct Process {
     child: Child,

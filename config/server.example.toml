@@ -14,6 +14,13 @@ bind = "0.0.0.0:7878"
 allow_public_bind = true
 allow_from = ["0.0.0.0/0", "::/0"]
 
+# Only with the Traefik route (compose.traefik.yaml), which removes the host
+# port so Traefik is the only peer: trust its X-Forwarded-For, so per-address
+# limits and logs see the real client. Never set it while the port is
+# published (the default compose.yaml), or any client can claim any address.
+# Use the subnet of the compose network (docker network inspect racking_default).
+# trusted_proxies = ["172.18.0.0/16"]
+
 # The volume mounted by compose.yaml.
 data_dir = "/data"
 

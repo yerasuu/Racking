@@ -107,7 +107,7 @@ What the configuration sets, from the Traefik docs ([entrypoints](https://doc.tr
 
 Known limitations:
 
-- The server sees Traefik's address as the peer, and `X-Forwarded-For` is ignored. Per-IP limits (for example on `/join`) count the proxy as one client. Trusting `X-Forwarded-For` from a known proxy is a later server change.
+- Until `trusted_proxies` is set (below), the server sees Traefik's address as the peer and ignores `X-Forwarded-For`, so per-address limits (the `/join` lockout) count every client as one.
 - Traefik's timeouts are the only bound on slow connections: the server has no per-connection read timeout.
 - ACME issuance could not be tested here (no public domain). Traefik starting with these options, routing `Host` to Racking over its self-signed default certificate, `/whoami` answering 401 and another host 404 was tested with Podman, with no socket mounted.
 
@@ -131,6 +131,20 @@ Alternative, label discovery. Traefik's own docs say that [unrestricted access t
 ```
 
 You would then put `traefik.*` labels on the `racking` service instead of using the dynamic file.
+
+#### Real client addresses behind Traefik
+
+Two settings with similar names live on two different sides:
+
+- **Traefik's `forwardedHeaders.trustedIPs`** (on the entrypoint) is about Traefik trusting *its own* upstream: "the IPs or CIDR from where Traefik trusts the forwarded headers information (`X-Forwarded-*`)", default none ([Traefik: entrypoints](https://doc.traefik.io/traefik/reference/install-configuration/entrypoints/)). It matters only when something else (a CDN, another proxy) sits in front of Traefik; leave it unset here. Traefik appends the address of whoever connected to it to `X-Forwarded-For` unless `notAppendXForwardedFor` is set (same page), so the rightmost entry Racking receives is the address Traefik saw.
+- **Racking's `trusted_proxies`** (in `server.toml`) is about Racking trusting Traefik: only then does it read `X-Forwarded-For`, from the right, and take the first entry that is not a trusted proxy as the client. Anything the client wrote into the header itself sits further left and is never used.
+
+To turn it on, with the Traefik route only (`compose.traefik.yaml` removes the host port, so Traefik is the only peer Racking can see):
+
+1. Find the subnet of the compose network: `docker network inspect racking_default --format '{{(index .IPAM.Config 0).Subnet}}'` (the network is `<project>_default`).
+2. Put it in `config/server.toml`: `trusted_proxies = ["172.18.0.0/16"]` (your subnet), and `docker compose restart racking`. The log line of each request then shows `peer=` (Traefik) and `client=` (the real address), and the `/join` lockout counts each client on its own.
+
+Never set `trusted_proxies` while the port is also published on the host (the default `compose.yaml`): Docker NATs those connections, which can then arrive from the network's gateway, inside that subnet, and every LAN client would be trusted to name its own address. The subnet changes if the network is recreated; check it after `docker compose down`. Not tested with Docker here (no Docker on the test machine); the server side is covered by the integration tests on loopback.
 
 ## Linking a new machine
 

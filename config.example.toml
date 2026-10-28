@@ -10,11 +10,19 @@ bind = "127.0.0.1:7878"
 # 0.0.0.0 / ::, which listen everywhere) is refused unless this is true.
 # allow_public_bind = false
 
-# Peer addresses that may connect at all; others get 403 before their token is
-# read. X-Forwarded-For is ignored: behind a proxy, the peer is the proxy.
-# Default: loopback and the private and link-local ranges, as below.
+# Client addresses that may connect at all; others get 403 before their token
+# is read. The client is the TCP peer, unless trusted_proxies below says the
+# peer is a proxy. Default: loopback and the private and link-local ranges.
 # allow_from = ["127.0.0.0/8", "::1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
 #               "169.254.0.0/16", "fc00::/7", "fe80::/10"]
+
+# Reverse proxies whose X-Forwarded-For header names the real client (for
+# allow_from, the /join lockout and the logs). Only set it when a reverse proxy
+# such as Traefik is in front and clients cannot reach this port directly;
+# never for a port clients connect to themselves, or any of them can claim any
+# address. List the proxy's own address, not the clients' network.
+# Default: empty, X-Forwarded-For is ignored.
+# trusted_proxies = ["192.168.1.30"]
 
 # SQLite database and attachment files live here.
 data_dir = "/var/lib/racking"
