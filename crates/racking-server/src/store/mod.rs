@@ -16,6 +16,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+mod admin;
+
+pub use admin::{AuditEntry, Managed};
+
 use crate::clock;
 use crate::config::SenderLimits;
 use crate::error::{ApiError, ApiResult, Code};
@@ -596,6 +600,7 @@ impl Store {
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| e.to_string())?;
         conn.execute_batch(SCHEMA)
+            .and_then(|()| conn.execute_batch(admin::SCHEMA))
             .map_err(|e| format!("cannot set up the schema: {e}"))?;
         add_reply_columns(&conn).map_err(|e| format!("cannot add the priority columns: {e}"))?;
         add_columns(&conn, HINT_COLUMNS).map_err(|e| format!("cannot add the model and capabilities columns: {e}"))?;
@@ -1922,6 +1927,14 @@ mod tests {
             "old jobs have no role"
         );
         assert_eq!(job.to_json(View::Summary)["from_role"], "worker");
+        assert_eq!((old.hops, old.parent), (0, None), "old jobs are roots");
+        assert_eq!(s.paused(), Ok(false), "the settings table is new and empty");
+        assert_eq!(s.managed_agents().map(|m| m.len()), Ok(0));
+        let reply = NewJob {
+            reply_to: Some(old.id),
+            ..task("linux")
+        };
+        assert_eq!(s.create_job(&windows, reply).map(|j| j.hops).ok(), Some(1));
 
         let inbox = s.inbox(&windows, Seq::new(0), None, 10).expect("inbox").to_json();
         assert_eq!(inbox["jobs"][1]["model"], "opus", "summaries carry it too");

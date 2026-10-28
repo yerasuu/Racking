@@ -18,13 +18,15 @@ pub enum Code {
     TooLarge,
     ChecksumMismatch,
     IdempotencyConflict,
+    Conflict,
     RateLimited,
     Internal,
+    Paused,
 }
 
 impl Code {
     /// Every code with its status and meaning, in the order `/help` lists them.
-    pub const ALL: [(Code, &'static str); 15] = [
+    pub const ALL: [(Code, &'static str); 17] = [
         (
             Code::BadRequest,
             "Malformed JSON or field out of range. `message` names the field.",
@@ -68,11 +70,20 @@ impl Code {
             "Same `Idempotency-Key` used for a different request.",
         ),
         (
+            Code::Conflict,
+            "Admin API: the agent name is taken, or a second main agent was asked for.",
+        ),
+        (
             Code::RateLimited,
             "Too many requests in flight, too many jobs this minute, or too many open tasks to one agent. Wait \
              `Retry-After` seconds.",
         ),
         (Code::Internal, "Storage or disk failure on the server."),
+        (
+            Code::Paused,
+            "The owner pulled the emergency brake (`POST /admin/pause`): workers cannot send until it is \
+             resumed. Stop acting on jobs.",
+        ),
     ];
 
     pub fn status(self) -> u16 {
@@ -81,11 +92,12 @@ impl Code {
             Code::NoToken | Code::BadToken => 401,
             Code::NotYours | Code::NotAdmin | Code::NotAllowed => 403,
             Code::NotFound => 404,
-            Code::BadTransition | Code::TooDeep | Code::AttachmentsLocked => 409,
+            Code::BadTransition | Code::TooDeep | Code::AttachmentsLocked | Code::Conflict => 409,
             Code::TooLarge => 413,
             Code::ChecksumMismatch | Code::IdempotencyConflict => 422,
             Code::RateLimited => 429,
             Code::Internal => 500,
+            Code::Paused => 503,
         }
     }
 
@@ -106,6 +118,8 @@ impl Code {
             Code::IdempotencyConflict => "idempotency_conflict",
             Code::RateLimited => "rate_limited",
             Code::Internal => "internal",
+            Code::Paused => "paused",
+            Code::Conflict => "conflict",
         }
     }
 }

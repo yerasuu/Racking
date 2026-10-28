@@ -2,6 +2,7 @@
 //! served as HTTP/JSON. Blocking I/O with a thread per request, which is enough
 //! for a handful of agents and keeps the binary free of an async runtime.
 
+mod accounts;
 mod api;
 mod clock;
 pub mod config;

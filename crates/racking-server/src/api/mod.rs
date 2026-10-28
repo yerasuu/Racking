@@ -1,9 +1,11 @@
 //! HTTP edge: the route table, request parsing and validation, auth,
 //! idempotency, and the Markdown guide generated from the same table.
 
+mod admin;
+
 use std::fmt::Write as _;
 use std::io::Read;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -11,6 +13,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tiny_http::{Header, Request, Response, ResponseBox};
 
+use crate::accounts::Accounts;
 use crate::clock::Clock;
 use crate::config::Config;
 use crate::dist::{self, Dist, Slot};
@@ -36,6 +39,7 @@ enum Method {
     Get,
     Post,
     Put,
+    Delete,
 }
 
 impl Method {
@@ -44,6 +48,7 @@ impl Method {
             Method::Get => "GET",
             Method::Post => "POST",
             Method::Put => "PUT",
+            Method::Delete => "DELETE",
         }
     }
 
@@ -52,6 +57,7 @@ impl Method {
             tiny_http::Method::Get => Some(Method::Get),
             tiny_http::Method::Post => Some(Method::Post),
             tiny_http::Method::Put => Some(Method::Put),
+            tiny_http::Method::Delete => Some(Method::Delete),
             _ => None,
         }
     }
@@ -80,6 +86,9 @@ struct Route {
     input: &'static str,
     example: &'static str,
     handler: Handler,
+    /// The answer carries a token, so it is never stored for an `Idempotency-Key`
+    /// replay: the database must hold no token in clear.
+    secret: bool,
 }
 
 const LIST_QUERY: &[(&str, &str)] = &[
@@ -117,6 +126,7 @@ static ROUTES: &[Route] = &[
         input: "",
         example: "curl -s $RACK_URL/",
         handler: help,
+        secret: false,
     },
     Route {
         method: Method::Get,
@@ -128,6 +138,7 @@ static ROUTES: &[Route] = &[
         input: "",
         example: "curl -s $RACK_URL/help",
         handler: help,
+        secret: false,
     },
     Route {
         method: Method::Get,
@@ -140,6 +151,7 @@ static ROUTES: &[Route] = &[
         input: "",
         example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" $RACK_URL/whoami",
         handler: whoami,
+        secret: false,
     },
     Route {
         method: Method::Get,
@@ -158,6 +170,7 @@ static ROUTES: &[Route] = &[
         input: "",
         example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" $RACK_URL/agents",
         handler: agents,
+        secret: false,
     },
     Route {
         method: Method::Put,
@@ -174,6 +187,7 @@ static ROUTES: &[Route] = &[
         example: "curl -s -X PUT -H \"Authorization: Bearer $RACK_TOKEN\" -d '{\"about\":\"Windows PC, GPU tests\"}' \
                   $RACK_URL/agents/me",
         handler: put_agent_info,
+        secret: false,
     },
     Route {
         method: Method::Post,
@@ -201,6 +215,7 @@ static ROUTES: &[Route] = &[
         example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" -H 'Idempotency-Key: 7f3c' \
                   -d '{\"to\":\"windows\",\"title\":\"Run the probe\",\"body\":\"...\"}' $RACK_URL/jobs",
         handler: create_job,
+        secret: false,
     },
     Route {
         method: Method::Get,
@@ -213,6 +228,7 @@ static ROUTES: &[Route] = &[
         input: "",
         example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" $RACK_URL/jobs/j1",
         handler: get_job,
+        secret: false,
     },
     Route {
         method: Method::Post,
@@ -224,6 +240,7 @@ static ROUTES: &[Route] = &[
         input: "",
         example: "curl -s -X POST -H \"Authorization: Bearer $RACK_TOKEN\" $RACK_URL/jobs/j1/receive",
         handler: receive_job,
+        secret: false,
     },
     Route {
         method: Method::Post,
@@ -235,6 +252,7 @@ static ROUTES: &[Route] = &[
         input: "",
         example: "curl -s -X POST -H \"Authorization: Bearer $RACK_TOKEN\" $RACK_URL/jobs/j1/accept",
         handler: accept_job,
+        secret: false,
     },
     Route {
         method: Method::Post,
@@ -247,6 +265,7 @@ static ROUTES: &[Route] = &[
         example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" -d '{\"reason\":\"no Windows box today\"}' \
                   $RACK_URL/jobs/j1/reject",
         handler: reject_job,
+        secret: false,
     },
     Route {
         method: Method::Post,
@@ -258,6 +277,7 @@ static ROUTES: &[Route] = &[
         input: "",
         example: "curl -s -X POST -H \"Authorization: Bearer $RACK_TOKEN\" $RACK_URL/jobs/j1/cancel",
         handler: cancel_job,
+        secret: false,
     },
     Route {
         method: Method::Put,
@@ -271,6 +291,7 @@ static ROUTES: &[Route] = &[
         example: "curl -s -T probe.bat -H \"Authorization: Bearer $RACK_TOKEN\" \
                   -H \"X-Sha256: $(sha256sum probe.bat | cut -d' ' -f1)\" $RACK_URL/jobs/j1/attachments/probe.bat",
         handler: put_attachment,
+        secret: false,
     },
     Route {
         method: Method::Get,
@@ -283,6 +304,7 @@ static ROUTES: &[Route] = &[
         example: "curl -s -D - -o probe.bat -H \"Authorization: Bearer $RACK_TOKEN\" \
                   $RACK_URL/jobs/j1/attachments/probe.bat",
         handler: get_attachment,
+        secret: false,
     },
     Route {
         method: Method::Get,
@@ -297,6 +319,7 @@ static ROUTES: &[Route] = &[
         input: "",
         example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" \"$RACK_URL/inbox?since=0\"",
         handler: inbox,
+        secret: false,
     },
     Route {
         method: Method::Get,
@@ -309,6 +332,7 @@ static ROUTES: &[Route] = &[
         input: "",
         example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" \"$RACK_URL/inbox/wait?since=0&timeout=25\"",
         handler: inbox_wait,
+        secret: false,
     },
     Route {
         method: Method::Get,
@@ -321,6 +345,7 @@ static ROUTES: &[Route] = &[
         input: "",
         example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" \"$RACK_URL/outbox?since=0\"",
         handler: outbox,
+        secret: false,
     },
     Route {
         method: Method::Get,
@@ -332,6 +357,7 @@ static ROUTES: &[Route] = &[
         input: "",
         example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" \"$RACK_URL/outbox/wait?since=0\"",
         handler: outbox_wait,
+        secret: false,
     },
     Route {
         method: Method::Get,
@@ -343,6 +369,7 @@ static ROUTES: &[Route] = &[
         input: "",
         example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" \"$RACK_URL/links?job=j1\"",
         handler: links,
+        secret: false,
     },
     Route {
         method: Method::Put,
@@ -355,6 +382,7 @@ static ROUTES: &[Route] = &[
         example: "curl -s -X PUT -H \"Authorization: Bearer $RACK_TOKEN\" -d '{\"repo\":\"decanter\",\"id\":\"31\"}' \
                   $RACK_URL/links/j1",
         handler: put_link,
+        secret: false,
     },
     Route {
         method: Method::Get,
@@ -370,6 +398,7 @@ static ROUTES: &[Route] = &[
         input: "",
         example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" $RACK_URL/dist/manifest",
         handler: dist_manifest,
+        secret: false,
     },
     Route {
         method: Method::Get,
@@ -383,6 +412,7 @@ static ROUTES: &[Route] = &[
         example: "curl -s -o rack -H \"Authorization: Bearer $RACK_TOKEN\" \
                   $RACK_URL/dist/x86_64-unknown-linux-gnu/rack",
         handler: get_dist_file,
+        secret: false,
     },
     Route {
         method: Method::Get,
@@ -395,6 +425,7 @@ static ROUTES: &[Route] = &[
         example: "curl -s -o rack -H \"Authorization: Bearer $RACK_TOKEN\" \
                   $RACK_URL/dist/pre/x86_64-unknown-linux-gnu/rack",
         handler: get_dist_pre_file,
+        secret: false,
     },
     Route {
         method: Method::Put,
@@ -412,6 +443,110 @@ static ROUTES: &[Route] = &[
         example: "curl -s -T rack -H \"Authorization: Bearer $RACK_TOKEN\" -H 'X-Version: 0.2.0' \
                   -H \"X-Sha256: $(sha256sum rack | cut -d' ' -f1)\" $RACK_URL/dist/x86_64-unknown-linux-gnu/rack",
         handler: put_dist_file,
+        secret: false,
+    },
+    Route {
+        method: Method::Get,
+        path: "/admin/agents",
+        auth: true,
+        body: BodyKind::None,
+        summary: "Admin agents only: every agent with `name`, `role`, `admin`, `source` (`file` for the config \
+                  file, `api` for one made here), `token_created_at` (API agents) and `last_used` (its last \
+                  request, RFC 3339, or null). Never a token.",
+        query: &[],
+        input: "",
+        example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" $RACK_URL/admin/agents",
+        handler: admin::list_agents,
+        secret: false,
+    },
+    Route {
+        method: Method::Post,
+        path: "/admin/agents",
+        auth: true,
+        body: BodyKind::Json,
+        summary: "Admin agents only: create an agent, usable at once without a restart. Answers 201 with its \
+                  `token`, shown this once: only its SHA-256 is stored. Never replayed for an `Idempotency-Key`.",
+        query: &[],
+        input: "`name` (`[a-z0-9][a-z0-9-]{0,31}`, not taken), `role` (`worker`, or `main` when no agent is main \
+                and the config sets roles).",
+        example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" -d '{\"name\":\"mac\",\"role\":\"worker\"}' \
+                  $RACK_URL/admin/agents",
+        handler: admin::create_agent,
+        secret: true,
+    },
+    Route {
+        method: Method::Post,
+        path: "/admin/agents/{name}/rotate",
+        auth: true,
+        body: BodyKind::None,
+        summary: "Admin agents only: give an agent made through this API a new token, shown once; the old one \
+                  stops working at once. Agents of the config file are changed in the file.",
+        query: &[],
+        input: "",
+        example: "curl -s -X POST -H \"Authorization: Bearer $RACK_TOKEN\" $RACK_URL/admin/agents/mac/rotate",
+        handler: admin::rotate_agent,
+        secret: true,
+    },
+    Route {
+        method: Method::Delete,
+        path: "/admin/agents/{name}",
+        auth: true,
+        body: BodyKind::None,
+        summary: "Admin agents only: remove an agent made through this API. Its token stops working at once; its \
+                  jobs are kept. Agents of the config file cannot be removed here.",
+        query: &[],
+        input: "",
+        example: "curl -s -X DELETE -H \"Authorization: Bearer $RACK_TOKEN\" $RACK_URL/admin/agents/mac",
+        handler: admin::remove_agent,
+        secret: false,
+    },
+    Route {
+        method: Method::Get,
+        path: "/admin/audit",
+        auth: true,
+        body: BodyKind::None,
+        summary: "Admin agents only: the audit log, newest first: `{\"entries\": [{\"id\", \"at\", \"actor\", \
+                  \"action\", \"target\", \"result\"}], \"next\"}`. Pass `next` as `before` for the next page \
+                  (null on the last). It records agent changes, pause and resume, and refused admin calls; never \
+                  a body or a token.",
+        query: &[
+            ("limit", "page size, 1 to 200 (default 50)"),
+            (
+                "before",
+                "only entries with a smaller `id`: the `next` of the previous page",
+            ),
+        ],
+        input: "",
+        example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" \"$RACK_URL/admin/audit?limit=20\"",
+        handler: admin::audit,
+        secret: false,
+    },
+    Route {
+        method: Method::Post,
+        path: "/admin/pause",
+        auth: true,
+        body: BodyKind::None,
+        summary: "Admin agents only: the emergency brake. While paused, inbox and outbox answers carry \
+                  `\"paused\": true` and every answer to an agent the header `X-Racking-Paused: 1`, so clients stop \
+                  acting; jobs are still delivered. Workers' sends answer 503 `paused`; the main and admin agents \
+                  can still send. Kept across restarts.",
+        query: &[],
+        input: "",
+        example: "curl -s -X POST -H \"Authorization: Bearer $RACK_TOKEN\" $RACK_URL/admin/pause",
+        handler: admin::pause,
+        secret: false,
+    },
+    Route {
+        method: Method::Post,
+        path: "/admin/resume",
+        auth: true,
+        body: BodyKind::None,
+        summary: "Admin agents only: release the emergency brake.",
+        query: &[],
+        input: "",
+        example: "curl -s -X POST -H \"Authorization: Bearer $RACK_TOKEN\" $RACK_URL/admin/resume",
+        handler: admin::resume,
+        secret: false,
     },
 ];
 
@@ -423,12 +558,14 @@ pub struct App {
     send_rules: SendRules,
     presence: Presence,
     per_minute: PerMinute,
+    /// The emergency brake, mirrored from the store so a request reads it without a query.
+    paused: AtomicBool,
     in_flight: AtomicUsize,
 }
 
 impl App {
     pub fn new(config: &Config, store: Store, dist: Dist, clock: Clock) -> Result<Self, String> {
-        let registry = Registry::from_config(config);
+        let registry = Registry::new(config, store.managed_agents()?)?;
         let send_rules = SendRules::new(config.send_rules.enforced(), config.send_rules.explicit().clone());
         let names = registry.names();
         if !send_rules.enforced() {
@@ -442,6 +579,10 @@ impl App {
             tracing::warn!(target: "racking::policy", agent = %unknown, "[permissions] names an agent the server does not have");
         }
         let per_minute = PerMinute::new(config.limits.jobs_per_minute, clock.clone());
+        let paused = store.paused()?;
+        if paused {
+            tracing::warn!(target: "racking::admin", "the emergency brake is on: workers cannot send until POST /admin/resume");
+        }
         let presence = Presence::new(names.iter(), store.load_agents()?, clock);
         Ok(Self {
             store,
@@ -450,8 +591,30 @@ impl App {
             send_rules,
             presence,
             per_minute,
+            paused: AtomicBool::new(paused),
             in_flight: AtomicUsize::new(0),
         })
+    }
+
+    fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+
+    /// A list answer with the brake's state at the top, so a client sees it on every read.
+    fn listing_json(&self, listing: &store::Listing) -> Value {
+        let mut body = listing.to_json();
+        body["paused"] = Value::from(self.is_paused());
+        body
+    }
+
+    /// The account operations, for the admin routes and any later one that issues tokens.
+    fn accounts(&self) -> Accounts<'_> {
+        Accounts {
+            registry: &self.registry,
+            store: &self.store,
+            presence: &self.presence,
+            roles_enforced: self.send_rules.enforced(),
+        }
     }
 
     /// Writes what `Presence` found due to the store, if anything.
@@ -557,6 +720,12 @@ pub fn handle(app: &App, mut request: Request) {
                 (err.code.status(), response.boxed())
             }
         };
+        // Only authenticated answers carry it, so the brake's state is not shown to anyone without a token.
+        let response = if agent.is_some() && app.is_paused() {
+            with_header(response, "X-Racking-Paused", "1")
+        } else {
+            response
+        };
         (status, agent, response)
     };
     if let Err(e) = request.respond(response) {
@@ -603,7 +772,7 @@ fn serve(app: &App, request: &mut Request, agent_out: &mut Option<AgentName>) ->
     };
     let key = idempotency_key(request)?;
     let claimed = match (&key, agent) {
-        (Some(key), Some(me)) if method != Method::Get => {
+        (Some(key), Some(me)) if method != Method::Get && !route.secret => {
             let hash = match route.body {
                 BodyKind::Raw => header_value(request, "X-Sha256")
                     .unwrap_or_default()
@@ -957,6 +1126,8 @@ fn whoami(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
         "agent": me.name.as_str(),
         "role": me.role.as_str(),
         "roles_enforced": app.send_rules.enforced(),
+        "admin": me.admin,
+        "paused": app.is_paused(),
         "peers": app.peers_of(me),
         "limits": {
             "title_chars": limits::TITLE_CHARS,
@@ -1023,6 +1194,14 @@ fn create_job(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
         )
         .with_retry_after(wait)
     })?;
+    if app.is_paused() && me.role == Role::Worker && !me.admin {
+        return Err(ApiError::new(
+            Code::Paused,
+            "the server is paused: workers cannot send",
+            "The owner pulled the emergency brake. Stop acting on jobs and wait for the owner; nothing you send \
+             goes out until POST /admin/resume.",
+        ));
+    }
     let job = app.store.create_job(&me.name, new)?;
     Ok(Reply::Json {
         status: 201,
@@ -1402,35 +1581,35 @@ fn inbox(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
         Some("1") => store::Delivery::Peek,
         Some(_) => return Err(ApiError::bad_request("peek: 1 or 0")),
     };
-    ok(app
+    let listing = app
         .store
-        .inbox_with(call.me()?, args.since, state, args.limit, delivery)?
-        .to_json())
+        .inbox_with(call.me()?, args.since, state, args.limit, delivery)?;
+    ok(app.listing_json(&listing))
 }
 
 fn inbox_wait(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
     let args = list_args(call)?;
     let me = call.me()?;
     let _online = Waiting::new(app, me);
-    ok(app
+    let listing = app
         .store
-        .wait(args.deadline, |s| s.inbox(me, args.since, None, args.limit))?
-        .to_json())
+        .wait(args.deadline, |s| s.inbox(me, args.since, None, args.limit))?;
+    ok(app.listing_json(&listing))
 }
 
 fn outbox(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
     let args = list_args(call)?;
-    ok(app.store.outbox(call.me()?, args.since, args.limit)?.to_json())
+    ok(app.listing_json(&app.store.outbox(call.me()?, args.since, args.limit)?))
 }
 
 fn outbox_wait(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
     let args = list_args(call)?;
     let me = call.me()?;
     let _online = Waiting::new(app, me);
-    ok(app
+    let listing = app
         .store
-        .wait(args.deadline, |s| s.outbox(me, args.since, args.limit))?
-        .to_json())
+        .wait(args.deadline, |s| s.outbox(me, args.since, args.limit))?;
+    ok(app.listing_json(&listing))
 }
 
 /// Keeps `me` online for as long as a wait blocks; its end counts as activity.

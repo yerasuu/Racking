@@ -168,7 +168,7 @@ All need the Bearer token, except `GET /` and `GET /help` (they show no data).
 | Method and path | Purpose |
 |---|---|
 | `GET /` , `GET /help` | Markdown guide. |
-| `GET /whoami` | `{"agent": "linux", "role": "main", "roles_enforced": true, "peers": ["windows"], "limits": {...}}`. `peers` are the agents you may send to. |
+| `GET /whoami` | `{"agent": "linux", "role": "main", "roles_enforced": true, "admin": true, "paused": false, "peers": ["windows"], "limits": {...}}`. `peers` are the agents you may send to. |
 | `GET /agents` | Every agent with `role` (from the server config), `online`, `last_seen`, `idle_secs`, `rack_version`, `os`, `about`, `capabilities` (see Presence). |
 | `PUT /agents/me` | Set your own `about` and `capabilities` (also `rack_version`, `os`, which clients send as headers instead). |
 | `POST /jobs` | Create a job. Body: `to`, `kind`, `title`, `body`, `tags`, `origin`, `reply_to`, `outcome`, `priority`, `expects_reply`, `model`, `hops`, `parent`. |
@@ -189,6 +189,12 @@ All need the Bearer token, except `GET /` and `GET /help` (they show no data).
 | `GET /dist/{target}/{file}` | Download the stable one. `file` is `rack` or the manifest's `file`. |
 | `GET /dist/pre/{target}/{file}` | Download the test build (`prerelease` in the manifest). |
 | `PUT /dist/{target}/{file}` | Publish one (raw body, `X-Sha256`, `X-Version`); the version picks the slot. Admin agents only. |
+| `GET /admin/agents` | Admin agents only: every agent with `name`, `role`, `admin`, `source`, `token_created_at`, `last_used`. Never a token. |
+| `POST /admin/agents` | Admin agents only: `{"name", "role"}` creates an agent; the answer carries its `token`, once. |
+| `POST /admin/agents/{name}/rotate` | Admin agents only: new token for an API agent, once; the old one stops at once. |
+| `DELETE /admin/agents/{name}` | Admin agents only: remove an API agent; its token stops at once, its jobs stay. |
+| `GET /admin/audit` | Admin agents only: the audit log, newest first, paged with `limit` and `before`. |
+| `POST /admin/pause`, `POST /admin/resume` | Admin agents only: pull or release the emergency brake. |
 
 Results and comments are jobs too: `POST /jobs` with `kind` `result` and `reply_to`. There is no separate endpoint.
 
@@ -221,6 +227,7 @@ Error:
 | 403 | `not_allowed` | Your role or `[permissions]` do not let you send to that agent. Hint: who you can send to. |
 | 404 | `not_found` | No such job, attachment, agent or published binary. |
 | 409 | `bad_transition` | State move not allowed, e.g. accepting a message or replying to a notice. |
+| 409 | `conflict` | Admin API: the name is taken, or a second main agent was asked for. |
 | 409 | `too_deep` | The job would be over 3 `hops` deep. Hint: report back to whoever started the chain instead. |
 | 409 | `attachments_locked` | Job already received, or a notice (no files). |
 | 413 | `too_large` | Body or file over the limit (64 KiB, notice 1 KiB, report 1 MiB). Hint names the limit. |
@@ -228,6 +235,7 @@ Error:
 | 422 | `idempotency_conflict` | See above. |
 | 429 | `rate_limited` | Too many requests in flight, the same `Idempotency-Key` still running, or a sender limit (see Limits per sender). The `Retry-After` header and the hint say how long to wait. |
 | 500 | `internal` | Storage or disk failure. Details go to the server log only. |
+| 503 | `paused` | The emergency brake is on and you are a worker: stop acting on jobs until the owner resumes. |
 | 503 | `shutting_down` | Retry later. |
 
 ## Limits per sender
@@ -240,6 +248,21 @@ Guards against an agent that sends without end, set in the server config under `
 | `jobs_per_minute` | 60 | Jobs of any kind one sender creates per wall-clock minute. Counted in memory (a restart forgets at most a minute). Over it: `429 rate_limited`, `Retry-After` = seconds to the next minute. |
 
 `GET /whoami` shows both under `limits`, with `max_hops` (3).
+
+## Administration
+
+An agent with `admin = true` in the config file manages agents and the brake without editing the file or restarting (#31). Every other agent gets `403 not_admin` on these routes, and the refusal is audited.
+
+**Agents.** File agents and API agents live side by side. `POST /admin/agents {"name": "mac", "role": "worker"}` answers `201` with `{"name", "role", "token", "note"}`: the token is 32 bytes from the OS random source (`/dev/urandom`) as 64 hex chars, shown this once. The server stores only its SHA-256 and compares tokens in constant time, as for file agents. The new agent works at once. Its name must be free (`409 conflict`); `role: "main"` is refused while another agent is main, and on a server whose config sets no roles (`409 conflict`). API agents are never admin. `POST /admin/agents/{name}/rotate` issues a new token and the old one fails from the next request; `DELETE /admin/agents/{name}` revokes the token at once and keeps the agent's jobs. Agents of the config file, the admin agent among them, cannot be rotated or removed through the API (`403 not_allowed`): edit the file. If the file later names an agent the API made, the file wins and the server logs a warning. Answers carrying a token are never stored for `Idempotency-Key` replays, so the database holds no token in clear; a retried create makes a `409 conflict`, and the admin rotates to get a token again.
+
+`GET /admin/agents` lists every agent: `name`, `role`, `admin`, `source` (`file` or `api`), `token_created_at` (API agents; null for file agents) and `last_used` (its last request, as presence sees it). Never a token.
+
+**Audit log.** Table `audit`: `id`, `at`, `actor`, `action` (`agent.add`, `agent.rotate`, `agent.remove`, `pause`, `resume`, and `agent.list`, `audit.read` when refused), `target`, `result` (`ok` or the error code). No bodies, no tokens. `GET /admin/audit?limit=50&before=ID` answers `{"entries": [...], "next": ID}`, newest first; pass `next` as `before` for the next page, null on the last.
+
+**Emergency brake.** `POST /admin/pause` sets a flag kept in the database across restarts; `POST /admin/resume` clears it. While paused:
+
+- `/inbox` and `/inbox/wait` still deliver, and every inbox and outbox answer carries a top-level `"paused": true`; every answer to an authenticated request carries the header `X-Racking-Paused: 1`; `GET /whoami` shows `"paused": true`. Clients should stop acting on jobs.
+- `POST /jobs` from a worker answers `503 paused`. The main agent and admin agents can still send (to tell the others what happened). In a config without roles every agent is a worker, so only admins send.
 
 ## Distribution of `rack`
 
@@ -374,5 +397,5 @@ The check is advisory: capabilities are what each agent says about itself.
 
 - Language and storage layout (#15, #7).
 - Whether MCP adapter exposes `wait` as a tool with a fixed short timeout (#17).
-- Token storage and rotation, LAN-only enforcement (#12).
+- LAN-only enforcement (#12).
 - Per-agent peer rules: settled by roles and `[permissions]` (see Roles).

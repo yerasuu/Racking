@@ -5,7 +5,7 @@
 //! (`PUT /agents/me`) are rare and written at once.
 
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
-use std::sync::{PoisonError, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use serde_json::{Value, json};
 
@@ -84,7 +84,20 @@ struct Slot {
 
 pub struct Presence {
     clock: Clock,
-    slots: Vec<Slot>,
+    /// Read on every request; written only when the admin API adds or removes an agent.
+    slots: RwLock<Vec<Arc<Slot>>>,
+}
+
+impl Slot {
+    fn new(name: AgentName, seen: i64, info: Info) -> Self {
+        Self {
+            name,
+            last_seen: AtomicI64::new(seen),
+            flushed: AtomicI64::new(seen),
+            waiting: AtomicU32::new(0),
+            info: RwLock::new(info),
+        }
+    }
 }
 
 impl Presence {
@@ -97,19 +110,39 @@ impl Presence {
                 .position(|s| s.name == name.as_str())
                 .map(|i| stored.swap_remove(i));
             let seen = kept.as_ref().and_then(|k| k.last_seen).unwrap_or(NEVER);
-            slots.push(Slot {
-                name: name.clone(),
-                last_seen: AtomicI64::new(seen),
-                flushed: AtomicI64::new(seen),
-                waiting: AtomicU32::new(0),
-                info: RwLock::new(kept.map(|k| k.info).unwrap_or_default()),
-            });
+            let info = kept.map(|k| k.info).unwrap_or_default();
+            slots.push(Arc::new(Slot::new(name.clone(), seen, info)));
         }
-        Self { clock, slots }
+        Self {
+            clock,
+            slots: RwLock::new(slots),
+        }
     }
 
-    fn slot(&self, agent: &AgentName) -> Option<&Slot> {
-        self.slots.iter().find(|s| &s.name == agent)
+    fn slot(&self, agent: &AgentName) -> Option<Arc<Slot>> {
+        let slots = self.slots.read().unwrap_or_else(PoisonError::into_inner);
+        slots.iter().find(|s| &s.name == agent).map(Arc::clone)
+    }
+
+    /// Starts tracking an agent the admin API created; it has never been seen.
+    pub fn add(&self, agent: &AgentName) {
+        let mut slots = self.slots.write().unwrap_or_else(PoisonError::into_inner);
+        if !slots.iter().any(|s| &s.name == agent) {
+            slots.push(Arc::new(Slot::new(agent.clone(), NEVER, Info::default())));
+        }
+    }
+
+    /// Stops listing a removed agent. A request already holding its slot finishes harmlessly.
+    pub fn remove(&self, agent: &AgentName) {
+        let mut slots = self.slots.write().unwrap_or_else(PoisonError::into_inner);
+        slots.retain(|s| &s.name != agent);
+    }
+
+    /// Unix seconds of the agent's last request, or `None` if never seen.
+    pub fn last_seen(&self, agent: &AgentName) -> Option<i64> {
+        self.slot(agent)
+            .map(|s| s.last_seen.load(Ordering::Relaxed))
+            .filter(|t| *t != NEVER)
     }
 
     /// Records activity of `agent` now, and the software it named if that changed.
@@ -190,12 +223,13 @@ impl Presence {
     /// `{"agents": [...]}`, every configured agent in config order. Carries no token or admin flag.
     pub fn to_json(&self) -> Value {
         let now = self.clock.now();
-        json!({"agents": self.slots.iter().map(|s| entry(s, now)).collect::<Vec<_>>()})
+        let slots = self.slots.read().unwrap_or_else(PoisonError::into_inner);
+        json!({"agents": slots.iter().map(|s| entry(s, now)).collect::<Vec<_>>()})
     }
 
     pub fn agent_json(&self, agent: &AgentName) -> Value {
         let now = self.clock.now();
-        self.slot(agent).map_or(Value::Null, |s| entry(s, now))
+        self.slot(agent).map_or(Value::Null, |s| entry(&s, now))
     }
 }
 

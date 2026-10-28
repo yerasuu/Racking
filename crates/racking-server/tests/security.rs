@@ -246,3 +246,170 @@ fn configs_without_roles_work_as_before() {
     );
     assert_eq!((status, job["from_role"].as_str()), (201, Some("worker")));
 }
+
+#[test]
+fn admin_manages_agents_without_a_restart() {
+    let s = Server::start(ROLES);
+    let (status, err) = s.call("GET", "/admin/agents", W1, None);
+    assert_eq!((status, code(&err)), (403, "not_admin"));
+    let (status, err) = s.call(
+        "POST",
+        "/admin/agents",
+        W1,
+        Some(json!({"name": "mac", "role": "worker"})),
+    );
+    assert_eq!((status, code(&err)), (403, "not_admin"));
+
+    let (status, made) = s.call(
+        "POST",
+        "/admin/agents",
+        BOSS,
+        Some(json!({"name": "mac", "role": "worker"})),
+    );
+    assert_eq!(status, 201, "{made}");
+    let token = made["token"].as_str().unwrap_or_default().to_owned();
+    assert_eq!(token.len(), 64);
+    let (status, me) = s.call("GET", "/whoami", &token, None);
+    assert_eq!(
+        (status, me["agent"].as_str(), me["role"].as_str()),
+        (200, Some("mac"), Some("worker"))
+    );
+    let (status, job) = s.send(&token, json!({"to": "boss", "kind": "message", "body": "hello"}));
+    assert_eq!(status, 201, "{job}");
+
+    let (status, _) = s.call(
+        "POST",
+        "/admin/agents",
+        BOSS,
+        Some(json!({"name": "mac", "role": "worker"})),
+    );
+    assert_eq!(status, 409, "name taken");
+    let (status, _) = s.call(
+        "POST",
+        "/admin/agents",
+        BOSS,
+        Some(json!({"name": "x", "role": "main"})),
+    );
+    assert_eq!(status, 409, "boss is main");
+    let (status, err) = s.call("DELETE", "/admin/agents/boss", BOSS, None);
+    assert_eq!(
+        (status, code(&err)),
+        (403, "not_allowed"),
+        "file agents stay in the file"
+    );
+
+    let (_, list) = s.call("GET", "/admin/agents", BOSS, None);
+    let text = list.to_string();
+    assert!(
+        !text.contains(&token) && !text.contains(BOSS) && !text.contains(W1),
+        "no token is listed"
+    );
+    let mac = list["agents"]
+        .as_array()
+        .and_then(|a| a.iter().find(|e| e["name"] == "mac"))
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        (mac["source"].as_str(), mac["admin"].as_bool()),
+        (Some("api"), Some(false))
+    );
+    assert!(mac["last_used"].is_string(), "{mac}");
+
+    let (status, rotated) = s.call("POST", "/admin/agents/mac/rotate", BOSS, None);
+    assert_eq!(status, 200);
+    let new_token = rotated["token"].as_str().unwrap_or_default().to_owned();
+    assert_eq!(
+        s.call("GET", "/whoami", &token, None).0,
+        401,
+        "the old token stopped at once"
+    );
+    assert_eq!(s.call("GET", "/whoami", &new_token, None).0, 200);
+
+    let (status, _) = s.call("DELETE", "/admin/agents/mac", BOSS, None);
+    assert_eq!(status, 200);
+    assert_eq!(
+        s.call("GET", "/whoami", &new_token, None).0,
+        401,
+        "revoked without a restart"
+    );
+    let id = job["id"].as_str().unwrap_or_default();
+    assert_eq!(
+        s.call("GET", &format!("/jobs/{id}"), BOSS, None).0,
+        200,
+        "its jobs are kept"
+    );
+
+    let (_, audit) = s.call("GET", "/admin/audit?limit=50", BOSS, None);
+    let entries = audit["entries"].as_array().cloned().unwrap_or_default();
+    let summary: Vec<(String, String)> = entries
+        .iter()
+        .map(|e| {
+            (
+                e["action"].as_str().unwrap_or("").to_owned(),
+                e["result"].as_str().unwrap_or("").to_owned(),
+            )
+        })
+        .collect();
+    for want in [
+        ("agent.remove", "ok"),
+        ("agent.rotate", "ok"),
+        ("agent.add", "ok"),
+        ("agent.add", "conflict"),
+        ("agent.remove", "not_allowed"),
+        ("agent.add", "not_admin"),
+    ] {
+        assert!(
+            summary.iter().any(|(a, r)| (a.as_str(), r.as_str()) == want),
+            "{want:?} in {summary:?}"
+        );
+    }
+    let text = audit.to_string();
+    assert!(
+        !text.contains(&token) && !text.contains(&new_token),
+        "the audit holds no token"
+    );
+    let (_, page) = s.call("GET", "/admin/audit?limit=2", BOSS, None);
+    let next = page["next"].as_i64().unwrap_or_default();
+    let (_, rest) = s.call("GET", &format!("/admin/audit?limit=50&before={next}"), BOSS, None);
+    assert_eq!(
+        rest["entries"].as_array().map(Vec::len),
+        Some(entries.len() - 2),
+        "pages follow `next`"
+    );
+}
+
+#[test]
+fn the_brake_stops_workers_but_keeps_delivering() {
+    let s = Server::start(ROLES);
+    let (_, sent) = s.send(BOSS, json!({"to": "w1", "kind": "message", "body": "before"}));
+    assert_eq!(s.call("POST", "/admin/pause", W1, None).0, 403);
+    let (status, body) = s.call("POST", "/admin/pause", BOSS, None);
+    assert_eq!((status, body["paused"].as_bool()), (200, Some(true)));
+
+    let (status, err) = s.send(W1, json!({"to": "boss", "kind": "message", "body": "x"}));
+    assert_eq!((status, code(&err)), (503, "paused"));
+    let (status, _) = s.send(BOSS, json!({"to": "w1", "kind": "message", "body": "stop"}));
+    assert_eq!(status, 201, "main can still send");
+
+    let (_, inbox) = s.call("GET", "/inbox", W1, None);
+    assert_eq!(inbox["paused"], true);
+    assert_eq!(inbox["jobs"][0]["id"], sent["id"], "jobs are still delivered");
+    let (_, me) = s.call("GET", "/whoami", W1, None);
+    assert_eq!(me["paused"], true);
+    let resp = s
+        .http
+        .get(format!("{}/whoami", s.base))
+        .header("Authorization", format!("Bearer {W2}"))
+        .call()
+        .expect("http");
+    assert_eq!(
+        resp.headers().get("X-Racking-Paused").and_then(|v| v.to_str().ok()),
+        Some("1")
+    );
+
+    assert_eq!(s.call("POST", "/admin/resume", BOSS, None).0, 200);
+    let (status, _) = s.send(W1, json!({"to": "boss", "kind": "message", "body": "back"}));
+    assert_eq!(status, 201);
+    let (_, inbox) = s.call("GET", "/inbox", W1, None);
+    assert_eq!(inbox["paused"], false);
+}
