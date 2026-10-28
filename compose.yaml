@@ -10,12 +10,11 @@ services:
     build: .
     image: racking-server:local
     restart: unless-stopped
-    # The server has no SIGTERM handler. As PID 1 the kernel ignores a signal
-    # with no handler, so `docker stop` waited its 10 s and then killed it.
-    # With an init process as PID 1 (compose `init: true`) the signal reaches
-    # the server, whose default action ends it at once. SQLite's WAL is
-    # designed to recover after a crash, so the kill loses at most requests
-    # in flight (docs/deploy.md). The grace period is the ceiling for a stop.
+    # The server handles SIGTERM: it stops accepting, lets requests in flight
+    # finish (shutdown_grace_secs, default 10) and checkpoints SQLite. `init: true`
+    # runs an init as PID 1 so the signal reaches the server (the kernel ignores
+    # unhandled signals for PID 1; here it is handled, and init also reaps
+    # children). The compose grace period must stay above the server's own.
     init: true
     stop_grace_period: 15s
     user: "10001:10001"
