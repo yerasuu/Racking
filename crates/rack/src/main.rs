@@ -17,11 +17,12 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 // Imported at the crate root so `pull` and `state` keep reaching it as `crate::client`.
-use rack::client::{self, Client, Job, Listing, Outcome, RackError, Result, job_id, local};
+use rack::client::{self, AttachmentInfo, Client, Job, Listing, Outcome, RackError, Result, job_id, local};
 use rack::config;
 use rack::guide::Topic;
 use rack::history;
 use rack::text;
+use rack::upload::{self, Mode};
 use state::State;
 
 const USAGE: &str = "\
@@ -73,7 +74,8 @@ Config: RACK_URL and RACK_TOKEN, or RACK_CONFIG=FILE, or the default file
   rack accept JOB
   rack reject JOB --reason TEXT
   rack result JOB [--failed] [--title T] [--body TEXT|-] [--attach FILE]...
-  rack attach JOB FILE...
+  rack attach JOB FILE... [--resume]              files over 32 MiB go in resumable chunks;
+                                                 --resume continues an upload that was cut
   rack get-attachment JOB NAME [--out PATH]
   rack outbox [--since N] [--wait] [--timeout SECS]
   rack pull [--dir DIR] [--repo NAME] [--notes] new tasks -> kb entries; --notes: reports -> kb notes
@@ -425,7 +427,7 @@ fn body_arg(opts: &Opts) -> Result<String> {
 fn create_and_attach(c: &Client, job: &Value, files: &[&str]) -> Result<(Job, String)> {
     let created = c.create_job(job)?;
     for file in files {
-        if let Err(e) = c.upload(&created.id, Path::new(file)) {
+        if let Err(e) = attach_path(c, &created.id, Path::new(file), Mode::Auto) {
             println!("{} sent to {} but {file} was not attached: {e}", created.id, created.to);
             return Err(RackError::Local(format!(
                 "retry with: rack attach {} {file}",
@@ -447,7 +449,7 @@ fn broadcast(c: &Client, job: &Value, files: &[&str]) -> Result<()> {
     let mut failed = Vec::new();
     for copy in &sent.jobs {
         for file in files {
-            if let Err(e) = c.upload(&copy.id, Path::new(file)) {
+            if let Err(e) = attach_path(c, &copy.id, Path::new(file), Mode::Auto) {
                 eprintln!("rack: {file} was not attached to {} ({}): {e}", copy.id, copy.to);
                 failed.push(format!("rack attach {} {file}", copy.id));
             }
@@ -986,14 +988,27 @@ fn result(c: &Client, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Uploads one file of `rack attach` or `--attach`: in one request when it is
+/// small, otherwise in resumable chunks with a progress line on stderr.
+fn attach_path(c: &Client, job: &str, path: &Path, mode: Mode) -> Result<AttachmentInfo> {
+    let mut stderr = std::io::stderr();
+    let opts = upload::Options {
+        mode,
+        progress: Some(&mut stderr),
+        ..upload::Options::default()
+    };
+    upload::upload_file(c, job, path, opts)
+}
+
 fn attach(c: &Client, args: &[String]) -> Result<()> {
-    let opts = Opts::parse(args, &[], &[])?;
+    let opts = Opts::parse(args, &[], &["resume"])?;
     let Some((id, files)) = opts.positional.split_first().filter(|(_, f)| !f.is_empty()) else {
         return Err(RackError::Usage("expected JOB FILE...".to_owned()));
     };
     let id = job_id(id)?;
+    let mode = if opts.flag("resume") { Mode::Resume } else { Mode::Auto };
     for file in files {
-        let a = c.upload(id, Path::new(file))?;
+        let a = attach_path(c, id, Path::new(file), mode)?;
         println!("{id} attached {} ({} bytes, sha256 {})", a.name, a.size, a.sha256);
     }
     Ok(())

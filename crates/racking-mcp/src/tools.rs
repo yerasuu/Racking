@@ -694,7 +694,8 @@ fn upload(ctx: &Ctx, job: &str, path: &str) -> Result<AttachmentInfo, Failure> {
         && file.len > cap
     {
         return Err(Failure(format!(
-            "{path} is {} bytes, over the server's limit of {cap} per file; split it or send a git bundle",
+            "{path} is {} bytes, over the {cap} bytes one request may carry; send it with `rack attach {job} \
+             {path}` in a shell, which uploads big files in resumable chunks",
             file.len
         )));
     }
@@ -1026,7 +1027,9 @@ pub fn list() -> Value {
             "Upload a local file as an attachment of a task, message or report you sent, while it is still \
              `sent` (notices take no files). The \
              attachment is named after the file, which must match [A-Za-z0-9._-]{1,100}. Only files inside \
-             this server's root directory can be sent; the size limit is the server's (see racking_whoami).",
+             this server's root directory can be sent. The file is streamed in one request, so the limit is \
+             the server's one-request size (64 MiB, `file_bytes` in racking_whoami); send bigger files and \
+             folders with `rack attach JOB PATH` in a shell, which uploads them in resumable chunks.",
             json!({
                 "job": job,
                 "path": {"type": "string", "description": "File path, relative to the root directory or absolute inside it."}

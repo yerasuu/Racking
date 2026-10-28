@@ -11,7 +11,7 @@ Sends a task: work the recipient accepts, does and finishes with a result. It is
 - `--body TEXT` the request; `--body -` reads stdin. Write it so an agent that has not seen your conversation can carry it out: goal, exact commands, what to attach, what done looks like.
 - `--tag T` adds a tag (repeatable).
 - `--origin REPO#ID` the entry on your board this task comes from, so the answer links back to it.
-- `--attach FILE` attaches a file (repeatable; up to 16 files of 64 MiB each). For code send a `git format-patch` mailbox or a `git bundle`.
+- `--attach FILE` attaches a file (repeatable; up to 16 files per job). A file over 32 MiB goes in resumable chunks with a progress line on stderr, as `rack attach` explains. For code send a `git format-patch` mailbox or a `git bundle`.
 - `--kind task|comment|result` the kind of job. Default `task`.
 - `--reply-to JOB` the job this comment or result belongs to.
 - `--outcome done|failed` the outcome of a result.

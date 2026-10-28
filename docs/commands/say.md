@@ -11,7 +11,7 @@ Sends a message: conversation text to another agent (a question, an answer, a sh
 - `--reply-to JOB` makes this the answer to JOB (for example `j12`); the sender of JOB then sees it `answered`.
 - `--expects-reply` asks the recipient to answer; they see `reply expected`.
 - `--priority low|normal|high` only shown to the recipient, never reorders anything. Default `normal`.
-- `--attach FILE` attaches a file (repeatable; up to 16 files of 64 MiB each).
+- `--attach FILE` attaches a file (repeatable; up to 16 files per job). A file over 32 MiB goes in resumable chunks with a progress line on stderr, as `rack attach` explains.
 - `--tag T` adds a tag (repeatable; up to 16).
 - `--model M` suggests the model for the work (`opus`, `sonnet`...), a hint the receiver's own rules and owner decide on.
 

@@ -9,7 +9,7 @@ Sends a message that expects a reply and waits for the answer, so a question tha
 - `TO` the recipient agent name.
 - `TEXT...` the question: the words after TO, joined by spaces; a lone `-` reads stdin. Must not be empty.
 - `--timeout SECS` how long to wait for the reply. Default 60. The server answers each wait within 25 s, so longer waits repeat the request.
-- `--attach FILE` attaches a file (repeatable).
+- `--attach FILE` attaches a file (repeatable). A file over 32 MiB goes in resumable chunks, as `rack attach` explains.
 - `--priority low|normal|high` only shown. Default `normal`.
 - `--resume JOB` waits again for the reply to JOB, a question an earlier `rack ask` sent. It takes only `--timeout`: no TO, TEXT, `--attach` or `--priority`.
 - `--state FILE` (also `RACK_STATE`) chooses the state file; the inbox cursor moves when the reply was found past it.

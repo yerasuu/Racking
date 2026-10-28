@@ -384,6 +384,19 @@ impl Client {
         read_json(resp)
     }
 
+    /// One PUT of `body` with `headers`, sent once and never retried here: a
+    /// resumable upload asks the server where it stands before trying again.
+    pub fn put_once<T: DeserializeOwned>(&self, path: &str, body: &[u8], headers: &[(&str, &str)]) -> Result<T> {
+        let mut req = self.headers(self.http.put(self.url(path)));
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        let resp = req
+            .send(body)
+            .map_err(|e| RackError::Transport(format!("{}: {e}", self.base)))?;
+        read_json(resp)
+    }
+
     /// Downloads an attachment to `dest` through a `.part` file and returns
     /// the server's `X-Sha256` and the hash of the bytes received; the caller
     /// decides what a mismatch means.
@@ -676,7 +689,7 @@ fn api_error(mut resp: ureq::http::Response<ureq::Body>) -> RackError {
 
 /// The attachment name is the file name, which must already fit the server's
 /// `[A-Za-z0-9._-]{1,100}` so no URL encoding is needed.
-fn attachment_name(file: &Path) -> Result<String> {
+pub(crate) fn attachment_name(file: &Path) -> Result<String> {
     let name = file.file_name().and_then(|n| n.to_str()).unwrap_or_default();
     let ok = (1..=100).contains(&name.len())
         && name
