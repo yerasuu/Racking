@@ -83,6 +83,11 @@ pub const COMMANDS: &[Command] = &[
         "wait without end, one short line per new job (for a Monitor or a hook)",
         None
     ),
+    command!(
+        "listen",
+        "experimental: like watch, into a Claude Code session's inbox socket",
+        None
+    ),
     command!("show", "show one job in full", Some("racking_show")),
     command!("accept", "accept a task sent to you", Some("racking_accept")),
     command!("reject", "reject a task with a reason", Some("racking_reject")),

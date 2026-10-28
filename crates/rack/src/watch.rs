@@ -1,5 +1,6 @@
 //! `rack watch`: one short line per new job, for a Claude Code Monitor or an
-//! `asyncRewake` hook (docs/agent-guide.md, "Waking an idle agent").
+//! `asyncRewake` hook (docs/agent-guide.md, "Waking an idle agent"). `rack listen`
+//! runs the same loop with the session's inbox socket in place of stdout.
 //!
 //! It sleeps in the server's long wait, so it costs no requests while nothing
 //! arrives. SIGINT and SIGTERM keep their default action (end the process): the
@@ -13,6 +14,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::client::{Client, Listing, RackError, Result, local, with_suffix};
+use crate::listen::{Inbox, Sent};
 use crate::state::State;
 
 /// Longest line printed per job, `...` included: enough to know who wrote and about
@@ -33,6 +35,13 @@ pub enum Mode {
     Forever,
 }
 
+/// Where the job lines go.
+pub enum Sink {
+    Stdout,
+    /// `rack listen`: one message per batch into a Claude Code session.
+    Session(Inbox),
+}
+
 pub struct Watch<'a> {
     pub client: &'a Client,
     pub state_path: &'a Path,
@@ -41,6 +50,7 @@ pub struct Watch<'a> {
     pub mode: Mode,
     /// `--timeout SECS`: give up quietly (exit 0, nothing printed) after this long.
     pub deadline: Option<Instant>,
+    pub sink: Sink,
 }
 
 impl Watch<'_> {
@@ -55,8 +65,13 @@ impl Watch<'_> {
         };
         let mut backoff = Backoff::new();
         let mut outage = Outage::default();
-        let mut out = std::io::stdout().lock();
         loop {
+            if let Sink::Session(inbox) = &self.sink
+                && !inbox.alive()
+            {
+                eprintln!("rack: listen: {} is gone; the session ended", inbox.path().display());
+                return Ok(());
+            }
             let Some(timeout) = self.wait_secs() else {
                 return Ok(());
             };
@@ -67,7 +82,7 @@ impl Watch<'_> {
                 Ok(l) => l,
                 Err(e) if is_retryable(&e) => {
                     if outage.should_report(Instant::now()) {
-                        eprintln!("rack: watch: {e}; retrying");
+                        eprintln!("rack: {}: {e}; retrying", self.name());
                     }
                     let delay = backoff.next_delay();
                     std::thread::sleep(
@@ -80,17 +95,11 @@ impl Watch<'_> {
             };
             backoff = Backoff::new();
             outage = Outage::default();
-            for job in &listing.jobs {
-                let line = short_line(&crate::incoming_line(job), LINE_CHARS);
-                if let Err(e) = writeln!(out, "{line}").and_then(|()| out.flush()) {
-                    // The cursor is not saved, so the next watch shows these jobs again.
-                    return match e.kind() {
-                        ErrorKind::BrokenPipe => Ok(()),
-                        _ => Err(local("write to stdout", e)),
-                    };
-                }
-            }
             if !listing.jobs.is_empty() {
+                // When the reader is gone the cursor is not saved, so the next watch shows these jobs again.
+                if !self.deliver(&listing)? {
+                    return Ok(());
+                }
                 save_cursor(self.state_path, listing.next)?;
                 if self.mode == Mode::Once {
                     return Ok(());
@@ -101,6 +110,45 @@ impl Watch<'_> {
                 // `rack wait` or `rack ask` may have moved the shared cursor meanwhile.
                 since = since.max(State::load(self.state_path)?.inbox_since);
             }
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self.sink {
+            Sink::Stdout => "watch",
+            Sink::Session(_) => "listen",
+        }
+    }
+
+    /// `false` when the reader went away: stdout closed, or the session ended.
+    fn deliver(&self, listing: &Listing) -> Result<bool> {
+        let lines = listing
+            .jobs
+            .iter()
+            .map(|job| short_line(&crate::incoming_line(job), LINE_CHARS));
+        match &self.sink {
+            Sink::Stdout => {
+                let mut out = std::io::stdout().lock();
+                for line in lines {
+                    if let Err(e) = writeln!(out, "{line}").and_then(|()| out.flush()) {
+                        return match e.kind() {
+                            ErrorKind::BrokenPipe => Ok(false),
+                            _ => Err(local("write to stdout", e)),
+                        };
+                    }
+                }
+                Ok(true)
+            }
+            Sink::Session(inbox) => match inbox.send(&lines.collect::<Vec<_>>())? {
+                Sent::Delivered => Ok(true),
+                Sent::SessionGone => {
+                    eprintln!(
+                        "rack: listen: {} refuses connections; the session ended",
+                        inbox.path().display()
+                    );
+                    Ok(false)
+                }
+            },
         }
     }
 
@@ -115,8 +163,9 @@ impl Watch<'_> {
         }
     }
 
-    /// One watch per state file, so hooks fired on every `Stop` do not pile up
-    /// watchers that all print the same job. `None` when another one holds it.
+    /// One watch or listen per state file, so hooks fired on every `Stop` (or every
+    /// `SessionStart`) do not pile up watchers that all report the same job, and the two
+    /// never split one cursor. `None` when another one holds it.
     fn lock(&self) -> Result<Option<File>> {
         let path = with_suffix(self.state_path, ".watch.lock");
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -132,16 +181,16 @@ impl Watch<'_> {
             Ok(()) => Ok(Some(file)),
             Err(TryLockError::WouldBlock) => {
                 let note = format!(
-                    "another rack watch already runs for {}; it reports the jobs",
+                    "another rack watch or listen already runs for {}; it reports the jobs",
                     self.state_path.display()
                 );
-                match self.mode {
+                match (self.mode, &self.sink) {
                     // The hook that started this one is covered by the running watch: no error.
-                    Mode::Once => {
+                    (Mode::Once, _) | (_, Sink::Session(_)) => {
                         eprintln!("rack: {note}");
                         Ok(None)
                     }
-                    Mode::Forever => Err(RackError::Local(format!(
+                    (Mode::Forever, Sink::Stdout) => Err(RackError::Local(format!(
                         "{note}; stop it first, or use another --state"
                     ))),
                 }

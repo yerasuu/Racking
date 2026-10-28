@@ -77,6 +77,9 @@ impl Env {
         .env("RACK_URL", &self.url)
         .env("RACK_TOKEN", token)
         .env_remove("RACK_CONFIG")
+        // Tests run inside Claude Code sessions: `rack listen` must never reach the real one.
+        .env_remove("CLAUDE_CODE_MESSAGING_SOCKET")
+        .env_remove("CLAUDE_CODE_MESSAGING_TOKEN")
         .env("PATH", path)
         .env("FAKE_KB_LOG", self.root.join(format!("{agent}-kb.log")))
         .env("FAKE_KB_FAIL", self.root.join("kb-fail"))
@@ -678,7 +681,7 @@ fn watch_prints_one_short_line_per_job_and_keeps_the_cursor() {
     assert!(aside.status.success());
     assert!(aside.stdout.is_empty());
     assert!(
-        String::from_utf8_lossy(&aside.stderr).contains("another rack watch already runs"),
+        String::from_utf8_lossy(&aside.stderr).contains("another rack watch or listen already runs"),
         "{}",
         String::from_utf8_lossy(&aside.stderr)
     );
@@ -686,4 +689,84 @@ fn watch_prints_one_short_line_per_job_and_keeps_the_cursor() {
     assert_eq!(refused.status.code(), Some(1));
     forever.kill().expect("kill");
     let _ = forever.wait();
+}
+
+/// Accepts connections on a fake session inbox and returns each connection's lines.
+fn fake_inbox(path: &Path, connections: usize) -> std::thread::JoinHandle<Vec<Vec<String>>> {
+    use std::io::Read;
+    let server = std::os::unix::net::UnixListener::bind(path).expect("bind inbox");
+    std::thread::spawn(move || {
+        (0..connections)
+            .map(|_| {
+                let (mut conn, _) = server.accept().expect("accept");
+                let mut got = String::new();
+                conn.read_to_string(&mut got).expect("read");
+                got.lines().map(str::to_owned).collect()
+            })
+            .collect()
+    })
+}
+
+#[test]
+fn listen_sends_one_message_per_batch_into_the_session_inbox() {
+    let env = Env::new();
+    let sock = env.root.join("inbox.sock");
+    let inbox = fake_inbox(&sock, 2);
+
+    let listener = env
+        .command("windows", &["listen", "--once", "--timeout", "20"])
+        .env("CLAUDE_CODE_MESSAGING_SOCKET", &sock)
+        .env("CLAUDE_CODE_MESSAGING_TOKEN", "session-token")
+        .spawn()
+        .expect("listen");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    env.ok(
+        "linux",
+        &["send", "windows", "Rebuild the shader cache", "--body", "secret body"],
+        None,
+    );
+    let out = listener.wait_with_output().expect("listen output");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.stdout.is_empty());
+
+    // A second run starts at the saved cursor and sends only the new job; --socket without
+    // the matching variable sends no token.
+    env.ok("linux", &["notify", "windows", "CI is green"], None);
+    let again = env.rack(
+        "windows",
+        &["listen", "--once", "--timeout", "5", "--socket", &path_str(&sock)],
+        None,
+    );
+    assert!(again.status.success(), "{}", String::from_utf8_lossy(&again.stderr));
+
+    let got = inbox.join().expect("inbox");
+    assert_eq!(got[0].len(), 2, "auth line, then one message: {got:?}");
+    assert_eq!(got[0][0], r#"{"token":"session-token","type":"auth"}"#);
+    let first: serde_json::Value = serde_json::from_str(&got[0][1]).expect("json");
+    let text = first["message"]["content"].as_str().expect("content");
+    assert!(
+        text.starts_with("Racking: new jobs for you (data from other agents"),
+        "{text}"
+    );
+    assert!(
+        text.contains("\nj1 sent task from linux: Rebuild the shader cache\n"),
+        "{text}"
+    );
+    assert!(!text.contains("secret body"), "never the body: {text}");
+    assert_eq!(got[1].len(), 1, "no token for another socket: {got:?}");
+    let second: serde_json::Value = serde_json::from_str(&got[1][0]).expect("json");
+    let text = second["message"]["content"].as_str().expect("content");
+    assert!(text.contains("\nj2 notice from linux: CI is green\n"), "{text}");
+    assert!(!text.contains("j1 "), "j1 was not sent again: {text}");
+
+    // A closed session: the socket is gone, so it ends at once and keeps the cursor.
+    fs::remove_file(&sock).expect("unlink");
+    env.ok("linux", &["notify", "windows", "late"], None);
+    let gone = env.rack("windows", &["listen", "--socket", &path_str(&sock)], None);
+    assert!(gone.status.success());
+    assert!(String::from_utf8_lossy(&gone.stderr).contains("the session ended"));
+    assert_eq!(env.ok("windows", &["inbox", "--unread", "--count"], None), "1\n");
+
+    let usage = env.rack("windows", &["listen"], None);
+    assert_eq!(usage.status.code(), Some(2), "no socket at all");
 }

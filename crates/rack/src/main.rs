@@ -1,6 +1,7 @@
 //! `rack`: command-line client for a Racking server. Output is short, one line
 //! per job, so agents can read it cheaply.
 
+mod listen;
 mod pull;
 mod state;
 mod update;
@@ -57,6 +58,9 @@ Config: RACK_URL and RACK_TOKEN, or RACK_CONFIG=FILE, or the default file
                                                  like wait, forever: one line per new job (200 chars),
                                                  for a Monitor or hook; --once stops after the first
                                                  batch, --timeout gives up quietly after SECS
+  rack listen [--socket PATH] [--once] [--timeout SECS]
+                                                 experimental: like watch, but each batch goes into a
+                                                 Claude Code session's inbox socket and wakes it
   rack show JOB
   rack accept JOB
   rack reject JOB --reason TEXT
@@ -262,6 +266,7 @@ fn run(all_args: &[String]) -> Result<()> {
         "inbox" => inbox(&connect()?, rest, state_path),
         "wait" => wait(&connect()?, rest, &state_path()?),
         "watch" => watch(&connect()?, rest, &state_path()?),
+        "listen" => listen(&connect()?, rest, &state_path()?),
         "show" => show(&connect()?, rest),
         "accept" => accept(&connect()?, rest),
         "reject" => reject(&connect()?, rest),
@@ -680,10 +685,21 @@ fn unread(c: &Client, state_path: &Path, count_only: bool) -> Result<()> {
 fn watch(c: &Client, args: &[String], state_path: &Path) -> Result<()> {
     let opts = Opts::parse(args, &["since", "timeout"], &["once"])?;
     opts.positionals(0, "no arguments besides options")?;
+    watch_with(c, &opts, state_path, opts.number("since")?, watch::Sink::Stdout)
+}
+
+fn listen(c: &Client, args: &[String], state_path: &Path) -> Result<()> {
+    let opts = Opts::parse(args, &["socket", "timeout"], &["once"])?;
+    opts.positionals(0, "no arguments besides options")?;
+    let inbox = listen::Inbox::from_env(opts.value("socket"))?;
+    watch_with(c, &opts, state_path, None, watch::Sink::Session(inbox))
+}
+
+fn watch_with(c: &Client, opts: &Opts, state_path: &Path, since: Option<i64>, sink: watch::Sink) -> Result<()> {
     watch::Watch {
         client: c,
         state_path,
-        since: opts.number("since")?,
+        since,
         mode: if opts.flag("once") {
             watch::Mode::Once
         } else {
@@ -692,6 +708,7 @@ fn watch(c: &Client, args: &[String], state_path: &Path) -> Result<()> {
         deadline: opts
             .number("timeout")?
             .map(|s| Instant::now() + Duration::from_secs(s.unsigned_abs())),
+        sink,
     }
     .run()
 }
