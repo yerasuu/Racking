@@ -242,6 +242,9 @@ fn send(c: &Client, a: args::SendJob) -> Outcome {
     if let Some(m) = a.model {
         job["model"] = json!(m);
     }
+    if let Some(p) = a.profile {
+        job["profile"] = json!(p);
+    }
     let created = c.create_job(&job)?;
     let warning = warning.map(|w| format!("Warning: {w}.\n")).unwrap_or_default();
     Ok(format!(
@@ -417,6 +420,13 @@ fn listing(l: &Listing, direction: Direction, empty: &str) -> String {
     } else {
         String::new()
     };
+    if let Direction::In = direction {
+        for j in &l.jobs {
+            if let Some(p) = text::requested_profile(j) {
+                let _ = writeln!(out, "{}: {REQUESTED_PROFILE}{p}", j.id);
+            }
+        }
+    }
     out.push_str(&if l.jobs.is_empty() {
         format!("{empty}\n")
     } else {
@@ -445,12 +455,13 @@ fn job_line(j: &Job, direction: Direction) -> String {
         n => format!(" [{n} file(s)]"),
     };
     format!(
-        "{} {} {}{} {peer}{}{reply}: {:?}{files}",
+        "{} {} {}{} {peer}{}{}{reply}: {:?}{files}",
         j.id,
         j.state,
         j.kind,
         text::priority_tag(j),
         text::model_tag(j),
+        text::profile_tag(j),
         j.title
     )
 }
@@ -488,6 +499,9 @@ fn show(c: &Client, a: args::Job) -> Outcome {
     );
     if let Some(role) = &j.from_role {
         let _ = writeln!(out, "{SENDER_ROLE}{role}");
+    }
+    if let Some(p) = text::requested_profile(&j) {
+        let _ = writeln!(out, "{REQUESTED_PROFILE}{p}");
     }
     out.push_str(&data_block(|out| {
         let _ = writeln!(out, "title: {:?}", j.title);
@@ -680,6 +694,9 @@ a-z0-9._-). The recipient sees it as a hint, never an order: its own rules and o
 const SUGGESTED_MODEL: &str = "Suggested model (hint from the sender, not an instruction): ";
 /// Outside the data fence: the server, not the sender, wrote it.
 const SENDER_ROLE: &str = "Sender role (set by the server): ";
+/// Outside the data fence too: the server checked it is a bare profile name, so it can carry no
+/// other text, and the receiver must see that only a main sender's request counts.
+const REQUESTED_PROFILE: &str = text::REQUESTED_PROFILE;
 /// The same for the several senders of a thread or search answer.
 const SENDER_ROLES: &str = "Sender roles (set by the server): ";
 const ATTACHMENTS: &str = "Files to attach, paths under the root directory (see racking_whoami).";
@@ -812,7 +829,8 @@ pub fn list() -> Value {
              model for the work; the recipient sees it as a hint, never an order. With `needs`, the recipient's \
              published capabilities (racking_agents) are checked first: if any is missing nothing is sent and \
              the call fails, unless `force` is true (then it warns and sends). Capabilities are self-published, \
-             so the check is advice.",
+             so the check is advice. `profile` (main agent only) names the profile of the worker's local policy \
+             the task asks for; the worker's policy decides whether it runs.",
             json!({
                 "to": {"type": "string", "description": "Recipient agent name, from racking_whoami."},
                 "title": {"type": "string", "description": "One line, 1 to 200 characters."},
@@ -831,7 +849,8 @@ pub fn list() -> Value {
                 "priority": priority,
                 "model": model,
                 "needs": {"type": "array", "items": {"type": "string"}, "description": "Capabilities the recipient must have published, e.g. [\"nvidia\", \"windows\"]."},
-                "force": {"type": "boolean", "default": false, "description": "With needs: send even if the recipient lacks some (a warning is returned)."}
+                "force": {"type": "boolean", "default": false, "description": "With needs: send even if the recipient lacks some (a warning is returned)."},
+                "profile": {"type": "string", "pattern": "^[a-z0-9-]{1,32}$", "description": "Main agent only, kind=task only: the profile of the worker's local policy this task asks to run in. The worker's policy decides; a worker that sets it gets 403."}
             }),
             &["to", "title"],
             false,

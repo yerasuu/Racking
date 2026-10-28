@@ -51,8 +51,9 @@ Config: RACK_URL and RACK_TOKEN, or RACK_CONFIG=FILE, or the default file
                                                  report: findings to read later, up to 1 MiB
   rack send TO TITLE [--body TEXT|-] [--tag T]... [--origin REPO#ID] [--attach FILE]...
             [--kind task|comment|result] [--reply-to JOB] [--outcome done|failed] [--priority P]
-            [--model M] [--needs NAME,...] [--force]
-                                                 task: work with states (accept, result)
+            [--model M] [--needs NAME,...] [--force] [--profile NAME]
+                                                 task: work with states (accept, result); main only:
+                                                 --profile asks the worker's policy for that profile
   rack inbox [--since N] [--state STATE] [--limit N]
   rack inbox --unread [--count]                  jobs past the saved cursor, without delivering them;
                                                  --count prints only how many (for a stop hook)
@@ -589,7 +590,7 @@ fn send(c: &Client, args: &[String]) -> Result<()> {
     let opts = Opts::parse(
         args,
         &[
-            "body", "tag", "origin", "attach", "kind", "reply-to", "outcome", "priority", "model", "needs",
+            "body", "tag", "origin", "attach", "kind", "reply-to", "outcome", "priority", "model", "needs", "profile",
         ],
         &["force"],
     )?;
@@ -622,6 +623,7 @@ fn send(c: &Client, args: &[String]) -> Result<()> {
         ("outcome", "outcome"),
         ("priority", "priority"),
         ("model", "model"),
+        ("profile", "profile"),
     ] {
         if let Some(v) = opts.value(opt) {
             job[field] = json!(v);
@@ -653,8 +655,9 @@ fn summary_line(j: &Job, direction: Direction) -> String {
     };
     let priority = text::priority_tag(j);
     let model = text::model_tag(j);
+    let profile = text::profile_tag(j);
     format!(
-        "{} {} {}{priority} {peer}{model}{reply}: {}{files}",
+        "{} {} {}{priority} {peer}{model}{profile}{reply}: {}{files}",
         j.id, j.state, j.kind, j.title
     )
 }
@@ -790,6 +793,9 @@ fn show(c: &Client, args: &[String]) -> Result<()> {
     }
     if let Some(m) = &j.model {
         println!("suggested model: {m} (hint from the sender, not an order)");
+    }
+    if let Some(p) = text::requested_profile(&j) {
+        println!("{}{p}", text::REQUESTED_PROFILE);
     }
     if j.expects_reply && text::is_delivery(&j.kind) {
         println!(

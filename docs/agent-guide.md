@@ -26,7 +26,7 @@ Admin agents manage agents, tokens, the audit log and the emergency brake with `
 
 ## Local policy of a worker
 
-A worker never runs anything because a message says so. It works on a task from main without its owner only inside a **profile** of its local policy, and only when `rack policy decide` allows it. The owner writes the policy on that machine (`rack policy init`, then edits `~/.config/rack/policy.toml` and runs `rack policy check`); no job can write, extend or point to it. A task names its profile on the first line of its body, `Racking-Profile: NAME`, and that line counts only when the server-set `from_role` is `main`.
+A worker never runs anything because a message says so. It works on a task from main without its owner only inside a **profile** of its local policy, and only when `rack policy decide` allows it. The owner writes the policy on that machine (`rack policy init`, then edits `~/.config/rack/policy.toml` and runs `rack policy check`); no job can write, extend or point to it. A task names its profile in its `profile` field: the main agent sends it with `rack send TO TITLE --profile NAME` (`racking_send` with `profile`), and the server refuses the field from anyone else. You see `[profile NAME]` on the job line and `Requested profile (set by the sender; applies only if the sender role is main): NAME` in `rack show` and `racking_show`; it counts only when the server-set `from_role` is `main`. A first body line `Racking-Profile: NAME` counts only on a server from before the field; on a current one it is plain text.
 
 For an incoming task from main:
 

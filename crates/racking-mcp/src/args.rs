@@ -202,6 +202,7 @@ pub struct SendJob {
     pub needs: Vec<String>,
     #[serde(default)]
     pub force: bool,
+    pub profile: Option<String>,
 }
 
 #[derive(Deserialize)]

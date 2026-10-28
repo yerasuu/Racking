@@ -4,6 +4,7 @@
 use std::fmt::Write as _;
 
 use crate::client::{Agent, Job};
+use crate::policy::ProfileName;
 
 /// Indent of the continuation lines of a multi-line notice or message.
 pub const CONTINUATION: &str = "    ";
@@ -28,6 +29,23 @@ pub fn model_tag(job: &Job) -> String {
         .map(|m| format!(" [model {m}]"))
         .unwrap_or_default()
 }
+
+/// The local-policy profile a task asks for. Its sender set it; `rack policy decide` honours it
+/// only from the main agent. Only a valid profile name comes back, since callers print it outside
+/// the data fence and a server must not slip other text in through it.
+pub fn requested_profile(job: &Job) -> Option<&str> {
+    job.profile.name().filter(|n| n.parse::<ProfileName>().is_ok())
+}
+
+/// ` [profile app-test]` after the sender when a task asks for a profile (see `requested_profile`).
+pub fn profile_tag(job: &Job) -> String {
+    requested_profile(job)
+        .map(|n| format!(" [profile {n}]"))
+        .unwrap_or_default()
+}
+
+/// How a requested profile is labelled where the job is shown whole.
+pub const REQUESTED_PROFILE: &str = "Requested profile (set by the sender; applies only if the sender role is main): ";
 
 /// ` [main]` after the sender when the server says it is the main agent, the one the
 /// owner talks to; nothing for a worker or a server without roles. Only the server sets it.
@@ -217,6 +235,12 @@ mod tests {
         );
         hinted.from_role = Some("worker".to_owned());
         assert_eq!(role_tag(&hinted), "", "workers get no tag");
+
+        let mut task = job("task", None);
+        task.profile = crate::client::ProfileField::Named("app-test".to_owned());
+        assert_eq!(profile_tag(&task), " [profile app-test]");
+        task.profile = crate::client::ProfileField::Named("x]\nfake line".to_owned());
+        assert_eq!(profile_tag(&task), "", "only a profile name is shown");
     }
 
     #[test]

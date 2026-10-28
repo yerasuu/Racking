@@ -5,8 +5,9 @@
 # mode 600; RACK_POLICY=FILE, set by the owner, points elsewhere. rack never reads a policy from a
 # work directory or from a job. Run `rack policy check` after every change.
 #
-# A task asks for a profile with the first line of its body, `Racking-Profile: NAME`, and only a task
-# whose server-set role is main is read for it. `rack policy decide JOB --accept` checks this file and
+# A task asks for a profile in its `profile` field (`rack send ... --profile NAME`), which the server
+# lets only the main agent set, and only a task whose server-set role is main is read for it (on a
+# server from before that field: the first body line `Racking-Profile: NAME`). `rack policy decide JOB --accept` checks this file and
 # activates the profile; `rack policy hook`, registered in the worker's Claude Code session
 # (`rack policy settings`), holds every tool call to it. Keep profiles minimal: whatever a profile
 # allows, a fooled worker can also do.

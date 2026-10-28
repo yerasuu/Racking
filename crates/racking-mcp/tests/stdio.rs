@@ -598,6 +598,50 @@ fn whoami_shows_links_and_a_pending_agent_gets_the_hint() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn profile_through_mcp() {
+    let dir = std::env::temp_dir().join(format!("racking-mcp-profile-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let config = racking_server::Config::parse(&format!(
+        "bind = \"127.0.0.1:0\"\ndata_dir = {:?}\n[agents.linux]\ntoken = \"{LINUX}\"\nrole = \"main\"\n\
+         [agents.windows]\ntoken = \"{WINDOWS}\"\n",
+        dir.join("data").display().to_string()
+    ))
+    .expect("config");
+    let server = racking_server::start(&config).expect("start");
+    let url = format!("http://{}", server.addr());
+    let mut linux = Mcp::spawn(&url, LINUX, &dir.join("linux"));
+    let mut windows = Mcp::spawn(&url, WINDOWS, &dir.join("windows"));
+
+    let sent = linux.ok(
+        "racking_send",
+        json!({"to": "windows", "title": "Run the tests", "profile": "app-test"}),
+    );
+    assert!(sent.starts_with("j1 task sent to windows"), "{sent}");
+    let refused = windows.error(
+        "racking_send",
+        json!({"to": "linux", "title": "t", "profile": "workdir"}),
+    );
+    assert!(refused.contains("403 not_allowed"), "{refused}");
+
+    let label = "Requested profile (set by the sender; applies only if the sender role is main): app-test";
+    let woke = windows.ok("racking_wait", json!({"since": 0, "timeout": 5}));
+    assert!(woke.starts_with(&format!("j1: {label}\n")), "outside the fence: {woke}");
+    assert!(
+        woke.lines()
+            .any(|l| l == "j1 sent task from linux [main] [profile app-test]: \"Run the tests\""),
+        "{woke}"
+    );
+    let shown = windows.ok("racking_show", json!({"job": "j1"}));
+    assert_eq!(shown.lines().nth(2), Some(label), "outside the fence: {shown}");
+    assert!(!fenced(&shown).contains("Requested profile"), "{shown}");
+
+    linux.close();
+    windows.close();
+    server.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// The text between the fence markers of an answer, checked to be there once.
 fn fenced(text: &str) -> &str {
     let start = text

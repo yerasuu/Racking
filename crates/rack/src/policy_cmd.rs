@@ -246,6 +246,7 @@ pub fn decide(job: &str, accept: bool, connect: impl FnOnce() -> Result<Client>)
         kind: &seen.job.kind,
         state: &seen.job.state,
         hops: seen.job.hops,
+        profile: &seen.job.profile,
         body: seen.job.body.as_deref().unwrap_or_default(),
         paused: seen.paused,
         open_tasks: seen.open_tasks,

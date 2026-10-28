@@ -134,7 +134,14 @@ pub fn line(job: &Job) -> String {
     if !delivery {
         let _ = write!(out, " {}", job.state);
     }
-    let _ = write!(out, " {}{} -> {}", job.from, text::role_tag(job), job.to);
+    let _ = write!(
+        out,
+        " {}{} -> {}{}",
+        job.from,
+        text::role_tag(job),
+        job.to,
+        text::profile_tag(job)
+    );
     if let Some(r) = &job.reply_to {
         let _ = write!(out, " [re {r}]");
     }

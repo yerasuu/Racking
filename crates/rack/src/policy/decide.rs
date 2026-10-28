@@ -4,9 +4,10 @@
 use std::fmt;
 
 use super::{Policy, Problems, ProfileName};
+use crate::client::ProfileField;
 
-/// The first line of a task body that names the profile it asks for. The server has no field for
-/// it yet, so it rides in the body; it counts only on a job whose server-set `from_role` is `main`.
+/// The first line of a task body that named its profile before the server had a `profile` field.
+/// Read only from a server without that field, and only on a job whose server-set `from_role` is `main`.
 pub const PROFILE_LINE: &str = "Racking-Profile:";
 
 /// What the caller learned about the job, from the server and the local state.
@@ -18,6 +19,8 @@ pub struct JobFacts<'a> {
     pub kind: &'a str,
     pub state: &'a str,
     pub hops: i64,
+    /// The job's `profile` field; when the server predates it, `body`'s first line names the profile.
+    pub profile: &'a ProfileField,
     pub body: &'a str,
     /// The server's emergency brake.
     pub paused: bool,
@@ -46,6 +49,7 @@ pub enum Deny {
         hops: i64,
         max: i64,
     },
+    NoProfile,
     NoProfileLine,
     BadProfileName(String),
     UnknownProfile(ProfileName),
@@ -71,9 +75,13 @@ impl fmt::Display for Deny {
             Deny::Kind(kind) => write!(f, "a {kind} is not a task; only tasks start a profile"),
             Deny::Closed(state) => write!(f, "the task is already {state}"),
             Deny::Hops { hops, max } => write!(f, "hops {hops} is above this worker's limit of {max}"),
+            Deny::NoProfile => {
+                f.write_str("the task names no profile: the main agent names one with `rack send ... --profile NAME`")
+            }
             Deny::NoProfileLine => write!(
                 f,
-                "the task names no profile: its body must start with the line `{PROFILE_LINE} NAME`"
+                "the task names no profile: this server predates the profile field, so the body must start with \
+                 the line `{PROFILE_LINE} NAME`"
             ),
             Deny::BadProfileName(e) => f.write_str(e),
             Deny::UnknownProfile(n) => write!(f, "profile {n} does not exist in the local policy"),
@@ -96,7 +104,7 @@ pub fn requested_profile(body: &str) -> Option<Result<ProfileName, String>> {
 }
 
 /// Allows a job only when every condition holds, checked so that a job from anyone but the main
-/// agent never has its body read for a profile name.
+/// agent never has its profile read, field or body line.
 #[must_use]
 pub fn decide(facts: &JobFacts, policy: Result<&Policy, &Problems>) -> Decision {
     match check(facts, policy) {
@@ -128,9 +136,15 @@ fn check(facts: &JobFacts, policy: Result<&Policy, &Problems>) -> Result<Profile
             max: policy.max_hops,
         });
     }
-    let name = requested_profile(facts.body)
-        .ok_or(Deny::NoProfileLine)?
-        .map_err(Deny::BadProfileName)?;
+    // The body line counts only where the field cannot exist; on a current server a body line is
+    // just text, so a job relayed from elsewhere cannot smuggle a profile in through its body.
+    let name = match facts.profile {
+        ProfileField::Named(name) => name.parse().map_err(Deny::BadProfileName)?,
+        ProfileField::Absent => return Err(Deny::NoProfile),
+        ProfileField::Unsupported => requested_profile(facts.body)
+            .ok_or(Deny::NoProfileLine)?
+            .map_err(Deny::BadProfileName)?,
+    };
     let profile = policy
         .profiles
         .get(&name)
@@ -155,6 +169,9 @@ mod tests {
     use super::*;
     use crate::policy::tests::{BASIC, Fixture};
 
+    const OLD_SERVER: &ProfileField = &ProfileField::Unsupported;
+
+    /// A job from a server before the profile field, so its body line counts.
     fn facts(body: &str) -> JobFacts<'_> {
         JobFacts {
             addressed_to_me: true,
@@ -162,6 +179,7 @@ mod tests {
             kind: "task",
             state: "received",
             hops: 0,
+            profile: OLD_SERVER,
             body,
             paused: false,
             open_tasks: 0,
@@ -269,6 +287,52 @@ mod tests {
             }),
             Deny::TooManyOpen { open: 1, max: 1 }
         );
+    }
+
+    #[test]
+    fn the_field_names_the_profile_and_the_body_line_only_counts_without_it() {
+        let f = Fixture::new("decide-field");
+        let p = f.load(BASIC).expect("policy");
+        let named = ProfileField::Named("workdir".to_owned());
+        let with_field = JobFacts {
+            profile: &named,
+            ..facts("Run the tests.")
+        };
+        assert_eq!(
+            decide(&with_field, Ok(&p)),
+            Decision::Allow("workdir".parse().expect("name"))
+        );
+        let off = ProfileField::Named("off".to_owned());
+        let disabled = JobFacts {
+            profile: &off,
+            ..facts(BODY)
+        };
+        assert_eq!(
+            deny(decide(&disabled, Ok(&p))),
+            Deny::Disabled("off".parse().expect("name")),
+            "the field wins over a body line"
+        );
+        let absent = JobFacts {
+            profile: &ProfileField::Absent,
+            ..facts(BODY)
+        };
+        assert_eq!(
+            deny(decide(&absent, Ok(&p))),
+            Deny::NoProfile,
+            "a current server's job is never read for a body line"
+        );
+        let bad = ProfileField::Named("../x".to_owned());
+        let bad = JobFacts {
+            profile: &bad,
+            ..facts("x")
+        };
+        assert!(matches!(deny(decide(&bad, Ok(&p))), Deny::BadProfileName(_)));
+        let from_worker = JobFacts {
+            from_role: Some("worker"),
+            profile: &named,
+            ..facts("x")
+        };
+        assert!(matches!(deny(decide(&from_worker, Ok(&p))), Deny::Role(_)));
     }
 
     #[test]

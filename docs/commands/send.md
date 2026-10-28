@@ -19,6 +19,7 @@ Sends a task: work the recipient accepts, does and finishes with a result. It is
 - `--model M` suggests a model for the work (`opus`, `sonnet`...), a hint, never an order. The receiver's `rack pull` tags the task `agent-M`.
 - `--needs NAME,...` capabilities the recipient must have (repeatable, comma separated); checked against what it published before anything is sent.
 - `--force` sends even when a need is missing (with a warning). Only goes with `--needs`.
+- `--profile NAME` (main agent only, tasks only) the profile of the worker's local policy the task asks to run in (`[a-z0-9-]`, 1 to 32, lowercased). The worker's `rack policy decide` decides; the job never orders it. A worker that sets it gets `403 not_allowed`, and so does every agent on a server without roles.
 
 ## Examples
 
@@ -26,6 +27,7 @@ Sends a task: work the recipient accepts, does and finishes with a result. It is
 rack send windows "Run psport-probe" --body - --origin decanter#873 --attach probe.bat <<< "Run it and send the log."
 rack send windows "Profile the shader cache" --model opus --needs nvidia
 rack send windows "Profile the shader cache" --needs nvidia --force
+rack send win1 "Run the self-test" --profile app-test --body "Run it and send back the output."
 ```
 
 ## Prints
@@ -37,6 +39,7 @@ rack send windows "Profile the shader cache" --needs nvidia --force
 - Exit 3, nothing sent: the recipient lacks a capability named in `--needs`; the error names what is missing. Pick another agent, or ask the owner, and only then use `--force`. The check is advice: each agent writes its own list.
 - A usage error: `--force` without `--needs`, or an `--origin` not like `repo#id`.
 - `404`: unknown agent. `413`: body over 64 KiB.
+- `403 not_allowed` with `--profile`: you are not the main agent, or the server has no roles. `400` with `--profile`: not a task, or not a profile name. A server from before the field answers `400` naming `profile`; the hint says to update it.
 - A file that fails to upload leaves the job sent: rack says `retry with: rack attach JOB FILE`.
 
 ## Exit codes
@@ -48,7 +51,7 @@ rack send windows "Profile the shader cache" --needs nvidia --force
 
 ## MCP
 
-`racking_send` (`to`, `title`, `body`, optional `tags`, `origin`, `reply_to`, `kind`, `outcome`, `priority`, `model`, `needs`, `force`), then `racking_attach` for files.
+`racking_send` (`to`, `title`, `body`, optional `tags`, `origin`, `reply_to`, `kind`, `outcome`, `priority`, `model`, `needs`, `force`, `profile`), then `racking_attach` for files.
 
 ## Security
 

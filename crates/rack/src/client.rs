@@ -115,9 +115,41 @@ pub struct Job {
     /// How deep the job is in a chain of tasks, computed by the server; 0 from servers before it.
     #[serde(default)]
     pub hops: i64,
+    /// The local-policy profile a task asks for, set by its sender (only main may).
+    #[serde(default)]
+    pub profile: ProfileField,
     /// UTC, RFC 3339.
     #[serde(default)]
     pub created_at: Option<String>,
+}
+
+/// A job's `profile` as the server sent it. A server from before the field sends no key at all,
+/// which `rack policy decide` must tell apart from a job that names no profile: only for the
+/// first does it fall back to the old `Racking-Profile:` body line.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub enum ProfileField {
+    /// The server predates the field.
+    #[default]
+    Unsupported,
+    /// The job names no profile.
+    Absent,
+    Named(String),
+}
+
+impl ProfileField {
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            ProfileField::Named(n) => Some(n),
+            ProfileField::Unsupported | ProfileField::Absent => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ProfileField {
+    /// Only runs when the key is present; a missing key takes `Default`, `Unsupported`.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        Ok(Option::<String>::deserialize(d)?.map_or(ProfileField::Absent, ProfileField::Named))
+    }
 }
 
 /// One entry of `GET /agents`. `about`, `rack_version`, `os` and `capabilities`
@@ -336,9 +368,14 @@ impl Client {
                     .to_owned(),
             }),
             Err(e) => Err(older_server(
-                e,
-                "unknown field `model`",
-                "This Racking server predates the model hint; update racking-server, or send without a model.",
+                older_server(
+                    e,
+                    "unknown field `model`",
+                    "This Racking server predates the model hint; update racking-server, or send without a model.",
+                ),
+                "unknown field `profile`",
+                "This Racking server predates the profile field; update racking-server, or name the profile on the \
+                 first body line `Racking-Profile: NAME` (read only from main).",
             )),
             ok => ok,
         }
@@ -642,6 +679,24 @@ mod tests {
         assert_eq!(
             hint(older_server(other, "unknown field `model`", "update")),
             "See GET /help."
+        );
+    }
+
+    #[test]
+    fn a_missing_profile_key_is_an_older_server() {
+        let job = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({"id": "j1", "from": "a", "to": "b", "kind": "task", "title": "t",
+                "state": "sent", "seq": 1});
+            if let (Some(o), Some(e)) = (v.as_object_mut(), extra.as_object()) {
+                o.extend(e.clone());
+            }
+            serde_json::from_value::<Job>(v).map(|j| j.profile).expect("job")
+        };
+        assert_eq!(job(serde_json::json!({})), ProfileField::Unsupported);
+        assert_eq!(job(serde_json::json!({"profile": null})), ProfileField::Absent);
+        assert_eq!(
+            job(serde_json::json!({"profile": "app-test"})),
+            ProfileField::Named("app-test".to_owned())
         );
     }
 
