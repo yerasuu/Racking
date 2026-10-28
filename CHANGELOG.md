@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.2
+
+- Installers for Linux (`install/install.sh`) and Windows (`install/install.ps1`), also runnable straight from GitHub with a SHA-256 check.
+- Stable tags now publish prebuilt `rack` and `racking-mcp` for x86_64 Linux and Windows as GitHub releases.
+
 ## 0.2.1
 
 - `rack link --pair` says which directions cannot send between workers and which `[permissions]` entry would allow them.
