@@ -549,3 +549,51 @@ fn ask_through_mcp() {
     server.stop();
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn whoami_shows_links_and_a_pending_agent_gets_the_hint() {
+    let dir = std::env::temp_dir().join(format!("racking-mcp-link-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let config = racking_server::Config::parse(&format!(
+        "bind = \"127.0.0.1:0\"\ndata_dir = {:?}\n[agents.linux]\ntoken = \"{LINUX}\"\nrole = \"main\"\n\
+         admin = true\n[agents.windows]\ntoken = \"{WINDOWS}\"\n",
+        dir.join("data").display().to_string()
+    ))
+    .expect("config");
+    let server = racking_server::start(&config).expect("start");
+    let url = format!("http://{}", server.addr());
+    let admin = rack::client::Client::new(&url, LINUX).expect("client");
+    let made: Value = admin
+        .post("/admin/invites", Some(&json!({"name": "mac", "role": "worker"})))
+        .expect("invite");
+    let anonymous = rack::client::Client::new(&url, "").expect("client");
+    let joined: Value = anonymous
+        .post("/join", Some(&json!({"code": made["code"]})))
+        .expect("join");
+    let token = joined["token"].as_str().unwrap_or_default();
+
+    let mut mac = Mcp::spawn(&url, token, &dir.join("mac"));
+    let pending = mac.error("racking_whoami", json!({}));
+    assert!(
+        pending.contains("not_confirmed") && pending.contains("rack link"),
+        "{pending}"
+    );
+    let id = made["id"].as_i64().unwrap_or_default();
+    let _: Value = admin
+        .post(&format!("/admin/invites/{id}/confirm"), None)
+        .expect("confirm");
+    let me = mac.ok("racking_whoami", json!({}));
+    assert!(me.contains("Linked with: linux (invite), windows (config)."), "{me}");
+
+    let mut windows = Mcp::spawn(&url, WINDOWS, &dir.join("windows"));
+    let them = windows.ok("racking_whoami", json!({}));
+    assert!(
+        them.contains("mac (config)") && them.contains("linux (config)"),
+        "{them}"
+    );
+
+    mac.close();
+    windows.close();
+    server.stop();
+    let _ = fs::remove_dir_all(&dir);
+}

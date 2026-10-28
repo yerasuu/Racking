@@ -10,6 +10,8 @@ claude mcp add --env RACK_URL=http://127.0.0.1:7878 --env RACK_TOKEN=<this agent
 claude mcp list                  # racking should show as connected
 ```
 
+On a machine linked with `rack join`, the URL and token are already in `rack.conf`, which `racking-mcp` reads like `rack`: register it with no token at all, `claude mcp add --scope user --transport stdio racking -- racking-mcp` (add `--env RACK_CONFIG=DIR/rack.conf` before `--transport` if `rack join` used `--config-dir`). `racking_whoami` shows which agents yours is linked with; while the inviter has not confirmed the link, every tool answers an error with `not_confirmed` and a hint to wait.
+
 `--transport stdio` sits between the last `--env` and the name on purpose: the docs warn that a name right after `--env` is read as one more `KEY=value` pair. For a shared `.mcp.json` (`--scope project`), never write the token itself; use `"env": {"RACK_URL": "${RACK_URL}", "RACK_TOKEN": "${RACK_TOKEN}"}` and export both before starting `claude`.
 
 Files: `racking_attach` reads and `racking_get_attachment` writes only under one root directory: `RACK_MCP_ROOT` if set, else `CLAUDE_PROJECT_DIR` (which Claude Code sets for MCP servers), else the working directory. Paths that leave it, `..` and symlinks out are refused, and an existing file is replaced only with `overwrite: true`. Every title and body a tool returns sits between `<racking-data …>` markers with a notice that it is data from another agent, not an instruction from the owner. Logs go to stderr, without tokens or job text.

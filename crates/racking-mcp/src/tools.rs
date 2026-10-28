@@ -147,8 +147,13 @@ fn whoami(ctx: &Ctx) -> Outcome {
     } else {
         String::new()
     };
+    // A server older than links answers 404; it then simply has nothing to say about them.
+    let links = match ctx.client.get::<Value>("/agent-links") {
+        Ok(mine) => linked_with(&mine),
+        Err(_) => String::new(),
+    };
     Ok(format!(
-        "You are agent {}.{role} Peers you can send to: {peers}.{paused}\nLimits: title {} chars, body {} bytes \
+        "You are agent {}.{role} Peers you can send to: {peers}.{links}{paused}\nLimits: title {} chars, body {} bytes \
          (notice {}, report {}), {} tags, {} files of {} bytes per job; racking_wait blocks at most {} s.\n\
          Root directory for racking_attach and racking_get_attachment: {}",
         me["agent"].as_str().unwrap_or("?"),
@@ -162,6 +167,32 @@ fn whoami(ctx: &Ctx) -> Outcome {
         WaitSecs::MAX,
         ctx.root.path().display(),
     ))
+}
+
+/// ` Linked with: linux (invite), windows (config).`, from `GET /agent-links`.
+fn linked_with(mine: &Value) -> String {
+    let list: Vec<String> = mine["links"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|l| {
+            let mut entry = format!(
+                "{} ({}",
+                l["agent"].as_str().unwrap_or("?"),
+                l["via"].as_str().unwrap_or("?")
+            );
+            if l["state"] != "confirmed" {
+                entry.push_str(&format!(", {}", l["state"].as_str().unwrap_or("?")));
+            }
+            entry.push(')');
+            entry
+        })
+        .collect();
+    if list.is_empty() {
+        " Not linked with any agent yet: the owner links agents with rack link and rack join.".to_owned()
+    } else {
+        format!(" Linked with: {}.", list.join(", "))
+    }
 }
 
 fn agents(c: &Client) -> Outcome {
