@@ -3,12 +3,17 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 
 use crate::net::{self, Cidr};
 use crate::policy::{Role, SendRules};
 use crate::types::AgentName;
+
+/// The longest `shutdown_grace_secs`: past a minute a supervisor would kill the
+/// server anyway (Docker waits 10 s unless `stop_grace_period` says otherwise).
+const MAX_GRACE_SECS: u64 = 60;
 
 /// Tokens shorter than this are refused, so a placeholder or a typo cannot become a credential.
 const MIN_TOKEN_LEN: usize = 24;
@@ -24,6 +29,8 @@ struct RawConfig {
     allow_from: Option<Vec<String>>,
     #[serde(default)]
     trusted_proxies: Vec<String>,
+    #[serde(default = "default_grace")]
+    shutdown_grace_secs: u64,
     data_dir: PathBuf,
     agents: BTreeMap<String, RawAgent>,
     #[serde(default)]
@@ -49,6 +56,10 @@ struct RawAgent {
     role: Option<String>,
 }
 
+fn default_grace() -> u64 {
+    10
+}
+
 fn default_bind() -> String {
     "127.0.0.1:7878".to_owned()
 }
@@ -64,6 +75,9 @@ pub struct Config {
     /// Reverse proxies whose `X-Forwarded-For` names the client; empty trusts no
     /// forwarded header, which is right whenever clients reach the port directly.
     pub trusted_proxies: Vec<Cidr>,
+    /// How long a SIGTERM or SIGINT lets requests in flight finish before the
+    /// database is checkpointed and the server exits anyway.
+    pub shutdown_grace: Duration,
     pub data_dir: PathBuf,
     pub agents: Vec<Agent>,
     pub send_rules: SendRules,
@@ -137,6 +151,9 @@ impl Config {
             })
             .collect::<Result<Vec<Cidr>, String>>()
             .map_err(|e| format!("trusted_proxies: {e}"))?;
+        if raw.shutdown_grace_secs > MAX_GRACE_SECS {
+            return Err(format!("shutdown_grace_secs must be 0 to {MAX_GRACE_SECS}"));
+        }
         if raw.agents.len() < 2 {
             return Err("at least two agents are needed under [agents.NAME]".to_owned());
         }
@@ -190,6 +207,7 @@ impl Config {
             public_bind,
             allow_from,
             trusted_proxies,
+            shutdown_grace: Duration::from_secs(raw.shutdown_grace_secs),
             data_dir: raw.data_dir,
             agents,
             send_rules: SendRules::new(any_role || raw.permissions.is_some(), explicit),
@@ -281,6 +299,21 @@ mod tests {
         let err = with("[\"0.0.0.0/0\"]").err().unwrap_or_default();
         assert!(err.contains("trusted_proxies"), "{err}");
         assert!(with("[\"::/0\"]").is_err());
+    }
+
+    #[test]
+    fn shutdown_grace_defaults_to_ten_seconds() {
+        let agents = format!("[agents.a]\ntoken = \"{T1}\"\n[agents.b]\ntoken = \"{T2}\"\n");
+        assert_eq!(cfg(&agents).expect("config").shutdown_grace, Duration::from_secs(10));
+        let with = |secs: &str| {
+            Config::parse(&format!(
+                "shutdown_grace_secs = {secs}\ndata_dir = \"/tmp/x\"\n{agents}"
+            ))
+        };
+        assert_eq!(with("0").expect("config").shutdown_grace, Duration::ZERO);
+        assert_eq!(with("60").expect("config").shutdown_grace, Duration::from_secs(60));
+        assert!(with("61").is_err());
+        assert!(with("-1").is_err());
     }
 
     #[test]

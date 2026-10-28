@@ -17,6 +17,9 @@ sha2 = "0.10"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.4.5"
+
 [dev-dependencies]
 ureq = { version = "3", default-features = false, features = ["json"] }
 

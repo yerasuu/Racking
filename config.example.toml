@@ -24,6 +24,11 @@ bind = "127.0.0.1:7878"
 # Default: empty, X-Forwarded-For is ignored.
 # trusted_proxies = ["192.168.1.30"]
 
+# Seconds SIGTERM or SIGINT lets requests in flight finish before the server
+# saves the database and exits (0 to 60). Whatever stops the server must wait
+# longer: Docker waits 10 s unless compose.yaml sets stop_grace_period.
+# shutdown_grace_secs = 10
+
 # SQLite database and attachment files live here.
 data_dir = "/var/lib/racking"
 

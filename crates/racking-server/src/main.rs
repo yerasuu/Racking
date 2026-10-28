@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use racking_server::{Bootstrap, Redeemed, Waited};
+use racking_server::{Bootstrap, Redeemed, Shutdown, Waited};
 
 const USAGE: &str = "usage: racking-server --config PATH
        racking-server invite --config PATH [--role worker|main] [--name NAME] [--no-wait]
@@ -63,7 +63,17 @@ fn main() -> ExitCode {
                 agents = config.agents.len(),
                 "listening"
             );
-            running.join();
+            if let Err(e) = on_signal(running.shutdown_handle()) {
+                tracing::error!(target: "racking::server", error = %e, "cannot handle SIGTERM and SIGINT");
+                return ExitCode::FAILURE;
+            }
+            let stopped = running.shutdown();
+            tracing::info!(
+                target: "racking::server",
+                abandoned = stopped.abandoned,
+                checkpointed = stopped.checkpointed,
+                "stopped"
+            );
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -71,6 +81,40 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The first SIGTERM or SIGINT starts a graceful shutdown; a second one exits at
+/// once with 128 + the signal, as a shell reports a process killed by it.
+#[cfg(unix)]
+fn on_signal(shutdown: Shutdown) -> std::io::Result<()> {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    use signal_hook::flag;
+    use signal_hook::iterator::Signals;
+
+    let armed = Arc::new(AtomicBool::new(false));
+    for signal in [SIGTERM, SIGINT] {
+        // The exit must be registered before the flag that arms it, or the first signal would already find it
+        // armed ([signal-hook: register_conditional_shutdown](https://docs.rs/signal-hook/0.4.5/signal_hook/flag/fn.register_conditional_shutdown.html)).
+        flag::register_conditional_shutdown(signal, 128 + signal, Arc::clone(&armed))?;
+        flag::register(signal, Arc::clone(&armed))?;
+    }
+    let mut signals = Signals::new([SIGTERM, SIGINT])?;
+    std::thread::Builder::new().name("signals".to_owned()).spawn(move || {
+        if let Some(signal) = signals.forever().next() {
+            tracing::info!(target: "racking::server", signal, "signal received; a second one exits at once");
+            shutdown.begin();
+        }
+    })?;
+    Ok(())
+}
+
+/// The server runs on Unix only; elsewhere it serves until killed.
+#[cfg(not(unix))]
+fn on_signal(_shutdown: Shutdown) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// The options of `invite`, read once.

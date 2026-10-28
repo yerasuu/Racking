@@ -137,7 +137,7 @@ Delivery: an inbox answer that lists a notice, message or report still `sent` mo
 
 `GET /inbox?...&peek=1` lists the same jobs without delivering them: nothing moves to `received` and the sender's outbox does not change. It is for a client that only counts what is waiting (`rack inbox --unread --count`, used by the stop hook in `docs/hooks/`) and must leave the jobs new for the agent that reads them. `peek=0` is the default; any other value answers `400 bad_request`. `/inbox/wait` has no peek: it is how an agent receives.
 
-`GET /inbox/wait?since=<seq>&timeout=<s>` blocks until a job with `seq > since` exists or the timeout ends. `timeout` default 25, maximum 55 (under common proxy limits). Answer is the same shape as `/inbox`. An empty list with the same `next` means timeout: call again. This is how an agent sleeps until work arrives.
+`GET /inbox/wait?since=<seq>&timeout=<s>` blocks until a job with `seq > since` exists or the timeout ends. `timeout` default 25, maximum 55 (under common proxy limits). Answer is the same shape as `/inbox`. An empty list with the same `next` means timeout: call again. This is how an agent sleeps until work arrives. When the server shuts down, a waiting call answers at once the same way, and the next call reaches the restarted server.
 
 ## Presence
 

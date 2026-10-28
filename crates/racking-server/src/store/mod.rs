@@ -6,7 +6,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
@@ -475,6 +475,9 @@ pub struct Download {
 struct Changes {
     version: Mutex<u64>,
     cv: Condvar,
+    /// Set once at shutdown: every wait returns at once, so in-flight long polls
+    /// do not hold the shutdown for their whole timeout.
+    closing: AtomicBool,
 }
 
 impl Changes {
@@ -488,10 +491,21 @@ impl Changes {
         self.cv.notify_all();
     }
 
-    /// Sleeps until the version moves past `seen` or `deadline` passes.
+    fn close(&self) {
+        self.closing.store(true, Ordering::Relaxed);
+        // Taken so that a waiter between its check of `closing` and its sleep cannot miss the notification.
+        let _v = self.version.lock().unwrap_or_else(PoisonError::into_inner);
+        self.cv.notify_all();
+    }
+
+    fn closing(&self) -> bool {
+        self.closing.load(Ordering::Relaxed)
+    }
+
+    /// Sleeps until the version moves past `seen`, `deadline` passes or the store closes.
     fn wait_past(&self, seen: u64, deadline: Instant) {
         let mut v = self.version.lock().unwrap_or_else(PoisonError::into_inner);
-        while *v == seen {
+        while *v == seen && !self.closing() {
             let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
                 return;
             };
@@ -615,11 +629,34 @@ impl Store {
             changes: Changes {
                 version: Mutex::new(0),
                 cv: Condvar::new(),
+                closing: AtomicBool::new(false),
             },
             tmp_counter: AtomicU64::new(0),
             last_purge: AtomicI64::new(0),
             open_task_limit: SenderLimits::default().open_tasks_per_pair,
         })
+    }
+
+    /// Wakes every long poll for good, at shutdown.
+    pub fn close_waits(&self) {
+        self.changes.close();
+    }
+
+    /// Whether the server is shutting down, for the waits that poll instead of sleeping on `wait`.
+    pub fn closing(&self) -> bool {
+        self.changes.closing()
+    }
+
+    /// Moves the whole WAL into the database and empties it, so a stopped server
+    /// leaves one self-contained file behind. Returns whether SQLite reported the
+    /// checkpoint as blocked, and the WAL pages it moved
+    /// ([SQLite: wal_checkpoint](https://www.sqlite.org/pragma.html#pragma_wal_checkpoint)).
+    pub fn checkpoint(&self) -> Result<(bool, i64), String> {
+        self.db()
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get::<_, i64>(0)? != 0, row.get::<_, i64>(2)?))
+            })
+            .map_err(|e| format!("cannot checkpoint the database: {e}"))
     }
 
     pub fn open_task_limit(&self) -> u32 {
@@ -1029,8 +1066,9 @@ impl Store {
         Ok(Listing { jobs, next })
     }
 
-    /// Runs `list` until it returns jobs or `deadline` passes. The change version
-    /// is read before each query so a change between query and sleep is not missed.
+    /// Runs `list` until it returns jobs, `deadline` passes or the server shuts
+    /// down. The change version is read before each query so a change between
+    /// query and sleep is not missed.
     pub fn wait<F>(&self, deadline: Instant, mut list: F) -> ApiResult<Listing>
     where
         F: FnMut(&Self) -> ApiResult<Listing>,
@@ -1038,7 +1076,7 @@ impl Store {
         loop {
             let seen = self.changes.current();
             let listing = list(self)?;
-            if !listing.jobs.is_empty() || Instant::now() >= deadline {
+            if !listing.jobs.is_empty() || Instant::now() >= deadline || self.changes.closing() {
                 return Ok(listing);
             }
             self.changes.wait_past(seen, deadline);
@@ -2274,6 +2312,43 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(5),
             "woken, not timed out"
         );
+    }
+
+    #[test]
+    fn closing_ends_every_wait_and_the_checkpoint_empties_the_wal() {
+        let (dir, s) = store();
+        let s = std::sync::Arc::new(s);
+        let (linux, windows) = (agent("linux"), agent("windows"));
+        s.create_job(&linux, task("linux")).expect("create");
+        let started = Instant::now();
+        let waiter = {
+            let s = std::sync::Arc::clone(&s);
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + std::time::Duration::from_secs(30);
+                s.wait(deadline, |st| st.inbox(&windows, Seq::new(0), None, 10))
+                    .map(|l| l.jobs.len())
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        s.close_waits();
+        assert_eq!(waiter.join().expect("join").expect("wait"), 0);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "woken by closing"
+        );
+        let later = Instant::now() + std::time::Duration::from_secs(30);
+        assert!(
+            s.wait(later, |st| st.inbox(&agent("windows"), Seq::new(0), None, 10))
+                .is_ok()
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a new wait returns at once too"
+        );
+        let (busy, _moved) = s.checkpoint().expect("checkpoint");
+        assert!(!busy);
+        let wal = dir.0.join("racking.db-wal");
+        assert_eq!(std::fs::metadata(wal).map(|m| m.len()).unwrap_or(0), 0);
     }
 
     #[test]

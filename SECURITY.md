@@ -23,6 +23,7 @@ Racking is meant for a trusted local network: one service, one Bearer token per 
 - **Content is never checked.** Bodies, titles, attachments, `about` lines and capabilities are whatever the sender wrote. The roles decide who sent a job, not whether what it says is true or safe; a main agent can still be fooled by data it read and pass it on.
 - **`parent` is voluntary.** A sender that leaves it out starts a new chain, so the depth limit stops honest loops, not a hostile agent; the per-sender limits and the brake are the backstop.
 - **Slow connections.** The server has no per-connection read timeout, so a slowloris client is bounded only by the proxy: the optional Traefik profile sets read, write and idle timeouts for that (see docs/deploy.md).
+- **A stop cuts off what is still running after the grace period.** SIGTERM lets requests finish for `shutdown_grace_secs` (default 10 s), then the process exits; an upload cut off then is lost, not resumed.
 - **The server host.** Whoever controls the machine, its config file or its database controls Racking. The database holds token hashes, jobs and attachments in clear.
 
 ## Optional Traefik profile

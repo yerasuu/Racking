@@ -47,7 +47,7 @@ Agents are the `[agents.*]` sections of the config: give each machine its URL an
 git pull && docker compose build && docker compose up -d
 ```
 
-The volume and the config are kept. The server does not handle SIGTERM. The compose file runs it with `init: true` ([compose init](https://docs.docker.com/reference/compose-file/services/#init)), so the stop signal reaches the process and ends it at once (Podman test: 0.06 s, against the full timeout without init) and `stop_grace_period` is 15 s. A kill loses at most the requests in flight; the SQLite docs say that the next connection to open the database after a crash runs recovery ([SQLite WAL](https://www.sqlite.org/wal.html)), though they do not state it for a killed process specifically.
+The volume and the config are kept. A stop sends SIGTERM and the server shuts down gracefully ([Stopping](#stopping)): it stops accepting, lets requests in flight finish and checkpoints SQLite. The compose file also runs it with `init: true` ([compose init](https://docs.docker.com/reference/compose-file/services/#init)), so the signal reaches the process even as PID 1, and `stop_grace_period` is 15 s, longer than the server's own 10 s grace. After a kill the SQLite docs say the next connection to open the database runs recovery ([SQLite WAL](https://www.sqlite.org/wal.html)), though they do not state it for a killed process specifically.
 
 ### Backup
 
@@ -145,6 +145,18 @@ To turn it on, with the Traefik route only (`compose.traefik.yaml` removes the h
 2. Put it in `config/server.toml`: `trusted_proxies = ["172.18.0.0/16"]` (your subnet), and `docker compose restart racking`. The log line of each request then shows `peer=` (Traefik) and `client=` (the real address), and the `/join` lockout counts each client on its own.
 
 Never set `trusted_proxies` while the port is also published on the host (the default `compose.yaml`): Docker NATs those connections, which can then arrive from the network's gateway, inside that subnet, and every LAN client would be trusted to name its own address. The subnet changes if the network is recreated; check it after `docker compose down`. Not tested with Docker here (no Docker on the test machine); the server side is covered by the integration tests on loopback.
+
+## Stopping
+
+On SIGTERM (`docker compose stop`, `systemctl --user stop`) or SIGINT (Ctrl-C), the server:
+
+1. stops taking requests and closes its port; long polls (`/inbox/wait`, `/outbox/wait` and the pairing waits) answer at once with what they have, so clients call again after the restart;
+2. lets the requests already running finish for up to `shutdown_grace_secs` (config, default 10, at most 60);
+3. moves SQLite's write-ahead log into the database and empties it (`PRAGMA wal_checkpoint(TRUNCATE)`, [SQLite: wal_checkpoint](https://www.sqlite.org/pragma.html#pragma_wal_checkpoint)), and exits with status 0. Each step is logged.
+
+A request still running when the grace period ends, such as a slow upload, is cut off: nothing of it is kept, and the client uploads again. A second SIGTERM or SIGINT exits at once with status 143 or 130; SQLite's WAL then recovers at the next start, as after a crash.
+
+The supervisor must wait longer than the grace period, or it kills the server before the checkpoint. Docker waits 10 s by default, the same as the default grace period: with the default, set `stop_grace_period: 15s` on the `racking` service in `compose.yaml` (or lower `shutdown_grace_secs`), and keep it above `shutdown_grace_secs` plus a few seconds if you raise that ([Compose: stop_grace_period](https://docs.docker.com/reference/compose-file/services/#stop_grace_period)). systemd waits `TimeoutStopSec=`, which defaults to `DefaultTimeoutStopSec=`, 90 s in the user manager too, and is enough ([systemd.service](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html), [systemd-system.conf](https://www.freedesktop.org/software/systemd/man/latest/systemd-system.conf.html)).
 
 ## Linking a new machine
 

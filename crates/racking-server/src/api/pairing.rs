@@ -199,7 +199,7 @@ pub(super) fn get_invite(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
                 "GET /admin/invites lists the pending ones.",
             )
         })?;
-        if invite.state != InviteState::Open || Instant::now() >= deadline {
+        if invite.state != InviteState::Open || Instant::now() >= deadline || app.store.closing() {
             return ok(invite.to_json());
         }
         std::thread::sleep(POLL);
@@ -385,7 +385,7 @@ pub(super) fn join_status(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
             .invite_by_token(&digest, now)?
             .ok_or_else(|| ApiError::new(Code::BadToken, "unknown token", super::AUTH_HINT))?;
         let state = match invite.state {
-            InviteState::Redeemed if Instant::now() < deadline => {
+            InviteState::Redeemed if Instant::now() < deadline && !app.store.closing() => {
                 std::thread::sleep(POLL);
                 continue;
             }

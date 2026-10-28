@@ -785,6 +785,27 @@ impl App {
         })
     }
 
+    /// Counts a request in before its thread starts, so a shutdown that waits for
+    /// `in_flight` to reach zero cannot miss one that is about to run. Returns the
+    /// count with this request; `handle` or `leave` counts it out.
+    pub fn enter(&self) -> usize {
+        self.in_flight.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Counts out a request that `enter` counted and `handle` never got.
+    pub fn leave(&self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+
+    /// Starts the shutdown on the request side: every long poll returns now.
+    pub fn close(&self) {
+        self.store.close_waits();
+    }
+
     fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Relaxed)
     }
@@ -884,10 +905,10 @@ enum Reply {
 
 const AUTH_HINT: &str = "Send `Authorization: Bearer <token>`; ask the owner of the server for your agent's token.";
 
-/// Serves one request end to end and logs one line for it.
-pub fn handle(app: &App, mut request: Request) {
+/// Serves one request end to end and logs one line for it. `in_flight` is what
+/// `App::enter` returned for it; the request is counted out once answered.
+pub fn handle(app: &App, mut request: Request, in_flight: usize) {
     let started = Instant::now();
-    let in_flight = app.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
     let method = request.method().to_string();
     let url = request.url().to_owned();
     // The one place the forwarded header is read, so nothing further in can trust it by mistake.
@@ -906,7 +927,7 @@ pub fn handle(app: &App, mut request: Request) {
     if let Err(e) = request.respond(response) {
         tracing::debug!(target: "racking::http", error = %e, "client went away before the answer");
     }
-    app.in_flight.fetch_sub(1, Ordering::AcqRel);
+    app.leave();
     tracing::info!(
         target: "racking::http",
         agent = agent.as_ref().map_or("-", AgentName::as_str),
