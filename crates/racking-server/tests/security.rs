@@ -24,8 +24,12 @@ struct Server {
 }
 
 impl Server {
-    /// `extra` is the config after `bind` and `data_dir`: agents and any other section.
+    /// `extra` is the config after `bind` and `data_dir`: top-level keys first, then agents and other sections.
     fn start(extra: &str) -> Self {
+        Self::start_with(extra, racking_server::Clock::system())
+    }
+
+    fn start_with(extra: &str, clock: racking_server::Clock) -> Self {
         static RUNS: AtomicUsize = AtomicUsize::new(0);
         let run = RUNS.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("racking-sec-{}-{run}", std::process::id()));
@@ -35,7 +39,7 @@ impl Server {
             dir.display().to_string()
         ))
         .expect("config");
-        let running = racking_server::start(&config).expect("start");
+        let running = racking_server::start_with_clock(&config, clock).expect("start");
         let base = format!("http://{}", running.addr());
         let http = ureq::Agent::config_builder()
             .http_status_as_error(false)
@@ -77,6 +81,22 @@ impl Drop for Server {
         }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// The `Retry-After` header of a `POST /jobs`, with the status.
+fn retry_after(s: &Server, token: &str, job: Value) -> (u16, Option<String>) {
+    let resp = s
+        .http
+        .post(format!("{}/jobs", s.base))
+        .header("Authorization", format!("Bearer {token}"))
+        .send_json(job)
+        .expect("http");
+    let header = resp
+        .headers()
+        .get("Retry-After")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    (resp.status().as_u16(), header)
 }
 
 fn code(v: &Value) -> &str {
@@ -126,6 +146,51 @@ fn roles_decide_who_may_send() {
         })
         .unwrap_or_default();
     assert_eq!(roles, [("boss", "main"), ("w1", "worker"), ("w2", "worker")]);
+}
+
+#[test]
+fn jobs_per_minute_follow_the_clock() {
+    let clock = racking_server::Clock::manual(6_000);
+    let s = Server::start_with(&format!("{ROLES}[limits]\njobs_per_minute = 2\n"), clock.clone());
+    let note = || json!({"to": "boss", "kind": "notice", "body": "tick"});
+    assert_eq!(s.send(W1, note()).0, 201);
+    assert_eq!(s.send(W1, note()).0, 201);
+    clock.advance(20);
+    assert_eq!(retry_after(&s, W1, note()), (429, Some("40".to_owned())));
+    let (_, err) = s.send(W1, note());
+    assert_eq!(code(&err), "rate_limited");
+    assert_eq!(s.send(W2, note()).0, 201, "the limit is per sender");
+    clock.advance(40);
+    assert_eq!(s.send(W1, note()).0, 201, "a new minute");
+    let (_, me) = s.call("GET", "/whoami", W1, None);
+    assert_eq!(me["limits"]["jobs_per_minute"], 2);
+    assert_eq!(me["limits"]["open_tasks_per_pair"], 20);
+}
+
+#[test]
+fn chains_of_tasks_stop_at_three_hops() {
+    let s = Server::start(ROLES);
+    let (_, mut last) = s.send(BOSS, json!({"to": "w1", "title": "t0", "body": "x"}));
+    let tokens = [W1, BOSS, W1];
+    for (n, token) in tokens.into_iter().enumerate() {
+        let to = if token == W1 { "boss" } else { "w1" };
+        let (status, job) = s.send(
+            token,
+            json!({"to": to, "title": "deeper", "reply_to": last["id"], "hops": 0}),
+        );
+        assert_eq!((status, job["hops"].as_u64()), (201, Some(n as u64 + 1)), "{job}");
+        last = job;
+    }
+    let (status, err) = s.send(BOSS, json!({"to": "w1", "title": "t4", "reply_to": last["id"]}));
+    assert_eq!((status, code(&err)), (409, "too_deep"));
+    let (status, err) = s.send(BOSS, json!({"to": "w1", "title": "t", "hops": 4}));
+    assert_eq!((status, code(&err)), (400, "bad_request"));
+    let (status, job) = s.send(BOSS, json!({"to": "w1", "title": "t", "hops": 2}));
+    assert_eq!(
+        (status, job["hops"].as_u64()),
+        (201, Some(2)),
+        "a root job may say it is deeper"
+    );
 }
 
 #[test]

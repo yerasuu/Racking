@@ -31,3 +31,8 @@ token = "CHANGE-ME-windows-token"
 # Each sender listed here may send to exactly the agents in its list instead.
 # [permissions]
 # send = { windows = ["linux", "mac"] }
+
+# Per-sender guards against an agent that sends without end (defaults shown).
+# [limits]
+# open_tasks_per_pair = 20   # tasks still open from one sender to one recipient
+# jobs_per_minute = 60       # jobs of any kind one sender creates per minute

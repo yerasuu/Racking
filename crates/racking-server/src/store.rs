@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::clock;
+use crate::config::SenderLimits;
 use crate::error::{ApiError, ApiResult, Code};
 use crate::policy::Role;
 use crate::presence;
@@ -48,6 +49,9 @@ pub mod limits {
     pub const LIST_MAX: u32 = 200;
     pub const REASON_CHARS: usize = 2000;
     pub const LINK_FIELD_CHARS: usize = 200;
+    /// How far a chain of jobs may go from the job that started it, so agents that
+    /// answer each other with new tasks stop before they loop.
+    pub const MAX_HOPS: u8 = 3;
     /// Idempotency records live this long, per the protocol.
     pub const IDEMPOTENCY_TTL_SECS: i64 = 24 * 3600;
     /// Closed jobs (done, rejected, failed) are kept this long, per the protocol.
@@ -281,6 +285,11 @@ pub struct NewJob {
     pub model: Option<String>,
     /// The sender's role when it sent the job, from the server config; never from the request.
     pub from_role: Role,
+    /// What the sender says for a job with no `reply_to` or `parent`; the store
+    /// computes it from those when they are set.
+    pub hops: u8,
+    /// The job this one follows from, besides any `reply_to`; the sender must be one of its parties.
+    pub parent: Option<JobId>,
 }
 
 pub struct Attachment {
@@ -336,6 +345,8 @@ pub struct Job {
     pub model: Option<String>,
     /// `main` or `worker`; null for a job stored before roles existed.
     pub from_role: Option<String>,
+    pub hops: u8,
+    pub parent: Option<JobId>,
     pub attachments: Vec<Attachment>,
 }
 
@@ -361,6 +372,8 @@ impl Job {
             "expects_reply": self.expects_reply,
             "model": self.model,
             "from_role": self.from_role,
+            "hops": self.hops,
+            "parent": self.parent.map(|j| j.to_string()),
         });
         if let Some(obj) = v.as_object_mut() {
             let mut insert = |k: &str, value: Value| obj.insert(k.to_owned(), value);
@@ -483,13 +496,13 @@ impl Changes {
 
 const JOB_COLUMNS: &str = "id, from_agent, to_agent, kind, title, body, length(CAST(body AS BLOB)), tags, origin, \
                            reply_to, outcome, reason, state, created_at, updated_at, seq, updated_seq, priority, \
-                           expects_reply, model, from_role";
+                           expects_reply, model, from_role, hops, parent";
 /// The body column must agree with `Kind::inlines`, `limits::INLINE_BYTES` and `limits::PREVIEW_CHARS`.
 const SUMMARY_COLUMNS: &str = "id, from_agent, to_agent, kind, title, \
                                CASE WHEN kind IN ('message', 'notice') AND length(CAST(body AS BLOB)) <= 4096 \
                                THEN body ELSE substr(body, 1, 200) END, length(CAST(body AS BLOB)), \
                                tags, origin, reply_to, outcome, reason, state, created_at, updated_at, seq, updated_seq, \
-                               priority, expects_reply, model, from_role";
+                               priority, expects_reply, model, from_role, hops, parent";
 
 const SCHEMA: &str = "
 PRAGMA journal_mode = WAL;
@@ -515,7 +528,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     priority TEXT NOT NULL DEFAULT 'normal',
     expects_reply INTEGER NOT NULL DEFAULT 0,
     model TEXT,
-    from_role TEXT
+    from_role TEXT,
+    hops INTEGER NOT NULL DEFAULT 0,
+    parent INTEGER
 ) STRICT;
 CREATE INDEX IF NOT EXISTS jobs_inbox ON jobs (to_agent, seq);
 CREATE INDEX IF NOT EXISTS jobs_outbox ON jobs (from_agent, updated_seq);
@@ -565,6 +580,8 @@ pub struct Store {
     changes: Changes,
     tmp_counter: AtomicU64,
     last_purge: AtomicI64,
+    /// `[limits] open_tasks_per_pair`, counted from the jobs table so it survives restarts.
+    open_task_limit: u32,
 }
 
 impl Store {
@@ -593,7 +610,18 @@ impl Store {
             },
             tmp_counter: AtomicU64::new(0),
             last_purge: AtomicI64::new(0),
+            open_task_limit: SenderLimits::default().open_tasks_per_pair,
         })
+    }
+
+    pub fn open_task_limit(&self) -> u32 {
+        self.open_task_limit
+    }
+
+    #[must_use]
+    pub fn with_open_task_limit(mut self, limit: u32) -> Self {
+        self.open_task_limit = limit;
+        self
     }
 
     /// A panic while holding the lock cannot leave a transaction open (it rolls
@@ -606,8 +634,19 @@ impl Store {
         let mut conn = self.db();
         let tx = conn.transaction()?;
         let now = clock::now();
+        let mut chained = None;
+        if let Some(parent_id) = new.parent {
+            let parent = load_job(&tx, parent_id, View::Summary)?;
+            if !parent.is_party(me) {
+                return Err(not_yours(&parent));
+            }
+            chained = Some(parent.hops.saturating_add(1));
+        }
         if let Some(reply_id) = new.reply_to {
             let original = load_job(&tx, reply_id, View::Summary)?;
+            // Only a task starts new work; a message, comment or result answers within its chain's depth.
+            let step = u8::from(new.kind == Kind::Task);
+            chained = chained.max(Some(original.hops.saturating_add(step)));
             if !original.is_party(me) {
                 return Err(not_yours(&original));
             }
@@ -663,6 +702,35 @@ impl Store {
                 apply_move(&tx, &original, Move::Finish(outcome), None, now)?;
             }
         }
+        let hops = chained.unwrap_or(new.hops);
+        if hops > limits::MAX_HOPS {
+            return Err(ApiError::new(
+                Code::TooDeep,
+                format!("this job would be {hops} hops deep, over {}", limits::MAX_HOPS),
+                "The chain of tasks is too long: report back to whoever started it (a result, comment or message) \
+                 instead of sending another task.",
+            ));
+        }
+        if new.kind == Kind::Task {
+            let open: u32 = tx.query_row(
+                "SELECT count(*) FROM jobs WHERE from_agent = ?1 AND to_agent = ?2 AND kind = 'task' \
+                 AND state IN ('sent', 'received', 'accepted')",
+                params![me.as_str(), new.to.as_str()],
+                |row| row.get(0),
+            )?;
+            if open >= self.open_task_limit {
+                return Err(ApiError::new(
+                    Code::RateLimited,
+                    format!("{} tasks from {me} to {} are still open", open, new.to),
+                    format!(
+                        "At most {} open tasks per sender and recipient: wait until some are done, failed or \
+                         rejected, or cancel ones still sent.",
+                        self.open_task_limit
+                    ),
+                )
+                .with_retry_after(60));
+            }
+        }
         let seq = bump_counter(&tx, &format!("inbox:{}", new.to))?;
         let updated_seq = bump_counter(&tx, "updated")?;
         let tags = serde_json::to_string(&new.tags).map_err(|e| ApiError::internal("encode tags", &e))?;
@@ -675,8 +743,8 @@ impl Store {
         let outcome = (new.kind == Kind::Result).then(|| new.outcome.unwrap_or(Outcome::Done).state().as_str());
         tx.execute(
             "INSERT INTO jobs (from_agent, to_agent, kind, title, body, tags, origin, reply_to, outcome, state, \
-             created_at, updated_at, seq, updated_seq, priority, expects_reply, model, from_role) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'sent', ?10, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             created_at, updated_at, seq, updated_seq, priority, expects_reply, model, from_role, hops, parent) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'sent', ?10, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 me.as_str(),
                 new.to.as_str(),
@@ -693,7 +761,9 @@ impl Store {
                 new.priority.as_str(),
                 new.expects_reply,
                 new.model,
-                new.from_role.as_str()
+                new.from_role.as_str(),
+                hops,
+                new.parent.map(JobId::get)
             ],
         )?;
         let id = JobId::new(tx.last_insert_rowid());
@@ -1381,8 +1451,13 @@ fn add_reply_columns(conn: &Connection) -> rusqlite::Result<()> {
 /// Databases made before the model hint and capabilities lack those columns.
 /// Both are nullable and null means "none", so old rows need no update.
 const HINT_COLUMNS: &[(&str, &str, &str)] = &[("jobs", "model", "TEXT"), ("agents", "capabilities", "TEXT")];
-/// Databases made before roles lack `from_role`; null there means the job predates roles, so it is data.
-const ROLE_COLUMNS: &[(&str, &str, &str)] = &[("jobs", "from_role", "TEXT")];
+/// Databases made before roles lack `from_role`, `hops` and `parent`; old jobs
+/// count as roots, and a null `from_role` means the job predates roles, so it is data.
+const ROLE_COLUMNS: &[(&str, &str, &str)] = &[
+    ("jobs", "from_role", "TEXT"),
+    ("jobs", "hops", "INTEGER NOT NULL DEFAULT 0"),
+    ("jobs", "parent", "INTEGER"),
+];
 
 /// Adds each `(table, column, declaration)` a database lacks. Every declaration
 /// is nullable or has a default, so old rows need no update.
@@ -1484,6 +1559,8 @@ fn job_from_row(row: &Row<'_>) -> rusqlite::Result<Job> {
         expects_reply: row.get(18)?,
         model: row.get(19)?,
         from_role: row.get(20)?,
+        hops: row.get(21)?,
+        parent: row.get::<_, Option<i64>>(22)?.map(JobId::new),
         attachments: Vec::new(),
     })
 }
@@ -1540,6 +1617,8 @@ mod tests {
             expects_reply: true,
             model: None,
             from_role: Role::Worker,
+            hops: 0,
+            parent: None,
         }
     }
 
@@ -1848,6 +1927,77 @@ mod tests {
         assert_eq!(inbox["jobs"][1]["model"], "opus", "summaries carry it too");
         drop(s);
         Store::open(&dir.0).expect("opening twice is fine");
+    }
+
+    #[test]
+    fn chain_depth_comes_from_the_stored_parent() {
+        let (_dir, s) = store();
+        let (linux, windows) = (agent("linux"), agent("windows"));
+        let root = s.create_job(&linux, task("windows")).expect("root");
+        assert_eq!(root.hops, 0);
+        // Each side answers the other's task with a new task: one hop deeper each time.
+        let mut last = root;
+        for (n, (me, to)) in [(&windows, "linux"), (&linux, "windows"), (&windows, "linux")]
+            .into_iter()
+            .enumerate()
+        {
+            let next = NewJob {
+                reply_to: Some(last.id),
+                hops: 0,
+                ..task(to)
+            };
+            last = s.create_job(me, next).expect("deeper task");
+            assert_eq!(usize::from(last.hops), n + 1, "the client's 0 is ignored");
+        }
+        let too_deep = NewJob {
+            reply_to: Some(last.id),
+            ..task("windows")
+        };
+        let err = s.create_job(&linux, too_deep).err().map(|e| e.code);
+        assert_eq!(err, Some(Code::TooDeep));
+        let comment = NewJob {
+            reply_to: Some(last.id),
+            ..delivery(Kind::Comment, "windows", "stopping here")
+        };
+        let comment = s.create_job(&linux, comment).expect("a comment keeps the depth");
+        assert_eq!(comment.hops, 3);
+
+        let fresh = s.create_job(&windows, task("linux")).expect("root");
+        let follow = NewJob {
+            parent: Some(fresh.id),
+            ..task("linux")
+        };
+        let follow = s.create_job(&windows, follow).expect("parent");
+        assert_eq!((follow.hops, follow.parent), (1, Some(fresh.id)));
+        assert_eq!(follow.to_json(View::Summary)["parent"], fresh.id.to_string());
+        let outsider = NewJob {
+            parent: Some(fresh.id),
+            ..task("windows")
+        };
+        let err = s.create_job(&agent("mac"), outsider).err().map(|e| e.code);
+        assert_eq!(err, Some(Code::NotYours), "a parent must be the sender's own job");
+    }
+
+    #[test]
+    fn open_tasks_per_pair_are_capped() {
+        let dir = TempDir::new();
+        let s = Store::open(&dir.0).expect("open").with_open_task_limit(2);
+        let (linux, windows) = (agent("linux"), agent("windows"));
+        let first = s.create_job(&linux, task("windows")).expect("1");
+        s.create_job(&linux, task("windows")).expect("2");
+        let err = s.create_job(&linux, task("windows")).err();
+        assert_eq!(
+            err.as_ref().map(|e| (e.code, e.retry_after)),
+            Some((Code::RateLimited, Some(60)))
+        );
+        s.create_job(&linux, delivery(Kind::Message, "windows", "hi"))
+            .expect("messages are not tasks");
+        s.create_job(&windows, task("linux"))
+            .expect("the other direction is another pair");
+        s.move_job(&windows, first.id, Move::Reject, Some("no"))
+            .expect("reject");
+        s.create_job(&linux, task("windows"))
+            .expect("a closed task frees a slot");
     }
 
     fn store() -> (TempDir, Store) {

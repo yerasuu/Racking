@@ -13,6 +13,7 @@ pub enum Code {
     NotAllowed,
     NotFound,
     BadTransition,
+    TooDeep,
     AttachmentsLocked,
     TooLarge,
     ChecksumMismatch,
@@ -23,7 +24,7 @@ pub enum Code {
 
 impl Code {
     /// Every code with its status and meaning, in the order `/help` lists them.
-    pub const ALL: [(Code, &'static str); 14] = [
+    pub const ALL: [(Code, &'static str); 15] = [
         (
             Code::BadRequest,
             "Malformed JSON or field out of range. `message` names the field.",
@@ -52,6 +53,11 @@ impl Code {
             "State move not allowed, e.g. accepting a message or replying to a notice.",
         ),
         (
+            Code::TooDeep,
+            "The job would be more than 3 hops from the job that started its chain (a task sent as a reply, or a \
+             job with `parent`). Answer the original sender instead of starting another task.",
+        ),
+        (
             Code::AttachmentsLocked,
             "The job is no longer `sent`, attachments are fixed; or it is a notice, which carries no files.",
         ),
@@ -61,7 +67,11 @@ impl Code {
             Code::IdempotencyConflict,
             "Same `Idempotency-Key` used for a different request.",
         ),
-        (Code::RateLimited, "Too many requests in flight."),
+        (
+            Code::RateLimited,
+            "Too many requests in flight, too many jobs this minute, or too many open tasks to one agent. Wait \
+             `Retry-After` seconds.",
+        ),
         (Code::Internal, "Storage or disk failure on the server."),
     ];
 
@@ -71,7 +81,7 @@ impl Code {
             Code::NoToken | Code::BadToken => 401,
             Code::NotYours | Code::NotAdmin | Code::NotAllowed => 403,
             Code::NotFound => 404,
-            Code::BadTransition | Code::AttachmentsLocked => 409,
+            Code::BadTransition | Code::TooDeep | Code::AttachmentsLocked => 409,
             Code::TooLarge => 413,
             Code::ChecksumMismatch | Code::IdempotencyConflict => 422,
             Code::RateLimited => 429,
@@ -89,6 +99,7 @@ impl Code {
             Code::NotAllowed => "not_allowed",
             Code::NotFound => "not_found",
             Code::BadTransition => "bad_transition",
+            Code::TooDeep => "too_deep",
             Code::AttachmentsLocked => "attachments_locked",
             Code::TooLarge => "too_large",
             Code::ChecksumMismatch => "checksum_mismatch",
@@ -104,6 +115,8 @@ pub struct ApiError {
     pub code: Code,
     pub message: String,
     pub hint: String,
+    /// Seconds for the `Retry-After` header of a 429 or 503.
+    pub retry_after: Option<u64>,
 }
 
 impl ApiError {
@@ -112,7 +125,14 @@ impl ApiError {
             code,
             message: message.into(),
             hint: hint.into(),
+            retry_after: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_retry_after(mut self, secs: u64) -> Self {
+        self.retry_after = Some(secs);
+        self
     }
 
     pub fn bad_request(message: impl Into<String>) -> Self {

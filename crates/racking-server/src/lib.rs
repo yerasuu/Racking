@@ -9,6 +9,7 @@ mod dist;
 mod error;
 mod policy;
 mod presence;
+mod rate;
 mod registry;
 pub mod release;
 mod store;
@@ -64,7 +65,7 @@ pub fn start(config: &Config) -> Result<Running, String> {
 ///
 /// As `start`.
 pub fn start_with_clock(config: &Config, clock: Clock) -> Result<Running, String> {
-    let store = store::Store::open(&config.data_dir)?;
+    let store = store::Store::open(&config.data_dir)?.with_open_task_limit(config.limits.open_tasks_per_pair);
     let dist = dist::Dist::open(&config.data_dir)?;
     let app = Arc::new(api::App::new(config, store, dist, clock)?);
     let server = tiny_http::Server::http(config.bind).map_err(|e| format!("cannot listen on {}: {e}", config.bind))?;

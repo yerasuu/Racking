@@ -21,6 +21,8 @@ struct RawConfig {
     agents: BTreeMap<String, RawAgent>,
     #[serde(default)]
     permissions: Option<RawPermissions>,
+    #[serde(default)]
+    limits: SenderLimits,
 }
 
 #[derive(Deserialize)]
@@ -50,6 +52,26 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub agents: Vec<Agent>,
     pub send_rules: SendRules,
+    pub limits: SenderLimits,
+}
+
+/// `[limits]`: per-sender guards against an agent that sends without end.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SenderLimits {
+    /// Tasks not yet done, failed or rejected from one sender to one recipient.
+    pub open_tasks_per_pair: u32,
+    /// Jobs of any kind one sender may create per wall-clock minute.
+    pub jobs_per_minute: u32,
+}
+
+impl Default for SenderLimits {
+    fn default() -> Self {
+        Self {
+            open_tasks_per_pair: 20,
+            jobs_per_minute: 60,
+        }
+    }
 }
 
 pub struct Agent {
@@ -111,6 +133,9 @@ impl Config {
                 role,
             });
         }
+        if raw.limits.open_tasks_per_pair == 0 || raw.limits.jobs_per_minute == 0 {
+            return Err("limits: open_tasks_per_pair and jobs_per_minute must be at least 1".to_owned());
+        }
         let explicit = match &raw.permissions {
             Some(p) => send_lists(&p.send)?,
             None => BTreeMap::new(),
@@ -120,6 +145,7 @@ impl Config {
             data_dir: raw.data_dir,
             agents,
             send_rules: SendRules::new(any_role || raw.permissions.is_some(), explicit),
+            limits: raw.limits,
         })
     }
 }
@@ -235,6 +261,17 @@ mod tests {
              [permissions]\nsend = {{ a = [\"B!\"] }}\n"
         ));
         assert!(bad.is_err());
+    }
+
+    #[test]
+    fn limits_default_and_override() {
+        let agents = format!("[agents.a]\ntoken = \"{T1}\"\n[agents.b]\ntoken = \"{T2}\"\n");
+        let c = cfg(&agents).expect("config");
+        assert_eq!((c.limits.open_tasks_per_pair, c.limits.jobs_per_minute), (20, 60));
+        let c = cfg(&format!("{agents}[limits]\njobs_per_minute = 5\n")).expect("config");
+        assert_eq!((c.limits.open_tasks_per_pair, c.limits.jobs_per_minute), (20, 5));
+        assert!(cfg(&format!("{agents}[limits]\njobs_per_minute = 0\n")).is_err());
+        assert!(cfg(&format!("{agents}[limits]\nbody_bytes = 9\n")).is_err());
     }
 
     #[test]

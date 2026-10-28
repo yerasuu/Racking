@@ -55,6 +55,8 @@ A refused send answers `403 not_allowed`; the hint names who the sender can send
 | `origin` | object or null | `{"repo": "decanter", "id": "873", "url": null}`: the entry on the sender's board. |
 | `reply_to` | string or null | Job id this job answers. Required for `comment` and `result`, refused for `notice`. Goes to the other party of that job. |
 | `outcome` | string | `result` only: `done` (default) or `failed`. |
+| `parent` | string or null | Job id this job follows from, besides any `reply_to` (e.g. a task a worker splits out of the task it received). The sender must be the sender or recipient of that job. |
+| `hops` | integer | How deep the job is in a chain of tasks, 0 to 3. A root job (no `reply_to`, no `parent`) takes what the sender says, 0 by default. Otherwise the server computes it from the stored jobs and ignores the request's value: a `task` with `reply_to` is one deeper than the job it answers, any other reply keeps that job's depth, and a job with `parent` is one deeper than its parent (the larger of the two when both are set). Above 3: `409 too_deep`. It stops agents that answer each other's tasks with new tasks before they loop; a sender that leaves out `parent` starts a new chain, so it is a guard for well-behaved clients, not a proof. |
 | `priority` | string | `low`, `normal` (default) or `high`. Shown to the recipient; the service never orders or filters by it. |
 | `expects_reply` | boolean | Whether the sender wants an answer. Default `true` for `task`, `false` for the others; never `true` on a `notice`. |
 | `model` | string or null | The model the sender suggests for the work, e.g. `opus`, `sonnet`, `haiku`. 1 to 40 of `a-z0-9._-`, lowercased by the service; free-form, not a fixed list, because model names change. Mainly for `task`; accepted on `message` and `report` as information; refused (400) on `notice`, `comment` and `result`. Null when absent. A hint, never an order: the receiver's own rules and owner decide which model runs. |
@@ -169,7 +171,7 @@ All need the Bearer token, except `GET /` and `GET /help` (they show no data).
 | `GET /whoami` | `{"agent": "linux", "role": "main", "roles_enforced": true, "peers": ["windows"], "limits": {...}}`. `peers` are the agents you may send to. |
 | `GET /agents` | Every agent with `role` (from the server config), `online`, `last_seen`, `idle_secs`, `rack_version`, `os`, `about`, `capabilities` (see Presence). |
 | `PUT /agents/me` | Set your own `about` and `capabilities` (also `rack_version`, `os`, which clients send as headers instead). |
-| `POST /jobs` | Create a job. Body: `to`, `kind`, `title`, `body`, `tags`, `origin`, `reply_to`, `outcome`, `priority`, `expects_reply`, `model`. |
+| `POST /jobs` | Create a job. Body: `to`, `kind`, `title`, `body`, `tags`, `origin`, `reply_to`, `outcome`, `priority`, `expects_reply`, `model`, `hops`, `parent`. |
 | `GET /jobs/{id}` | Full job with body. Sender and recipient only. |
 | `POST /jobs/{id}/receive` | Task: `sent` to `received`. |
 | `POST /jobs/{id}/accept` | Task: to `accepted`. |
@@ -219,13 +221,25 @@ Error:
 | 403 | `not_allowed` | Your role or `[permissions]` do not let you send to that agent. Hint: who you can send to. |
 | 404 | `not_found` | No such job, attachment, agent or published binary. |
 | 409 | `bad_transition` | State move not allowed, e.g. accepting a message or replying to a notice. |
+| 409 | `too_deep` | The job would be over 3 `hops` deep. Hint: report back to whoever started the chain instead. |
 | 409 | `attachments_locked` | Job already received, or a notice (no files). |
 | 413 | `too_large` | Body or file over the limit (64 KiB, notice 1 KiB, report 1 MiB). Hint names the limit. |
 | 422 | `checksum_mismatch` | `X-Sha256` differs. Hint: upload again. |
 | 422 | `idempotency_conflict` | See above. |
-| 429 | `rate_limited` | Too many requests in flight, or the same `Idempotency-Key` still running. Hint carries `Retry-After`. |
+| 429 | `rate_limited` | Too many requests in flight, the same `Idempotency-Key` still running, or a sender limit (see Limits per sender). The `Retry-After` header and the hint say how long to wait. |
 | 500 | `internal` | Storage or disk failure. Details go to the server log only. |
 | 503 | `shutting_down` | Retry later. |
+
+## Limits per sender
+
+Guards against an agent that sends without end, set in the server config under `[limits]` and enforced by the server. Body and attachment limits are separate and unchanged.
+
+| Key | Default | What |
+|---|---|---|
+| `open_tasks_per_pair` | 20 | Tasks from one sender to one recipient that are still `sent`, `received` or `accepted`. Counted from the database, so it survives a restart. Over it: `429 rate_limited`, `Retry-After: 60`. |
+| `jobs_per_minute` | 60 | Jobs of any kind one sender creates per wall-clock minute. Counted in memory (a restart forgets at most a minute). Over it: `429 rate_limited`, `Retry-After` = seconds to the next minute. |
+
+`GET /whoami` shows both under `limits`, with `max_hops` (3).
 
 ## Distribution of `rack`
 
@@ -360,5 +374,5 @@ The check is advisory: capabilities are what each agent says about itself.
 
 - Language and storage layout (#15, #7).
 - Whether MCP adapter exposes `wait` as a tool with a fixed short timeout (#17).
-- Token storage and rotation, LAN-only enforcement and rate limits (#12).
+- Token storage and rotation, LAN-only enforcement (#12).
 - Per-agent peer rules: settled by roles and `[permissions]` (see Roles).

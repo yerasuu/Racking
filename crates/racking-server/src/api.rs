@@ -17,6 +17,7 @@ use crate::dist::{self, Dist, Slot};
 use crate::error::{ApiError, ApiResult, Code};
 use crate::policy::{Role, SendRules};
 use crate::presence::{self, Flush, InfoUpdate, Presence, Software};
+use crate::rate::PerMinute;
 use crate::registry::{Caller, Registry};
 use crate::store::{self, Claim, Download, Kind, Move, NewJob, Origin, Outcome, Priority, State, Store, View, limits};
 use crate::types::{
@@ -192,7 +193,11 @@ static ROUTES: &[Route] = &[
                 default, `high`; shown to the recipient, never reorders), `expects_reply` (boolean; default true \
                 for `task`, false otherwise; always false for `notice`), `model` (`task`, `message` or `report` \
                 only: 1-40 of `a-z0-9._-`, lowercased, e.g. `opus`, `sonnet`; the model the sender suggests for the \
-                work, null when absent. A hint, never an order: the receiver's own rules and owner decide).",
+                work, null when absent. A hint, never an order: the receiver's own rules and owner decide), \
+                `hops` (0-3, default 0: how many tasks deep this job is in a chain; the server computes it, ignoring \
+                this, when `reply_to` or `parent` is set: a task replying to a job is one deeper, other replies \
+                keep its depth; over 3 answers 409 `too_deep`), `parent` (job id this one follows from, sent or \
+                received by you; the job is one deeper than it).",
         example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" -H 'Idempotency-Key: 7f3c' \
                   -d '{\"to\":\"windows\",\"title\":\"Run the probe\",\"body\":\"...\"}' $RACK_URL/jobs",
         handler: create_job,
@@ -417,6 +422,7 @@ pub struct App {
     registry: Registry,
     send_rules: SendRules,
     presence: Presence,
+    per_minute: PerMinute,
     in_flight: AtomicUsize,
 }
 
@@ -435,6 +441,7 @@ impl App {
         for unknown in send_rules.unknown_names(&names) {
             tracing::warn!(target: "racking::policy", agent = %unknown, "[permissions] names an agent the server does not have");
         }
+        let per_minute = PerMinute::new(config.limits.jobs_per_minute, clock.clone());
         let presence = Presence::new(names.iter(), store.load_agents()?, clock);
         Ok(Self {
             store,
@@ -442,6 +449,7 @@ impl App {
             registry,
             send_rules,
             presence,
+            per_minute,
             in_flight: AtomicUsize::new(0),
         })
     }
@@ -540,7 +548,14 @@ pub fn handle(app: &App, mut request: Request) {
         let mut agent = None;
         let (status, response) = match serve(app, &mut request, &mut agent) {
             Ok(reply) => into_response(reply),
-            Err(err) => (err.code.status(), error_response(&err).boxed()),
+            Err(err) => {
+                let response = error_response(&err);
+                let response = match err.retry_after {
+                    Some(secs) => with_header(response, "Retry-After", &secs.to_string()),
+                    None => response,
+                };
+                (err.code.status(), response.boxed())
+            }
         };
         (status, agent, response)
     };
@@ -958,6 +973,9 @@ fn whoami(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
             "wait_max_secs": limits::WAIT_MAX_SECS,
             "list_max": limits::LIST_MAX,
             "idempotency_key_chars": limits::IDEMPOTENCY_KEY_CHARS,
+            "max_hops": limits::MAX_HOPS,
+            "open_tasks_per_pair": app.store.open_task_limit(),
+            "jobs_per_minute": app.per_minute.limit(),
         },
         "version": env!("CARGO_PKG_VERSION"),
     }))
@@ -987,12 +1005,24 @@ struct CreateJobBody {
     expects_reply: Option<bool>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    hops: Option<u8>,
+    #[serde(default)]
+    parent: Option<String>,
 }
 
 fn create_job(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
     let me = call.caller()?;
     let input: CreateJobBody = call.body()?;
     let new = validate_job(app, me, input)?;
+    app.per_minute.admit(&me.name).map_err(|wait| {
+        ApiError::new(
+            Code::RateLimited,
+            format!("{} sent {} jobs this minute", me.name, app.per_minute.limit()),
+            format!("Retry-After: {wait}. Slow down: batch what you have into fewer jobs."),
+        )
+        .with_retry_after(wait)
+    })?;
     let job = app.store.create_job(&me.name, new)?;
     Ok(Reply::Json {
         status: 201,
@@ -1144,6 +1174,16 @@ fn validate_job(app: &App, me: &Caller, input: CreateJobBody) -> ApiResult<NewJo
             ));
         }
     };
+    let hops = input.hops.unwrap_or(0);
+    if hops > limits::MAX_HOPS {
+        return Err(ApiError::bad_request(format!("hops: 0 to {}", limits::MAX_HOPS)));
+    }
+    let parent = input
+        .parent
+        .as_deref()
+        .map(str::parse::<JobId>)
+        .transpose()
+        .map_err(|e| ApiError::bad_request(format!("parent: {e}")))?;
     Ok(NewJob {
         to,
         kind,
@@ -1157,6 +1197,8 @@ fn validate_job(app: &App, me: &Caller, input: CreateJobBody) -> ApiResult<NewJo
         expects_reply,
         model,
         from_role: me.role,
+        hops,
+        parent,
     })
 }
 
