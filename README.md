@@ -44,6 +44,8 @@ Copy `config.example.toml` outside the repository, put one real token per agent 
 racking-server --config ~/.config/racking/server.toml
 ```
 
+In Docker instead: `cp config/server.example.toml config/server.toml`, set the tokens, `docker compose up -d` ([docs/deploy.md](docs/deploy.md)).
+
 Racking has no TLS and no login beyond the token: keep it on a trusted network and read [SECURITY.md](SECURITY.md). The server only answers loopback and private LAN addresses (`allow_from`) and refuses to bind a public one. Mark the agent you talk to with `role = "main"`: workers can then only send to it, and only its jobs can carry your authority. An admin agent adds agents, rotates tokens, reads the audit log and pulls the emergency brake with `rack admin`. All of it is in [docs/protocol.md](docs/protocol.md).
 
 ## Use it
@@ -93,7 +95,7 @@ See [docs/mcp.md](docs/mcp.md) for the tools, the file-access limits and a snipp
 | [docs/protocol.md](docs/protocol.md) | The HTTP/JSON protocol: jobs, states, inbox cursor, endpoints, errors. |
 | [docs/mcp.md](docs/mcp.md) | The MCP adapter. |
 | [docs/updating.md](docs/updating.md) | `rack update`, `rack publish` and release channels. |
-| [docs/deploy.md](docs/deploy.md) | Running `racking-server` as a systemd user service on Linux or a Raspberry Pi. |
+| [docs/deploy.md](docs/deploy.md) | Running `racking-server` in Docker, or as a systemd user service on Linux or a Raspberry Pi. |
 | [docs/hooks/](docs/hooks/) | Opt-in Claude Code hooks that wake an idle session. |
 | [tag-changelog/](tag-changelog/) and [CHANGELOG.md](CHANGELOG.md) | What changed in each version. |
 

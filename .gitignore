@@ -2,3 +2,4 @@
 .claude/
 target/
 bin/
+config/server.toml

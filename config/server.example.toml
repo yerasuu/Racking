@@ -1,0 +1,34 @@
+# Racking server configuration for the container (compose.yaml).
+# Copy to config/server.toml (never commit it), replace every CHANGE-ME with
+# the output of `openssl rand -hex 32`, then chmod 600.
+
+# Inside the container the server must listen on all interfaces, or the
+# published port cannot reach it. The host side is limited by compose.yaml
+# to ONE address (RACKING_BIND_IP, default 127.0.0.1), and allow_from below
+# still decides which peers are answered. That is the only reason
+# allow_public_bind = true is acceptable here; do not use it outside a container.
+bind = "0.0.0.0:7878"
+allow_public_bind = true
+
+# With the default bridge network, a published port reaches the server from the
+# bridge gateway (172.x) or, with some runtimes, from the real client address
+# (see docs/deploy.md). Keep the private ranges; narrow them to your LAN once
+# you know what the server sees. Public addresses stay refused.
+allow_from = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+
+# The volume mounted by compose.yaml.
+data_dir = "/data"
+
+[agents.linux]
+token = "CHANGE-ME-linux-token"
+admin = true
+role = "main"
+
+[agents.windows]
+token = "CHANGE-ME-windows-token"
+
+# [permissions]
+# send = { windows = ["linux"] }
+# [limits]
+# open_tasks_per_pair = 20
+# jobs_per_minute = 60

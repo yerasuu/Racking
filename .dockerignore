@@ -1,0 +1,9 @@
+target/
+.git/
+.brain/
+.claude/
+bin/
+config/
+docs/
+deploy/
+*.md

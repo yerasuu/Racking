@@ -1,0 +1,32 @@
+# docker compose up -d   (see docs/deploy.md)
+services:
+  racking:
+    build: .
+    image: racking-server:local
+    restart: unless-stopped
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - racking-data:/data
+      - ./config/server.toml:/config/server.toml:ro
+    # Published on one host address only. Default: this machine. For the LAN,
+    # set RACKING_BIND_IP=192.168.1.20 (in the shell or in a .env file).
+    ports:
+      - "${RACKING_BIND_IP:-127.0.0.1}:7878:7878"
+    # LAN alternative on Linux, which keeps the real client addresses (see
+    # docs/deploy.md): remove `ports:` above, set `bind` in server.toml to the
+    # LAN address with port 7878, and uncomment:
+    # network_mode: host
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  racking-data:
