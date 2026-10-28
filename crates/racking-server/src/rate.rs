@@ -70,17 +70,12 @@ impl<K: Hash + Eq + Clone> PerWindow<K> {
         {
             let windows = self.windows.read().unwrap_or_else(PoisonError::into_inner);
             if let Some(w) = windows.get(key) {
-                return w
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, take)
-                    .map(drop)
-                    .map_err(|_| full());
+                return update(w, take).map(drop).map_err(|_| full());
             }
         }
         let mut windows = self.windows.write().unwrap_or_else(PoisonError::into_inner);
         let w = windows.entry(key.clone()).or_insert_with(|| AtomicU64::new(0));
-        w.fetch_update(Ordering::Relaxed, Ordering::Relaxed, take)
-            .map(drop)
-            .map_err(|_| full())
+        update(w, take).map(drop).map_err(|_| full())
     }
 
     /// The seconds until `key`'s window ends while it is full, without counting.
@@ -91,6 +86,23 @@ impl<K: Hash + Eq + Clone> PerWindow<K> {
         let packed = windows.get(key)?.load(Ordering::Relaxed);
         let (w, count) = ((packed >> 32) as u32, packed as u32);
         (w == current && count >= self.limit).then(|| now.rem_euclid(self.window).abs_diff(self.window))
+    }
+}
+
+/// Applies `f` to the counter until the swap lands, or returns the value `f` refused.
+///
+/// A hand-written loop because `AtomicU64::fetch_update` is deprecated in newer toolchains in favour of
+/// `try_update`, which the pinned `rust-version` does not have: this compiles without warnings on both.
+fn update(cell: &AtomicU64, f: impl Fn(u64) -> Option<u64>) -> Result<u64, u64> {
+    let mut seen = cell.load(Ordering::Relaxed);
+    loop {
+        let Some(next) = f(seen) else {
+            return Err(seen);
+        };
+        match cell.compare_exchange_weak(seen, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(previous) => return Ok(previous),
+            Err(actual) => seen = actual,
+        }
     }
 }
 
