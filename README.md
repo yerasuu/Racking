@@ -39,6 +39,34 @@ cargo test --workspace
 
 A Windows `rack.exe` cross-compiles from Linux with zig: see [docs/building-windows.md](docs/building-windows.md).
 
+### Install the clients
+
+`install/install.sh` (Linux) and `install/install.ps1` (Windows) put `rack` and `racking-mcp` in your user directory, with no root or administrator rights. They use the binaries in `target/release` (or the folder you pass), and build them with cargo first if they are missing. Both can run again safely, take `--dry-run` / `-DryRun` to print the plan, and uninstall with `--uninstall` / `-Uninstall`; your `rack.conf` is never touched.
+
+```sh
+install/install.sh                      # Linux: ~/.local/bin; add it to PATH if it is not there
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install\install.ps1   # Windows: %LOCALAPPDATA%\Racking\bin, added to the user PATH
+```
+
+To install from GitHub without cloning, take the latest stable release (SHA-256 checked; x86_64 Linux and Windows):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/yerasuu/Racking/main/install/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/yerasuu/Racking/main/install/install.sh | sh -s -- --version 0.2.1   # a given version
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/yerasuu/Racking/main/install/install.ps1)))                  # latest
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/yerasuu/Racking/main/install/install.ps1))) -Version 0.2.1   # a given version
+```
+
+Piping a script into a shell runs whatever it says: [read it first](install/install.sh) if you prefer. Any other platform builds from source: `cargo install --git https://github.com/yerasuu/Racking rack racking-mcp`. The releases are built by [.github/workflows/release.yml](.github/workflows/release.yml) when a stable `vX.Y.Z` tag is pushed.
+
+Options: `--version X.Y.Z` / `-Version X.Y.Z`, `--from DIR` / `-From DIR` for ready-made binaries (for example a Windows build copied from another machine), `--bin-dir DIR` / `-BinDir DIR` for another target. Then link the machine ([below](#link-a-machine)); later versions arrive with `rack update`. The server has its own installer: [docs/deploy.md](docs/deploy.md#without-docker-systemd-user-service).
+
 ## Run the server
 
 Copy `config.example.toml` outside the repository, put one real token per agent in it (`openssl rand -hex 32`) and start it. It binds `127.0.0.1:7878` until you set your LAN address in `bind`.

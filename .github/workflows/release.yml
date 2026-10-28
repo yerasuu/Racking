@@ -1,0 +1,55 @@
+name: Release
+
+# Builds the clients for each stable tag and attaches them to the GitHub release,
+# where install/install.sh and install/install.ps1 download them from.
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+      - run: cargo build --release --locked -p rack -p racking-mcp
+      - name: Package
+        run: |
+          mkdir dist
+          tar -C target/release -czf dist/rack-x86_64-unknown-linux-gnu.tar.gz rack racking-mcp
+      - uses: actions/upload-artifact@v4
+        with: { name: linux, path: dist }
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+      - run: cargo build --release --locked -p rack -p racking-mcp
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Compress-Archive -Path target\release\rack.exe, target\release\racking-mcp.exe -DestinationPath dist\rack-x86_64-pc-windows-msvc.zip
+      - uses: actions/upload-artifact@v4
+        with: { name: windows, path: dist }
+
+  publish:
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - name: Checksums and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist && sha256sum *.tar.gz *.zip > SHA256SUMS && cd ..
+          gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" \
+            --notes-file "tag-changelog/$GITHUB_REF_NAME.md"
