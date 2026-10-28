@@ -47,15 +47,21 @@ impl<K: Hash + Eq + Clone> PerWindow<K> {
     /// Counts one for `key`. When its window is full, returns the seconds until
     /// the next one and counts nothing.
     pub fn admit(&self, key: &K) -> Result<(), u64> {
+        self.admit_many(key, 1)
+    }
+
+    /// Counts `n` for `key` at once, or nothing when fewer than `n` are left in its window,
+    /// so a broadcast is admitted whole or not at all. Returns the seconds until the next window.
+    pub fn admit_many(&self, key: &K, n: u32) -> Result<(), u64> {
         let now = self.clock.now();
         // Truncating the window number only matters when two windows 2^32 windows apart meet.
         let current = now.div_euclid(self.window) as u32;
         let take = |packed: u64| {
             let (w, count) = ((packed >> 32) as u32, packed as u32);
             if w != current {
-                Some(u64::from(current) << 32 | 1)
-            } else if count < self.limit {
-                Some(packed + 1)
+                (n <= self.limit).then(|| u64::from(current) << 32 | u64::from(n))
+            } else if count.saturating_add(n) <= self.limit {
+                Some(packed + u64::from(n))
             } else {
                 None
             }
@@ -110,6 +116,20 @@ mod tests {
         assert_eq!(rate.admit(&a), Ok(()), "a new minute starts over");
         assert_eq!(rate.admit(&a), Ok(()));
         assert_eq!(rate.admit(&a), Err(60));
+    }
+
+    #[test]
+    fn many_at_once_count_whole_or_not_at_all() {
+        let clock = Clock::manual(600);
+        let rate = PerMinute::new(5, clock.clone());
+        let a = name("a");
+        assert_eq!(rate.admit_many(&a, 3), Ok(()));
+        assert_eq!(rate.admit_many(&a, 3), Err(60), "two left, three asked: nothing counts");
+        assert_eq!(rate.admit_many(&a, 2), Ok(()));
+        assert_eq!(rate.admit(&a), Err(60));
+        clock.advance(60);
+        assert_eq!(rate.admit_many(&a, 6), Err(60), "more than a whole window never fits");
+        assert_eq!(rate.admit_many(&a, 5), Ok(()));
     }
 
     #[test]

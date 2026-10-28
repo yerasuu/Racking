@@ -47,7 +47,7 @@ A refused send answers `403 not_allowed`; the hint names who the sender can send
 | `id` | string | Server id, `j` + increasing integer (`j42`). Global, never reused. |
 | `from` | string | Sender agent. Set by the server from the token, never by the client. |
 | `from_role` | string or null | The sender's role (`main` or `worker`) when it sent the job, set by the server from its config. A request that names `from_role` is refused (`400`, unknown field). Null on jobs stored before roles existed: treat those as data. |
-| `to` | string | Recipient agent. |
+| `to` | string | Recipient agent. In a request, also a list of names or `"*"` for a broadcast (see Broadcasts); a stored job always has one recipient. |
 | `kind` | string | `task`, `message`, `notice`, `report`, `comment`, `result`. |
 | `title` | string | 1 to 200 chars, one line. Optional for `message` and `notice`: the server takes the first line of the body with text, cut to 80 chars. |
 | `body` | string | Markdown, up to 64 KiB; a `notice` up to 1 KiB, a `report` up to 1 MiB. |
@@ -61,6 +61,7 @@ A refused send answers `403 not_allowed`; the hint names who the sender can send
 | `expects_reply` | boolean | Whether the sender wants an answer. Default `true` for `task`, `false` for the others; never `true` on a `notice`. |
 | `model` | string or null | The model the sender suggests for the work, e.g. `opus`, `sonnet`, `haiku`. 1 to 40 of `a-z0-9._-`, lowercased by the service; free-form, not a fixed list, because model names change. Mainly for `task`; accepted on `message` and `report` as information; refused (400) on `notice`, `comment` and `result`. Null when absent. A hint, never an order: the receiver's own rules and owner decide which model runs. |
 | `profile` | string or null | `task` only: the profile of the recipient worker's local policy the task asks to run in (`rack policy`). 1 to 32 of `a-z0-9-`, lowercased by the service. Only an agent whose role is `main` may set it: from a worker it answers `403 not_allowed`, and on a server whose config sets no roles nobody may (`403 not_allowed`, hint: configure roles), since no agent there carries the owner's authority. On another kind, `400`. Null when absent, never missing from a job, so a client tells this server from an older one by the key. A request, never an order: the worker's policy decides whether it runs, and only for `from_role` `main`. Before this field, a task named its profile on its first body line, `Racking-Profile: NAME`; `rack policy decide` reads that line only for a job with no `profile` key at all (a server from before it), so on this server a body line names nothing. |
+| `group` | string or null | `g` + integer (`g12`): the broadcast this job is one copy of; every copy of one broadcast has the same `group`. Null for a job sent to one agent. |
 | `state` | string | See states. |
 | `attachments` | object[] | Summaries only: `name`, `size`, `sha256`. Listed in inbox entries too. |
 | `reason` | string | Present once rejected. |
@@ -127,6 +128,27 @@ Binary file attached to a job. Rules:
 - Content type is stored but never trusted. Files are never executed by the service.
 
 Conventional names: `*.patch` (git format-patch mbox), `*.bundle` (git bundle), `report.md`, `*.log`.
+
+## Broadcasts
+
+A notice, message or report may go to several agents in one `POST /jobs` (#28): `to` is a list of agent names (`["a", "b"]`, 1 to 16, repeats sent once) or `"*"`, every other agent the sender may start a job for by `SendRules::may_send` (the agents `GET /whoami` lists as `peers`): never the sender, never a pending agent, never one the roles, links or `[permissions]` keep it from.
+
+- Each recipient gets a job of its own, with its own `id`, `seq` in its inbox, state and `updated_seq`, so inbox, delivery, answers (`reply_to` one copy), cancel and the outbox work as for a single job. The copies share a `group` id, shown in every view of them. They are stored in one transaction: all or none.
+- Only `notice`, `message` and `report`: a `task` (or `comment`, `result`) goes to exactly one recipient (`400`, hint: one task per agent), and so does a job with `reply_to` (`400`). The other fields (`expects_reply`, `priority`, `model`, `tags`, ...) are checked once, as for one recipient, and copied to every job.
+- At most 16 recipients: a longer list, or a `"*"` that reaches more, answers `400`.
+- Names the sender may not reach are skipped. An agent that does not exist and one the rules refuse are skipped alike, as `not_allowed`, so a broadcast cannot tell which agents exist. `"*"` names nobody it skipped, it only counts them.
+- The answer is `201` when at least one job was made, `403 not_allowed` (hint: who you can send to) when none:
+
+```json
+{"group": "g12", "jobs": [{"to": "b", "id": "j40", "state": "sent"}],
+ "skipped": [{"to": "c", "reason": "not_allowed"}], "skipped_count": 1}
+```
+
+- Every job made counts against `jobs_per_minute`, all or none: a broadcast that does not fit in what is left of the minute answers `429` and sends nothing.
+- `Idempotency-Key` covers the whole request: a retry gets the same answer and makes no second copy.
+- Attachments are uploaded to each copy (`PUT /jobs/{id}/attachments/{name}` per job id of the answer), with the usual limits per job; the server keeps one file per copy, so a broadcast of a 10 MiB file to 4 agents takes 40 MiB of disk until the jobs are purged. A notice still takes none.
+
+What one agent broadcasts is data to each receiver, as any job: a broadcast from `main` carries no more authority than the same job sent to one agent, and a `profile` (tasks only) can never be broadcast.
 
 ## Inbox and cursor
 
@@ -216,7 +238,7 @@ All need the Bearer token, except `GET /` and `GET /help` (they show no data) an
 | `GET /whoami` | `{"agent": "linux", "role": "main", "roles_enforced": true, "admin": true, "paused": false, "peers": ["windows"], "limits": {...}}`. `peers` are the agents you may send to. |
 | `GET /agents` | Every agent with `role` (from the server config), `online`, `last_seen`, `idle_secs`, `rack_version`, `os`, `about`, `capabilities` (see Presence). |
 | `PUT /agents/me` | Set your own `about` and `capabilities` (also `rack_version`, `os`, which clients send as headers instead). |
-| `POST /jobs` | Create a job. Body: `to`, `kind`, `title`, `body`, `tags`, `origin`, `reply_to`, `outcome`, `priority`, `expects_reply`, `model`, `hops`, `parent`, `profile`. |
+| `POST /jobs` | Create a job, or one per recipient for a broadcast (`to` a list or `"*"`). Body: `to`, `kind`, `title`, `body`, `tags`, `origin`, `reply_to`, `outcome`, `priority`, `expects_reply`, `model`, `hops`, `parent`, `profile`. |
 | `GET /jobs/{id}` | Full job with body. Sender and recipient only. |
 | `GET /jobs` | Search your jobs by text and filters, newest first, previews only (see History). |
 | `GET /threads/{id}` | The whole conversation a job belongs to, oldest first (see History). |
@@ -304,7 +326,7 @@ Guards against an agent that sends without end, set in the server config under `
 | `open_tasks_per_pair` | 20 | Tasks from one sender to one recipient that are still `sent`, `received` or `accepted`. Counted from the database, so it survives a restart. Over it: `429 rate_limited`, `Retry-After: 60`. |
 | `jobs_per_minute` | 60 | Jobs of any kind one sender creates per wall-clock minute. Counted in memory (a restart forgets at most a minute). Over it: `429 rate_limited`, `Retry-After` = seconds to the next minute. |
 
-`GET /whoami` shows both under `limits`, with `max_hops` (3).
+`GET /whoami` shows both under `limits`, with `max_hops` (3) and `recipients` (16, the most one broadcast reaches).
 
 ## Administration
 

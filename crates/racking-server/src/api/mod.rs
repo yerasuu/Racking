@@ -2,6 +2,7 @@
 //! idempotency, and the Markdown guide generated from the same table.
 
 mod admin;
+mod broadcast;
 mod history;
 mod pairing;
 
@@ -239,9 +240,13 @@ static ROUTES: &[Route] = &[
         body: BodyKind::Json,
         summary: "Create a job for a peer. `from` and `from_role` are always the token's agent and its role; a \
                   request that names `from_role` is refused. Answers 201 with the job. A job that is not a reply \
-                  must be allowed by the send rules (see Roles), else 403 `not_allowed`.",
+                  must be allowed by the send rules (see Roles), else 403 `not_allowed`. With a list or `\"*\"` in \
+                  `to`, a notice, message or report is broadcast (see Broadcasts) and the answer is `{\"group\", \
+                  \"jobs\": [{\"to\", \"id\", \"state\"}], \"skipped\": [{\"to\", \"reason\"}], \
+                  \"skipped_count\"}`.",
         query: &[],
-        input: "`to` (peer), `kind` (`task` default, `message`, `notice`, `report`, `comment`, `result`; see Kinds), \
+        input: "`to` (peer; or a list of up to 16 peers, or `\"*\"` for every agent you may send to, for a \
+                broadcast), `kind` (`task` default, `message`, `notice`, `report`, `comment`, `result`; see Kinds), \
                 `title` (1-200 chars, one line; optional for `message` and `notice`, which take the first line of \
                 the body, cut to 80 chars), `body` (Markdown, up to 64 KiB; `notice` 1 KiB, `report` 1 MiB), \
                 `tags` (up to 16, each 1-40 of `A-Za-z0-9._:/-`), `origin` (`{\"repo\", \"id\", \"url\"}` or null), \
@@ -1366,10 +1371,19 @@ pub fn guide() -> String {
          every request. `last_seen`, `rack_version` and `os` are kept in memory and written to disk at most once \
          a minute per agent. `PUT /agents/me` publishes `capabilities` (e.g. `windows`, `nvidia`): what the agent \
          says it has, not checked by the server, so a sender's check against them is advisory.\n\n\
+         ## Broadcasts\n\nA notice, message or report may go to several agents at once: `to` is a list of names \
+         (`[\"a\", \"b\"]`) or `\"*\"`, every other agent you may send to (as `GET /whoami` lists your peers; \
+         never you, never a pending agent). At most {} recipients. Each one gets a job of its own (own id, state \
+         and `seq`), all sharing a `group` id (`g12`) that every view of them shows; read, answer and follow them \
+         one by one as usual. A task, or a job with `reply_to`, goes to one agent (400). Names you may not send to \
+         are skipped (`not_allowed`, the same for an agent that does not exist); the request answers 201 while at \
+         least one job was made, 403 `not_allowed` when none. Every job made counts against your jobs per minute, \
+         all or none. Attachments are uploaded to each job.\n\n\
          ## Retries\n\nAny POST or PUT accepts `Idempotency-Key` (up to {} chars). The same key and request within \
          24 h returns the stored answer; the same key with another request answers 422 `idempotency_conflict`.\n",
         env!("CARGO_PKG_VERSION"),
         presence::ONLINE_SECS,
+        limits::RECIPIENTS,
         limits::IDEMPOTENCY_KEY_CHARS
     );
     let _ = writeln!(md, "## Routes\n");
@@ -1450,6 +1464,7 @@ fn whoami(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
             "list_max": limits::LIST_MAX,
             "idempotency_key_chars": limits::IDEMPOTENCY_KEY_CHARS,
             "max_hops": limits::MAX_HOPS,
+            "recipients": limits::RECIPIENTS,
             "open_tasks_per_pair": app.store.open_task_limit(),
             "jobs_per_minute": app.per_minute.limit(),
         },
@@ -1460,7 +1475,8 @@ fn whoami(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateJobBody {
-    to: String,
+    /// An agent name, a list of names or `"*"`; `broadcast::target` reads it.
+    to: Value,
     #[serde(default)]
     kind: Option<String>,
     #[serde(default)]
@@ -1492,15 +1508,38 @@ struct CreateJobBody {
 fn create_job(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
     let me = call.caller()?;
     let input: CreateJobBody = call.body()?;
-    let new = validate_job(app, me, input)?;
-    app.per_minute.admit(&me.name).map_err(|wait| {
+    let to = match broadcast::target(me, &input.to)? {
+        broadcast::Target::One(to) => to,
+        broadcast::Target::Many(recipients) => return broadcast::send(app, me, input, recipients),
+    };
+    let new = validate_job(app, me, to, input)?;
+    admit(app, me, 1)?;
+    check_paused(app, me)?;
+    let job = app.store.create_job(&me.name, new)?;
+    Ok(Reply::Json {
+        status: 201,
+        body: job.to_json(View::Full),
+    })
+}
+
+/// Counts `jobs` against the sender's jobs per minute, all of them or none.
+fn admit(app: &App, me: &Caller, jobs: usize) -> ApiResult<()> {
+    let n = u32::try_from(jobs).unwrap_or(u32::MAX);
+    app.per_minute.admit_many(&me.name, n).map_err(|wait| {
         ApiError::new(
             Code::RateLimited,
-            format!("{} sent {} jobs this minute", me.name, app.per_minute.limit()),
+            format!(
+                "{} may send {} jobs a minute and this would pass it",
+                me.name,
+                app.per_minute.limit()
+            ),
             format!("Retry-After: {wait}. Slow down: batch what you have into fewer jobs."),
         )
         .with_retry_after(wait)
-    })?;
+    })
+}
+
+fn check_paused(app: &App, me: &Caller) -> ApiResult<()> {
     if app.is_paused() && me.role == Role::Worker && !me.admin {
         return Err(ApiError::new(
             Code::Paused,
@@ -1509,22 +1548,27 @@ fn create_job(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
              goes out until POST /admin/resume.",
         ));
     }
-    let job = app.store.create_job(&me.name, new)?;
-    Ok(Reply::Json {
-        status: 201,
-        body: job.to_json(View::Full),
-    })
+    Ok(())
 }
 
-/// The single validation point for a job's fields, and for whether its sender may send it.
-fn validate_job(app: &App, me: &Caller, input: CreateJobBody) -> ApiResult<NewJob> {
-    let to: AgentName = input
-        .to
-        .parse()
-        .map_err(|e: String| ApiError::bad_request(format!("to: {e}")))?;
-    if to == me.name {
-        return Err(ApiError::bad_request("to: you cannot send a job to yourself"));
+/// The hint of a `not_allowed` send: who `me` may start a job for.
+fn reach_hint(app: &App, me: &Caller) -> String {
+    let peers = app.peers_of(me);
+    if peers.is_empty() {
+        "You may send to no agent; only replies (reply_to) to jobs sent to you go out. Agents made through \
+         the API reach only those they are linked with (GET /agent-links)."
+            .to_owned()
+    } else {
+        format!(
+            "You can send to: {}. Agents made through the API reach only those they are linked with (GET \
+             /agent-links); ask the owner if this needs to change.",
+            peers.join(", ")
+        )
     }
+}
+
+/// The single validation point for a job to one agent: whether its sender may send it, then its fields.
+fn validate_job(app: &App, me: &Caller, to: AgentName, input: CreateJobBody) -> ApiResult<NewJob> {
     let Some(recipient) = app.registry.member(&to) else {
         let peers = app.peers_of(me).join(", ");
         return Err(ApiError::new(
@@ -1542,24 +1586,17 @@ fn validate_job(app: &App, me: &Caller, input: CreateJobBody) -> ApiResult<NewJo
         recipient.pending
     };
     if refused {
-        let peers = app.peers_of(me);
-        let hint = if peers.is_empty() {
-            "You may send to no agent; only replies (reply_to) to jobs sent to you go out. Agents made through \
-             the API reach only those they are linked with (GET /agent-links)."
-                .to_owned()
-        } else {
-            format!(
-                "You can send to: {}. Agents made through the API reach only those they are linked with (GET \
-                 /agent-links); ask the owner if this needs to change.",
-                peers.join(", ")
-            )
-        };
         return Err(ApiError::new(
             Code::NotAllowed,
             format!("{} ({}) may not send to {to}", me.name, me.role),
-            hint,
+            reach_hint(app, me),
         ));
     }
+    validate_fields(app, me, to, input)
+}
+
+/// The fields of a job, once its recipients are settled. `input.to` is not read: `to` is.
+fn validate_fields(app: &App, me: &Caller, to: AgentName, input: CreateJobBody) -> ApiResult<NewJob> {
     let kind: Kind = match input.kind.as_deref() {
         Some(k) => k
             .parse()

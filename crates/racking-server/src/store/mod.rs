@@ -64,6 +64,8 @@ pub mod limits {
     /// How far a chain of jobs may go from the job that started it, so agents that
     /// answer each other with new tasks stop before they loop.
     pub const MAX_HOPS: u8 = 3;
+    /// Agents one broadcast reaches; each gets a job of its own, so the cap bounds the rows one request writes.
+    pub const RECIPIENTS: usize = 16;
     /// Idempotency records live this long, per the protocol.
     pub const IDEMPOTENCY_TTL_SECS: i64 = 24 * 3600;
     /// Closed jobs (done, rejected, failed) are kept this long, per the protocol.
@@ -365,6 +367,8 @@ pub struct Job {
     pub hops: u8,
     pub parent: Option<JobId>,
     pub profile: Option<String>,
+    /// The broadcast this job is one copy of; each recipient's copy is a job of its own.
+    pub group: Option<i64>,
     pub attachments: Vec<Attachment>,
 }
 
@@ -393,6 +397,7 @@ impl Job {
             "hops": self.hops,
             "parent": self.parent.map(|j| j.to_string()),
             "profile": self.profile,
+            "group": self.group.map(|g| format!("g{g}")),
         });
         if let Some(obj) = v.as_object_mut() {
             let mut insert = |k: &str, value: Value| obj.insert(k.to_owned(), value);
@@ -529,17 +534,17 @@ impl Changes {
 
 const JOB_COLUMNS: &str = "id, from_agent, to_agent, kind, title, body, length(CAST(body AS BLOB)), tags, origin, \
                            reply_to, outcome, reason, state, created_at, updated_at, seq, updated_seq, priority, \
-                           expects_reply, model, from_role, hops, parent, profile";
+                           expects_reply, model, from_role, hops, parent, profile, group_id";
 /// The body column must agree with `Kind::inlines`, `limits::INLINE_BYTES` and `limits::PREVIEW_CHARS`.
 const SUMMARY_COLUMNS: &str = "id, from_agent, to_agent, kind, title, \
                                CASE WHEN kind IN ('message', 'notice') AND length(CAST(body AS BLOB)) <= 4096 \
                                THEN body ELSE substr(body, 1, 200) END, length(CAST(body AS BLOB)), \
                                tags, origin, reply_to, outcome, reason, state, created_at, updated_at, seq, updated_seq, \
-                               priority, expects_reply, model, from_role, hops, parent, profile";
+                               priority, expects_reply, model, from_role, hops, parent, profile, group_id";
 /// The body column must agree with `limits::PREVIEW_CHARS`.
 const PREVIEW_COLUMNS: &str = "id, from_agent, to_agent, kind, title, substr(body, 1, 200), length(CAST(body AS BLOB)), \
                                tags, origin, reply_to, outcome, reason, state, created_at, updated_at, seq, updated_seq, \
-                               priority, expects_reply, model, from_role, hops, parent, profile";
+                               priority, expects_reply, model, from_role, hops, parent, profile, group_id";
 
 const SCHEMA: &str = "
 PRAGMA journal_mode = WAL;
@@ -568,7 +573,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     from_role TEXT,
     hops INTEGER NOT NULL DEFAULT 0,
     parent INTEGER,
-    profile TEXT
+    profile TEXT,
+    group_id INTEGER
 ) STRICT;
 CREATE INDEX IF NOT EXISTS jobs_inbox ON jobs (to_agent, seq);
 CREATE INDEX IF NOT EXISTS jobs_outbox ON jobs (from_agent, updated_seq);
@@ -643,6 +649,9 @@ impl Store {
         add_columns(&conn, HINT_COLUMNS).map_err(|e| format!("cannot add the model and capabilities columns: {e}"))?;
         add_columns(&conn, ROLE_COLUMNS).map_err(|e| format!("cannot add the role columns: {e}"))?;
         add_columns(&conn, PROFILE_COLUMNS).map_err(|e| format!("cannot add the profile column: {e}"))?;
+        add_columns(&conn, GROUP_COLUMNS)
+            .and_then(|()| conn.execute_batch(GROUP_INDEX))
+            .map_err(|e| format!("cannot add the group column: {e}"))?;
         Ok(Self {
             conn: Mutex::new(conn),
             files,
@@ -700,14 +709,7 @@ impl Store {
         let mut conn = self.db();
         let tx = conn.transaction()?;
         let now = clock::now();
-        let mut chained = None;
-        if let Some(parent_id) = new.parent {
-            let parent = load_job(&tx, parent_id, View::Summary)?;
-            if !parent.is_party(me) {
-                return Err(not_yours(&parent));
-            }
-            chained = Some(parent.hops.saturating_add(1));
-        }
+        let mut chained = parent_hops(&tx, me, new.parent)?;
         if let Some(reply_id) = new.reply_to {
             let original = load_job(&tx, reply_id, View::Summary)?;
             // Only a task starts new work; a message, comment or result answers within its chain's depth.
@@ -768,15 +770,7 @@ impl Store {
                 apply_move(&tx, &original, Move::Finish(outcome), None, now)?;
             }
         }
-        let hops = chained.unwrap_or(new.hops);
-        if hops > limits::MAX_HOPS {
-            return Err(ApiError::new(
-                Code::TooDeep,
-                format!("this job would be {hops} hops deep, over {}", limits::MAX_HOPS),
-                "The chain of tasks is too long: report back to whoever started it (a result, comment or message) \
-                 instead of sending another task.",
-            ));
-        }
+        let hops = checked_depth(chained.unwrap_or(new.hops))?;
         if new.kind == Kind::Task {
             let open: u32 = tx.query_row(
                 "SELECT count(*) FROM jobs WHERE from_agent = ?1 AND to_agent = ?2 AND kind = 'task' \
@@ -797,49 +791,32 @@ impl Store {
                 .with_retry_after(60));
             }
         }
-        let seq = bump_counter(&tx, &format!("inbox:{}", new.to))?;
-        let updated_seq = bump_counter(&tx, "updated")?;
-        let tags = serde_json::to_string(&new.tags).map_err(|e| ApiError::internal("encode tags", &e))?;
-        let origin = new
-            .origin
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| ApiError::internal("encode origin", &e))?;
-        let outcome = (new.kind == Kind::Result).then(|| new.outcome.unwrap_or(Outcome::Done).state().as_str());
-        tx.execute(
-            "INSERT INTO jobs (from_agent, to_agent, kind, title, body, tags, origin, reply_to, outcome, state, \
-             created_at, updated_at, seq, updated_seq, priority, expects_reply, model, from_role, hops, parent, \
-             profile) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'sent', ?10, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
-            params![
-                me.as_str(),
-                new.to.as_str(),
-                new.kind.as_str(),
-                new.title,
-                new.body,
-                tags,
-                origin,
-                new.reply_to.map(JobId::get),
-                outcome,
-                now,
-                seq,
-                updated_seq,
-                new.priority.as_str(),
-                new.expects_reply,
-                new.model,
-                new.from_role.as_str(),
-                hops,
-                new.parent.map(JobId::get),
-                new.profile
-            ],
-        )?;
-        let id = JobId::new(tx.last_insert_rowid());
+        let id = insert_job(&tx, me, &new.to, &new, hops, None, now)?;
         let job = load_job(&tx, id, View::Full)?;
         tx.commit()?;
         drop(conn);
         self.changes.bump();
         Ok(job)
+    }
+
+    /// One job of `new` for each of `recipients`, all in one transaction and one group, so a
+    /// broadcast is stored whole or not at all. `new.to` is not used. The caller has checked that
+    /// `new` is a kind with no reply protocol (no `reply_to`, no task), so no other job changes.
+    pub fn create_group(&self, me: &AgentName, recipients: &[AgentName], new: &NewJob) -> ApiResult<Vec<Job>> {
+        let mut conn = self.db();
+        let tx = conn.transaction()?;
+        let now = clock::now();
+        let hops = checked_depth(parent_hops(&tx, me, new.parent)?.unwrap_or(new.hops))?;
+        let group = bump_counter(&tx, "group")?;
+        let mut jobs = Vec::with_capacity(recipients.len());
+        for to in recipients {
+            let id = insert_job(&tx, me, to, new, hops, Some(group), now)?;
+            jobs.push(load_job(&tx, id, View::Summary)?);
+        }
+        tx.commit()?;
+        drop(conn);
+        self.changes.bump();
+        Ok(jobs)
     }
 
     /// Reading a job as its recipient marks it `received`, as the protocol's
@@ -1497,6 +1474,83 @@ fn set_state(tx: &Transaction<'_>, id: JobId, state: State, reason: Option<&str>
     Ok(updated_seq)
 }
 
+/// Stores `new` for `to` with its own inbox `seq` and `updated_seq`, so each copy of a broadcast
+/// moves through `to`'s inbox and the sender's outbox like any single job.
+fn insert_job(
+    tx: &Transaction<'_>,
+    me: &AgentName,
+    to: &AgentName,
+    new: &NewJob,
+    hops: u8,
+    group: Option<i64>,
+    now: i64,
+) -> ApiResult<JobId> {
+    let seq = bump_counter(tx, &format!("inbox:{to}"))?;
+    let updated_seq = bump_counter(tx, "updated")?;
+    let tags = serde_json::to_string(&new.tags).map_err(|e| ApiError::internal("encode tags", &e))?;
+    let origin = new
+        .origin
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| ApiError::internal("encode origin", &e))?;
+    let outcome = (new.kind == Kind::Result).then(|| new.outcome.unwrap_or(Outcome::Done).state().as_str());
+    tx.execute(
+            "INSERT INTO jobs (from_agent, to_agent, kind, title, body, tags, origin, reply_to, outcome, state, \
+             created_at, updated_at, seq, updated_seq, priority, expects_reply, model, from_role, hops, parent, \
+             profile, group_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'sent', ?10, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, \
+             ?20)",
+            params![
+                me.as_str(),
+                to.as_str(),
+                new.kind.as_str(),
+                new.title,
+                new.body,
+                tags,
+                origin,
+                new.reply_to.map(JobId::get),
+                outcome,
+                now,
+                seq,
+                updated_seq,
+                new.priority.as_str(),
+                new.expects_reply,
+                new.model,
+                new.from_role.as_str(),
+                hops,
+                new.parent.map(JobId::get),
+                new.profile,
+                group
+            ],
+        )?;
+    Ok(JobId::new(tx.last_insert_rowid()))
+}
+
+/// The depth a job with `parent` gets: one below it. The sender must be a party of the parent.
+fn parent_hops(tx: &Transaction<'_>, me: &AgentName, parent: Option<JobId>) -> ApiResult<Option<u8>> {
+    let Some(parent_id) = parent else {
+        return Ok(None);
+    };
+    let parent = load_job(tx, parent_id, View::Summary)?;
+    if !parent.is_party(me) {
+        return Err(not_yours(&parent));
+    }
+    Ok(Some(parent.hops.saturating_add(1)))
+}
+
+fn checked_depth(hops: u8) -> ApiResult<u8> {
+    if hops > limits::MAX_HOPS {
+        return Err(ApiError::new(
+            Code::TooDeep,
+            format!("this job would be {hops} hops deep, over {}", limits::MAX_HOPS),
+            "The chain of tasks is too long: report back to whoever started it (a result, comment or message) \
+             instead of sending another task.",
+        ));
+    }
+    Ok(hops)
+}
+
 /// Databases made before notices, messages and reports lack `priority` and
 /// `expects_reply`. Their tasks expected a reply all along, so they get `expects_reply = 1`.
 fn add_reply_columns(conn: &Connection) -> rusqlite::Result<()> {
@@ -1529,6 +1583,10 @@ const ROLE_COLUMNS: &[(&str, &str, &str)] = &[
 ];
 /// Databases made before the profile field lack it; null means the job names no profile.
 const PROFILE_COLUMNS: &[(&str, &str, &str)] = &[("jobs", "profile", "TEXT")];
+/// Databases made before broadcasts lack `group_id`; null means the job was sent to one agent.
+const GROUP_COLUMNS: &[(&str, &str, &str)] = &[("jobs", "group_id", "INTEGER")];
+/// Outside `SCHEMA` because an old database has no `group_id` until `GROUP_COLUMNS` adds it.
+const GROUP_INDEX: &str = "CREATE INDEX IF NOT EXISTS jobs_group ON jobs (group_id);";
 
 /// Adds each `(table, column, declaration)` a database lacks. Every declaration
 /// is nullable or has a default, so old rows need no update.
@@ -1634,6 +1692,7 @@ fn job_from_row(row: &Row<'_>) -> rusqlite::Result<Job> {
         hops: row.get(21)?,
         parent: row.get::<_, Option<i64>>(22)?.map(JobId::new),
         profile: row.get(23)?,
+        group: row.get(24)?,
         attachments: Vec::new(),
     })
 }
@@ -2044,6 +2103,98 @@ mod tests {
         let inbox = s.inbox(&windows, Seq::new(0), None, 10).expect("inbox").to_json();
         assert_eq!(inbox["jobs"][1]["profile"], "app-test", "summaries carry it");
         assert_eq!(inbox["jobs"][0]["profile"], Value::Null);
+        drop(s);
+        Store::open(&dir.0).expect("opening twice is fine");
+    }
+
+    #[test]
+    fn a_group_is_one_job_per_recipient() {
+        let (_dir, s) = store();
+        let (linux, windows, mac) = (agent("linux"), agent("windows"), agent("mac"));
+        s.create_job(&linux, delivery(Kind::Message, "windows", "before"))
+            .expect("single");
+        let jobs = s
+            .create_group(
+                &linux,
+                &[windows.clone(), mac.clone()],
+                &delivery(Kind::Notice, "unused", "deploying"),
+            )
+            .expect("group");
+        assert_eq!(jobs.len(), 2);
+        assert_ne!(jobs[0].id, jobs[1].id, "own ids");
+        assert_eq!((jobs[0].to.as_str(), jobs[1].to.as_str()), ("windows", "mac"));
+        assert_eq!((jobs[0].seq, jobs[1].seq), (2, 1), "each recipient's own inbox seq");
+        assert!(jobs[0].group.is_some() && jobs[0].group == jobs[1].group);
+        let again = s
+            .create_group(
+                &linux,
+                std::slice::from_ref(&windows),
+                &delivery(Kind::Notice, "x", "done"),
+            )
+            .expect("group");
+        assert_ne!(again[0].group, jobs[0].group, "a new group per broadcast");
+
+        let out = s.outbox(&linux, Seq::new(0), 50).expect("outbox").to_json();
+        let groups: Vec<&Value> = out["jobs"]
+            .as_array()
+            .expect("jobs")
+            .iter()
+            .map(|j| &j["group"])
+            .collect();
+        let g = format!("g{}", jobs[0].group.unwrap_or_default());
+        assert_eq!(
+            groups,
+            [
+                &Value::Null,
+                &json!(g),
+                &json!(g),
+                &json!(format!("g{}", again[0].group.unwrap_or_default()))
+            ]
+        );
+        let inbox = s.inbox(&mac, Seq::new(0), None, 50).expect("inbox");
+        assert_eq!(inbox.jobs.len(), 1);
+        assert_eq!(inbox.jobs[0].state, State::Received, "delivered as any notice");
+        assert_eq!(
+            state_in_outbox(&s, &linux, jobs[0].id),
+            Some(State::Sent),
+            "windows has not read its copy"
+        );
+    }
+
+    #[test]
+    fn old_databases_gain_the_group_column_and_index() {
+        let dir = TempDir::new();
+        fs::create_dir_all(&dir.0).expect("dir");
+        let conn = Connection::open(dir.0.join("racking.db")).expect("db");
+        conn.execute_batch(
+            "CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, from_agent TEXT NOT NULL, \
+             to_agent TEXT NOT NULL, kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, \
+             tags TEXT NOT NULL, origin TEXT, reply_to INTEGER, outcome TEXT, reason TEXT, state TEXT NOT NULL, \
+             created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, seq INTEGER NOT NULL, \
+             updated_seq INTEGER NOT NULL, priority TEXT NOT NULL DEFAULT 'normal', \
+             expects_reply INTEGER NOT NULL DEFAULT 0, model TEXT, from_role TEXT, \
+             hops INTEGER NOT NULL DEFAULT 0, parent INTEGER, profile TEXT) STRICT;
+             INSERT INTO jobs VALUES (1, 'linux', 'windows', 'message', 't', 'b', '[]', NULL, NULL, NULL, NULL, \
+             'sent', 0, 0, 1, 1, 'normal', 0, NULL, 'worker', 0, NULL, NULL);",
+        )
+        .expect("schema before broadcasts");
+        drop(conn);
+        let s = Store::open(&dir.0).expect("open");
+        let old = s.get_job(&agent("linux"), JobId::new(1)).expect("old job");
+        assert_eq!(old.to_json(View::Summary)["group"], Value::Null);
+        let indexed: i64 = s
+            .db()
+            .query_row(
+                "SELECT count(*) FROM pragma_index_list('jobs') WHERE name = 'jobs_group'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("index list");
+        assert_eq!(indexed, 1);
+        let made = s
+            .create_group(&agent("linux"), &[agent("windows")], &delivery(Kind::Report, "x", "r"))
+            .expect("group");
+        assert!(made[0].to_json(View::Summary)["group"].is_string());
         drop(s);
         Store::open(&dir.0).expect("opening twice is fine");
     }

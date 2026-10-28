@@ -150,7 +150,7 @@ impl Store {
                 after.map(|a| a.1),
                 query.limit.saturating_add(1)
             ],
-            |row| Ok((job_from_row(row)?, row.get::<_, i64>(24)?)),
+            |row| Ok((job_from_row(row)?, row.get::<_, i64>(25)?)),
         )?;
         // Rows are read one at a time, so a page of whole reports never sits in memory past the cap.
         let budget = limits::THREAD_BYTES - 1024;
