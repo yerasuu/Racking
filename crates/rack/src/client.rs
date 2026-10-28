@@ -112,6 +112,9 @@ pub struct Job {
     /// Absent from servers before roles.
     #[serde(default)]
     pub from_role: Option<String>,
+    /// How deep the job is in a chain of tasks, computed by the server; 0 from servers before it.
+    #[serde(default)]
+    pub hops: i64,
 }
 
 /// One entry of `GET /agents`. `about`, `rack_version`, `os` and `capabilities`

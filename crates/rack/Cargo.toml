@@ -12,6 +12,8 @@ ureq = { version = "3", default-features = false, features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# Same version and features as racking-server, so the lockfile gains no new crate.
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 
 [dev-dependencies]
 racking-server = { path = "../racking-server" }

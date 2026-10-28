@@ -1,0 +1,96 @@
+# Local policy of a Racking worker (`rack policy init` writes this file; `rack help policy`).
+#
+# What this machine's agent may do on its own for a task from the main agent, and nothing else.
+# Only this machine's owner edits it. Keep it at ~/.config/rack/policy.toml (%APPDATA%\rack\policy.toml),
+# mode 600; RACK_POLICY=FILE, set by the owner, points elsewhere. rack never reads a policy from a
+# work directory or from a job. Run `rack policy check` after every change.
+#
+# A task asks for a profile with the first line of its body, `Racking-Profile: NAME`, and only a task
+# whose server-set role is main is read for it. `rack policy decide JOB --accept` checks this file and
+# activates the profile; `rack policy hook`, registered in the worker's Claude Code session
+# (`rack policy settings`), holds every tool call to it. Keep profiles minimal: whatever a profile
+# allows, a fooled worker can also do.
+#
+# Patterns: `*` matches any run of characters and `?` one character; everything else is literal and
+# the whole text must match (no regex, no prefix match). In paths a wildcard stays within one
+# directory level. `{workdir}` and the keys of a profile's `vars` are replaced before matching.
+
+version = 1
+
+[worker]
+# The only directory the default profile reads and writes, and where commands of a profile run.
+workdir = '/home/you/rack-work'
+# Accepted tasks open at once.
+max_open_jobs = 1
+# How long an accepted profile stays active (seconds), unless `rack policy release` ends it first.
+max_runtime_secs = 3600
+# The most a result may carry back, unless a profile says less (advice for the worker: rack does not cut output).
+max_output_bytes = 1048576
+# Deepest task chain (server `hops`, 0 to 3) this worker takes work from.
+max_hops = 1
+# Roles whose tasks may start a profile. Only "main" can delegate (decision #44); [] turns delegation off.
+accept_from = ["main"]
+# Tool calls while no profile is active: "deny", or "ask" to put each one to the owner.
+no_profile = "deny"
+
+# Read, write and run a few listing commands, all inside the workdir; no network.
+[profiles.workdir]
+description = "Work inside the workdir only: read and write files there, list it; no network."
+enabled = true
+allow_run = [
+  { cmd = "/usr/bin/ls", args = ["-la"] },
+  { cmd = "/usr/bin/ls", args = ["-la", "{workdir}/*"] },
+]
+# read and write default to ["{workdir}"].
+network = false
+returns = ["stdout", "exit_code", "files:*"]
+
+# Run one app under test with the listed arguments and send back its output and exit code.
+# Keep the app outside the workdir: a command the worker could rewrite is any command.
+[profiles.app-test]
+description = "Run the app under test with fixed arguments; capture stdout, stderr and the exit code."
+enabled = false
+vars = { app = "/opt/myapp/bin/myapp" }
+allow_run = [
+  { cmd = "{app}", args = ["--version"] },
+  { cmd = "{app}", args = ["--self-test"] },
+  { cmd = "{app}", args = ["--input", "{workdir}/*"] },
+]
+timeout_secs = 300
+max_output_bytes = 262144
+returns = ["stdout", "stderr", "exit_code", "files:logs/*.log"]
+
+# Start an app through a compatibility layer (Wine or Proton). A starting point only: tune the
+# arguments, variables and paths with real runs on this machine before enabling it.
+# Proton is usually run as `proton run APP` with STEAM_COMPAT_DATA_PATH set; add that variable and
+# the `run` argument for it. The prefix is readable, never writable, by the worker's file tools.
+[profiles.compat-launch]
+description = "Launch an app under a compatibility layer and collect its output and logs. Tune with real tests."
+enabled = false
+vars = { layer = "/usr/bin/wine", prefix = "/home/you/.wine-test", app = 'C:\Program Files\App\app.exe' }
+allow_run = [
+  { cmd = "{layer}", args = ["{app}"] },
+  { cmd = "{layer}", args = ["{app}", "--log={workdir}/*"] },
+]
+read = ["{workdir}", "{prefix}"]
+write = ["{workdir}"]
+# Values are not checked, only names: keep the list short.
+env_allow = ["WINEPREFIX", "WINEDEBUG", "DXVK_HUD"]
+timeout_secs = 600
+returns = ["stdout", "stderr", "exit_code", "files:*.log"]
+
+# Read-only diagnostics: log files by pattern and a closed list of metric commands with fixed arguments.
+[profiles.diagnostics]
+description = "Read logs and run a fixed set of metric commands; change nothing."
+enabled = false
+allow_run = [
+  { cmd = "/usr/bin/uptime" },
+  { cmd = "/usr/bin/free", args = ["-m"] },
+  { cmd = "/usr/bin/df", args = ["-h"] },
+  { cmd = "/usr/bin/nvidia-smi" },
+  { cmd = "/usr/bin/nvidia-smi", args = ["--query-gpu=name,temperature.gpu,utilization.gpu,memory.used", "--format=csv"] },
+]
+read = ["/var/log/*.log", "{workdir}"]
+write = []
+timeout_secs = 30
+returns = ["stdout", "exit_code"]
