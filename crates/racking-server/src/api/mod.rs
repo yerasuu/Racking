@@ -5,6 +5,7 @@ mod admin;
 mod broadcast;
 mod history;
 mod pairing;
+mod uploads;
 
 use std::fmt::Write as _;
 use std::io::Read;
@@ -371,7 +372,8 @@ static ROUTES: &[Route] = &[
         summary: "Sender: upload a file while the job is `sent`. Same name replaces it.",
         query: &[],
         input: "Raw body. Header `X-Sha256` (hex SHA-256 of the body) is required. `name` is \
-                `[A-Za-z0-9._-]{1,100}`. Limits: 64 MiB per file, 256 MiB and 16 files per job.",
+                `[A-Za-z0-9._-]{1,100}`. Limits: 64 MiB in one PUT (bigger files: `POST /jobs/{id}/uploads`), \
+                16 files and `max_job_bytes` per job, your quota, and the server's free-space reserve.",
         example: "curl -s -T probe.bat -H \"Authorization: Bearer $RACK_TOKEN\" \
                   -H \"X-Sha256: $(sha256sum probe.bat | cut -d' ' -f1)\" $RACK_URL/jobs/j1/attachments/probe.bat",
         handler: put_attachment,
@@ -388,6 +390,93 @@ static ROUTES: &[Route] = &[
         example: "curl -s -D - -o probe.bat -H \"Authorization: Bearer $RACK_TOKEN\" \
                   $RACK_URL/jobs/j1/attachments/probe.bat",
         handler: get_attachment,
+        secret: false,
+    },
+    Route {
+        method: Method::Post,
+        path: "/jobs/{id}/uploads",
+        auth: true,
+        body: BodyKind::Json,
+        summary: "Sender: start a resumable upload of one file while the job is `sent`. Answers 201 with the \
+                  session (`upload_id`, `chunk_size`, `received` 0, `expires_at`), or 200 with the open session \
+                  of the same name, size and sha256: that is how a client resumes. Another open upload of the \
+                  same name answers 409 `conflict`.",
+        query: &[],
+        input: "`name` (`[A-Za-z0-9._-]{1,100}`, replaces an attachment of that name), `size` (bytes, up to \
+                `max_file_bytes`), `sha256` (hex of the whole file), optional `content_type`. The size counts \
+                against the job's 16 files and `max_job_bytes`, your quota and the free-space reserve at once.",
+        example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" -d \"{\\\"name\\\":\\\"disk.img\\\",\
+                  \\\"size\\\":$(stat -c%s disk.img),\\\"sha256\\\":\\\"$(sha256sum disk.img | cut -d' ' -f1)\\\"}\" \
+                  $RACK_URL/jobs/j1/uploads",
+        handler: uploads::create,
+        secret: false,
+    },
+    Route {
+        method: Method::Get,
+        path: "/jobs/{id}/uploads",
+        auth: true,
+        body: BodyKind::None,
+        summary: "Your open uploads to a job: `{\"uploads\": [...]}`, to find a session again by name, size and \
+                  sha256.",
+        query: &[],
+        input: "",
+        example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" $RACK_URL/jobs/j1/uploads",
+        handler: uploads::list,
+        secret: false,
+    },
+    Route {
+        method: Method::Get,
+        path: "/uploads/{upload_id}",
+        auth: true,
+        body: BodyKind::None,
+        summary: "An upload session: `received` (where the next chunk starts), `size`, `state` (`open` or \
+                  `complete`), `expires_at` (24 h after the last chunk). Only its uploader sees it.",
+        query: &[],
+        input: "",
+        example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" $RACK_URL/uploads/u1",
+        handler: uploads::get,
+        secret: false,
+    },
+    Route {
+        method: Method::Put,
+        path: "/uploads/{upload_id}",
+        auth: true,
+        body: BodyKind::Raw,
+        summary: "Write one chunk. It must start at `received`, or 409 `bad_offset` with `error.received`; a \
+                  chunk wholly before `received` was stored already and answers 200 unchanged. A chunk cut short \
+                  keeps the bytes that arrived (400 with `error.received`). Answers the session.",
+        query: &[],
+        input: "Raw body of at most `chunk_size` bytes, with `Content-Length` and `Content-Range: bytes \
+                FIRST-LAST/SIZE` (RFC 9110 section 14.4: LAST inclusive, one range, SIZE the upload's size).",
+        example: "head -c 8388608 disk.img > chunk0 && curl -s -T chunk0 -H \"Authorization: Bearer $RACK_TOKEN\" \
+                  -H \"Content-Range: bytes 0-8388607/$(stat -c%s disk.img)\" $RACK_URL/uploads/u1",
+        handler: uploads::put_chunk,
+        secret: false,
+    },
+    Route {
+        method: Method::Post,
+        path: "/uploads/{upload_id}/complete",
+        auth: true,
+        body: BodyKind::None,
+        summary: "Once `received` equals `size`: checks the sha256 of the whole file and makes it an attachment \
+                  of the job, which must still be `sent`. 422 `checksum_mismatch` ends the session. Repeating it \
+                  answers the same attachment.",
+        query: &[],
+        input: "",
+        example: "curl -s -X POST -H \"Authorization: Bearer $RACK_TOKEN\" $RACK_URL/uploads/u1/complete",
+        handler: uploads::complete,
+        secret: false,
+    },
+    Route {
+        method: Method::Delete,
+        path: "/uploads/{upload_id}",
+        auth: true,
+        body: BodyKind::None,
+        summary: "Abort an upload and delete its data.",
+        query: &[],
+        input: "",
+        example: "curl -s -X DELETE -H \"Authorization: Bearer $RACK_TOKEN\" $RACK_URL/uploads/u1",
+        handler: uploads::abort,
         secret: false,
     },
     Route {
@@ -1379,11 +1468,21 @@ pub fn guide() -> String {
          are skipped (`not_allowed`, the same for an agent that does not exist); the request answers 201 while at \
          least one job was made, 403 `not_allowed` when none. Every job made counts against your jobs per minute, \
          all or none. Attachments are uploaded to each job.\n\n\
+         ## Big files\n\nOne `PUT /jobs/{{id}}/attachments/{{name}}` carries up to {} MiB. A bigger file (up to \
+         `max_file_bytes`, see `GET /whoami`) goes in chunks that survive a cut connection: `POST \
+         /jobs/{{id}}/uploads` with name, size and sha256 starts a session; `PUT /uploads/{{upload_id}}` with \
+         `Content-Range` writes each chunk in order; after a failure `GET /uploads/{{upload_id}}` (or the same \
+         `POST` again) gives `received`, the offset to continue from; `POST /uploads/{{upload_id}}/complete` \
+         checks the sha256 and attaches the file. Sessions idle for 24 h are dropped with their data. Every \
+         agent has a quota: the attachments of the jobs it sent plus its open uploads (`GET /whoami` shows \
+         `quota`); a closed job's files leave it when the job is purged. Uploads that would leave the server's \
+         disk under its reserve answer 507 `insufficient_storage`.\n\n\
          ## Retries\n\nAny POST or PUT accepts `Idempotency-Key` (up to {} chars). The same key and request within \
          24 h returns the stored answer; the same key with another request answers 422 `idempotency_conflict`.\n",
         env!("CARGO_PKG_VERSION"),
         presence::ONLINE_SECS,
         limits::RECIPIENTS,
+        limits::FILE_BYTES >> 20,
         limits::IDEMPOTENCY_KEY_CHARS
     );
     let _ = writeln!(md, "## Routes\n");
@@ -1418,8 +1517,10 @@ pub fn guide() -> String {
     let _ = writeln!(
         md,
         "\n## Limits\n\nTitle {} chars, body {} KiB (notice {} KiB, report {} MiB; whole in `/inbox` up to {} KiB \
-         for notices and messages), {} tags of {} chars, {} files per job, {} MiB per file, {} MiB \
-         per job, wait {} s default and {} s max, lists {} by default and {} max, {} MiB per published `rack` binary.",
+         for notices and messages), {} tags of {} chars, {} files per job, {} MiB per file in one PUT (bigger \
+         ones through uploads, up to the server's `max_file_bytes`, and `max_job_bytes` per job: `GET /whoami` \
+         says both), wait {} s default and {} s max, lists {} by default and {} max, {} MiB per published `rack` \
+         binary.",
         limits::TITLE_CHARS,
         limits::BODY_BYTES / 1024,
         limits::NOTICE_BYTES / 1024,
@@ -1429,7 +1530,6 @@ pub fn guide() -> String {
         limits::TAG_CHARS,
         limits::FILES_PER_JOB,
         limits::FILE_BYTES >> 20,
-        limits::JOB_FILE_BYTES >> 20,
         limits::WAIT_DEFAULT_SECS,
         limits::WAIT_MAX_SECS,
         limits::LIST_DEFAULT,
@@ -1441,6 +1541,7 @@ pub fn guide() -> String {
 
 fn whoami(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
     let me = call.caller()?;
+    let rules = app.store.upload_rules();
     ok(json!({
         "agent": me.name.as_str(),
         "role": me.role.as_str(),
@@ -1458,7 +1559,9 @@ fn whoami(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
             "tag_chars": limits::TAG_CHARS,
             "files_per_job": limits::FILES_PER_JOB,
             "file_bytes": limits::FILE_BYTES,
-            "job_file_bytes": limits::JOB_FILE_BYTES,
+            "upload_file_bytes": rules.max_file_bytes,
+            "upload_chunk_bytes": rules.chunk_bytes,
+            "job_file_bytes": rules.max_job_bytes,
             "wait_default_secs": limits::WAIT_DEFAULT_SECS,
             "wait_max_secs": limits::WAIT_MAX_SECS,
             "list_max": limits::LIST_MAX,
@@ -1468,6 +1571,7 @@ fn whoami(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
             "open_tasks_per_pair": app.store.open_task_limit(),
             "jobs_per_minute": app.per_minute.limit(),
         },
+        "quota": {"used": app.store.quota_used(&me.name)?, "limit": rules.per_agent_bytes},
         "version": env!("CARGO_PKG_VERSION"),
     }))
 }
@@ -1912,6 +2016,8 @@ fn put_attachment(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
             ),
         ));
     }
+    app.store
+        .check_disk(call.request.body_length().map_or(0, |n| n as u64))?;
     let content_type = call.header("Content-Type").map(|c| truncate(c, 100).to_owned());
     let me = call.me()?.clone();
     let att = app.store.put_attachment(

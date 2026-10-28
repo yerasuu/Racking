@@ -25,11 +25,14 @@ pub enum Code {
     Paused,
     InviteRefused,
     NotConfirmed,
+    BadOffset,
+    OverQuota,
+    InsufficientStorage,
 }
 
 impl Code {
     /// Every code with its status and meaning, in the order `/help` lists them.
-    pub const ALL: [(Code, &'static str); 20] = [
+    pub const ALL: [(Code, &'static str); 23] = [
         (
             Code::BadRequest,
             "Malformed JSON or field out of range. `message` names the field.",
@@ -82,7 +85,24 @@ impl Code {
             "The job is no longer `sent`, attachments are fixed; or it is a notice, which carries no files.",
         ),
         (Code::TooLarge, "Body or file over the limit. The hint names the limit."),
-        (Code::ChecksumMismatch, "`X-Sha256` differs from the uploaded bytes."),
+        (
+            Code::BadOffset,
+            "Upload: the chunk does not start at the session's `received` offset, or `complete` came before every \
+             byte arrived. `error.received` says where to continue.",
+        ),
+        (
+            Code::OverQuota,
+            "Upload: the attachments of the jobs you sent, with your open uploads, would pass your quota. The hint \
+             names your use and the limit.",
+        ),
+        (
+            Code::InsufficientStorage,
+            "Upload: the server's disk is below its free-space reserve. Retry later or send less.",
+        ),
+        (
+            Code::ChecksumMismatch,
+            "`X-Sha256` (or an upload's `sha256`) differs from the uploaded bytes.",
+        ),
         (
             Code::IdempotencyConflict,
             "Same `Idempotency-Key` used for a different request.",
@@ -116,12 +136,13 @@ impl Code {
             | Code::InviteRefused
             | Code::NotConfirmed => 403,
             Code::NotFound => 404,
-            Code::BadTransition | Code::TooDeep | Code::AttachmentsLocked | Code::Conflict => 409,
-            Code::TooLarge => 413,
+            Code::BadTransition | Code::TooDeep | Code::AttachmentsLocked | Code::Conflict | Code::BadOffset => 409,
+            Code::TooLarge | Code::OverQuota => 413,
             Code::ChecksumMismatch | Code::IdempotencyConflict => 422,
             Code::RateLimited => 429,
             Code::Internal => 500,
             Code::Paused => 503,
+            Code::InsufficientStorage => 507,
         }
     }
 
@@ -147,6 +168,9 @@ impl Code {
             Code::Conflict => "conflict",
             Code::InviteRefused => "bad_code",
             Code::NotConfirmed => "not_confirmed",
+            Code::BadOffset => "bad_offset",
+            Code::OverQuota => "over_quota",
+            Code::InsufficientStorage => "insufficient_storage",
         }
     }
 }
@@ -158,6 +182,8 @@ pub struct ApiError {
     pub hint: String,
     /// Seconds for the `Retry-After` header of a 429 or 503.
     pub retry_after: Option<u64>,
+    /// The upload offset a `bad_offset` answer carries, so a client resumes without another request.
+    pub received: Option<u64>,
 }
 
 impl ApiError {
@@ -167,12 +193,19 @@ impl ApiError {
             message: message.into(),
             hint: hint.into(),
             retry_after: None,
+            received: None,
         }
     }
 
     #[must_use]
     pub fn with_retry_after(mut self, secs: u64) -> Self {
         self.retry_after = Some(secs);
+        self
+    }
+
+    #[must_use]
+    pub fn with_received(mut self, received: u64) -> Self {
+        self.received = Some(received);
         self
     }
 
@@ -192,7 +225,11 @@ impl ApiError {
     }
 
     pub fn body(&self) -> serde_json::Value {
-        json!({"error": {"code": self.code.as_str(), "message": self.message, "hint": self.hint}})
+        let mut body = json!({"error": {"code": self.code.as_str(), "message": self.message, "hint": self.hint}});
+        if let Some(received) = self.received {
+            body["error"]["received"] = received.into();
+        }
+        body
     }
 }
 

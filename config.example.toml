@@ -58,3 +58,18 @@ token = "CHANGE-ME-windows-token"
 # [limits]
 # open_tasks_per_pair = 20   # tasks still open from one sender to one recipient
 # jobs_per_minute = 60       # jobs of any kind one sender creates per minute
+# Attachment sizes. One plain upload carries 64 MiB; bigger files go in
+# resumable chunks (rack attach does it) up to max_file_bytes (at most 16 GiB).
+# max_file_bytes = 2147483648      # 2 GiB per file
+# max_job_bytes = 4294967296       # 4 GiB of files per job
+# upload_chunk_bytes = 8388608     # 8 MiB per chunk request
+
+# Disk an agent may fill (defaults shown). per_agent_bytes counts the files of
+# the jobs an agent SENT (the sender fills the disk) plus its open uploads, until
+# the jobs are purged 30 days after they close. Uploads that would leave the
+# data_dir's file system with less than disk_free_min_bytes free are refused
+# (0 turns that check off; it needs `df`, and is skipped where df is missing).
+# Size data_dir for agents x per_agent_bytes, plus the reserve.
+# [quota]
+# per_agent_bytes = 8589934592     # 8 GiB
+# disk_free_min_bytes = 1073741824 # 1 GiB

@@ -122,12 +122,35 @@ Binary file attached to a job. Rules:
 
 - Uploaded by the sender after the job is created (`PUT /jobs/{id}/attachments/{name}`), only while the job is `sent`. A `notice` takes none (`409 attachments_locked`, hint: send a message).
 - `name`: `[A-Za-z0-9._-]{1,100}`, no path parts.
-- Limit 64 MiB per file, 256 MiB per job, 16 files per job. Larger files: split or send a git bundle.
-- The uploader sends `X-Sha256`. The service checks it and answers `422 checksum_mismatch` if it differs.
+- Limits: 64 MiB in one `PUT`; up to `max_file_bytes` (default 2 GiB, at most 16 GiB) per file through a resumable upload (see Uploads); 16 files and `max_job_bytes` (default 4 GiB) per job, open uploads included; the sender's quota; the server's free-space reserve. Larger files: split them, or send a git bundle.
+- The uploader sends `X-Sha256` (a resumable upload sends `sha256` when it starts). The service checks it and answers `422 checksum_mismatch` if it differs.
 - Download returns `X-Sha256`. The receiver must verify it.
 - Content type is stored but never trusted. Files are never executed by the service.
 
-Conventional names: `*.patch` (git format-patch mbox), `*.bundle` (git bundle), `report.md`, `*.log`.
+Conventional names: `*.patch` (git format-patch mbox), `*.bundle` (git bundle), `report.md`, `*.log`, `DIR.tar` (a directory `rack attach` packed: plain ustar, see `docs/commands/attach.md`).
+
+### Uploads
+
+A file too big for one `PUT` (64 MiB), or one sent over a link that drops, goes in chunks through an upload session (#29). Every step can be repeated after a cut connection, and the client continues from the offset the server reports.
+
+1. `POST /jobs/{id}/uploads` with `{"name", "size", "sha256", "content_type"?}`, by the sender while the job is `sent`. The answer is `201` with the session: `{"upload_id": "u1", "job", "name", "size", "sha256", "received": 0, "state": "open", "chunk_size": 8388608, "expires_at"}`. The size counts at once against the job's 16 files and `max_job_bytes`, the sender's quota and the free-space reserve, so a refusal comes before any byte travels. The same request while that session is open answers `200` with it (that is how a client that lost the id resumes); an open session of the same name with another size or sha256 answers `409 conflict` (abort it first).
+2. `PUT /uploads/{upload_id}`, one per chunk, raw body with `Content-Length` and `Content-Range: bytes FIRST-LAST/SIZE` ([RFC 9110 section 14.4](https://www.rfc-editor.org/rfc/rfc9110.html#name-content-range): `LAST` inclusive; a range with `LAST < FIRST` or `SIZE <= LAST` is invalid). Deviations from the RFC, all answered `400`: the unit must be `bytes`, `SIZE` must be the session's size (no `*`), the `bytes */SIZE` form is refused, and only one contiguous range per request, in order. A partial `PUT` to a separate resource is what [section 14.5](https://www.rfc-editor.org/rfc/rfc9110.html#name-partial-put) suggests; the attachment route itself takes no `Content-Range`.
+   - `FIRST` must equal `received`, or `409 bad_offset` with `error.received` (no second request needed to learn it).
+   - A chunk that lies wholly before `received` was stored already (a retry whose answer was lost): `200` with the session unchanged, its bytes not compared. The sha256 at `complete` covers every byte, so a changed retry cannot slip through.
+   - A chunk over `chunk_size` answers `413 too_large`.
+   - A chunk cut short (the connection dropped) keeps the bytes that arrived: `received` moves past them and the request answers `400` with `error.received`. Retry from there.
+   - A second request writing the same session while one runs answers `429 rate_limited`, `Retry-After: 1`.
+3. `GET /uploads/{upload_id}` gives `received`, `size` and `state` (`open` or `complete`); `GET /jobs/{id}/uploads` lists your open sessions of a job.
+4. `POST /uploads/{upload_id}/complete` once `received` equals `size` (`409 bad_offset` before). The server reads the stored file once (streamed) for its sha256: a mismatch answers `422 checksum_mismatch` and ends the session with its data. Otherwise the file becomes attachment `name` of the job (replacing one of that name), which must still be `sent`. Repeating `complete` answers the same attachment.
+5. `DELETE /uploads/{upload_id}` aborts and deletes the data.
+
+Only the agent that started a session sees or touches it (`403 not_yours`). A session with no chunk for 24 h is dropped with its data (`expires_at`); cancelling the job drops its sessions too. Partial data lives in the data directory's `tmp/` until it completes.
+
+### Quota and disk
+
+- **Quota per agent** (`[quota] per_agent_bytes`, default 8 GiB): the attachments of the jobs an agent sent, plus the declared size of its open uploads. The sender is who fills the disk, so the sender pays; what an agent receives costs it nothing. A job's files leave the quota when the job is purged (30 days after it closes) or cancelled. Over it: `413 over_quota`, the hint naming the use and the limit. `GET /whoami` shows `"quota": {"used", "limit"}`.
+- **Free-space reserve** (`[quota] disk_free_min_bytes`, default 1 GiB, `0` turns it off): a new upload (a session, or a one-request `PUT`) that would leave the data directory's file system with less free space answers `507 insufficient_storage`. The server reads free space with POSIX `df -P -k` ([POSIX: df](https://pubs.opengroup.org/onlinepubs/9799919799/utilities/df.html)), since the Rust standard library has no call for it; where `df` is missing the check is skipped (and logged once), and the quota still bounds each agent.
+- **Cleanup**: the hourly purge drops idle sessions and their files, and deletes files under the data directory that no row points to any more (part files, temp files of a cut one-request upload, attachment folders of deleted jobs) once they are an hour old.
 
 ## Broadcasts
 
@@ -235,7 +258,7 @@ All need the Bearer token, except `GET /` and `GET /help` (they show no data) an
 | `POST /join` | Redeem a pairing code: `{"code", "name"?, "os"?, "rack_version"?}`. Answers the new agent's `token` (once) and the `fingerprint`; the agent is pending. |
 | `GET /join/status` | With the joiner's token: `pending`, `confirmed` or `denied`; `timeout` blocks while pending. |
 | `GET /agent-links` | The agents you are linked with (see Linking). |
-| `GET /whoami` | `{"agent": "linux", "role": "main", "roles_enforced": true, "admin": true, "paused": false, "peers": ["windows"], "limits": {...}}`. `peers` are the agents you may send to. |
+| `GET /whoami` | `{"agent": "linux", "role": "main", "roles_enforced": true, "admin": true, "paused": false, "peers": ["windows"], "limits": {...}, "quota": {"used", "limit"}}`. `peers` are the agents you may send to. `limits` has `file_bytes` (one `PUT`), `upload_file_bytes`, `upload_chunk_bytes` and `job_file_bytes` among the rest. |
 | `GET /agents` | Every agent with `role` (from the server config), `online`, `last_seen`, `idle_secs`, `rack_version`, `os`, `about`, `capabilities` (see Presence). |
 | `PUT /agents/me` | Set your own `about` and `capabilities` (also `rack_version`, `os`, which clients send as headers instead). |
 | `POST /jobs` | Create a job, or one per recipient for a broadcast (`to` a list or `"*"`). Body: `to`, `kind`, `title`, `body`, `tags`, `origin`, `reply_to`, `outcome`, `priority`, `expects_reply`, `model`, `hops`, `parent`, `profile`. |
@@ -246,8 +269,14 @@ All need the Bearer token, except `GET /` and `GET /help` (they show no data) an
 | `POST /jobs/{id}/accept` | Task: to `accepted`. |
 | `POST /jobs/{id}/reject` | Task: to `rejected`. Body: `reason`. |
 | `POST /jobs/{id}/cancel` | Sender cancels while `sent`. Deletes the job and attachments. |
-| `PUT /jobs/{id}/attachments/{name}` | Upload (raw body, `X-Sha256`). |
+| `PUT /jobs/{id}/attachments/{name}` | Upload (raw body, `X-Sha256`), up to 64 MiB. |
 | `GET /jobs/{id}/attachments/{name}` | Download. |
+| `POST /jobs/{id}/uploads` | Start a resumable upload, or find the open one of the same file (see Uploads). |
+| `GET /jobs/{id}/uploads` | Your open uploads to a job. |
+| `GET /uploads/{upload_id}` | One upload: `received`, `size`, `state`, `expires_at`. |
+| `PUT /uploads/{upload_id}` | Write one chunk (`Content-Range`). |
+| `POST /uploads/{upload_id}/complete` | Check the sha256 and attach the file. |
+| `DELETE /uploads/{upload_id}` | Abort and delete the data. |
 | `GET /inbox` | Jobs for me: summaries, whole bodies for notices and short messages. Delivers notices, messages and reports, unless `peek=1`. |
 | `GET /inbox/wait` | Same, blocking. |
 | `GET /outbox` | Jobs I sent, with their current state. Same cursor rules, on `updated_seq` (see below). |
@@ -309,17 +338,20 @@ Error:
 | 409 | `conflict` | Admin API: the name is taken (by an agent or an open invite), a second main agent was asked for, or an invite is not in the state the call needs. |
 | 409 | `too_deep` | The job would be over 3 `hops` deep. Hint: report back to whoever started the chain instead. |
 | 409 | `attachments_locked` | Job already received, or a notice (no files). |
-| 413 | `too_large` | Body or file over the limit (64 KiB, notice 1 KiB, report 1 MiB). Hint names the limit. |
-| 422 | `checksum_mismatch` | `X-Sha256` differs. Hint: upload again. |
+| 409 | `bad_offset` | Upload: the chunk does not start at `received`, or `complete` came early. `error.received` is the offset to continue from. |
+| 413 | `too_large` | Body, file, chunk or job files over the limit (64 KiB, notice 1 KiB, report 1 MiB, 64 MiB per `PUT`, `max_file_bytes`, `max_job_bytes`, 16 files). Hint names the limit. |
+| 413 | `over_quota` | Upload: the sender's quota would be passed. Hint names use and limit. |
+| 422 | `checksum_mismatch` | `X-Sha256` (or the upload's `sha256`) differs. Hint: upload again. |
 | 422 | `idempotency_conflict` | See above. |
 | 429 | `rate_limited` | Too many requests in flight, the same `Idempotency-Key` still running, or a sender limit (see Limits per sender). The `Retry-After` header and the hint say how long to wait. |
 | 500 | `internal` | Storage or disk failure. Details go to the server log only. |
 | 503 | `paused` | The emergency brake is on and you are a worker: stop acting on jobs until the owner resumes. |
 | 503 | `shutting_down` | Retry later. |
+| 507 | `insufficient_storage` | Upload: the server's disk is below its free-space reserve. |
 
 ## Limits per sender
 
-Guards against an agent that sends without end, set in the server config under `[limits]` and enforced by the server. Body and attachment limits are separate and unchanged.
+Guards against an agent that sends without end, set in the server config under `[limits]` and enforced by the server. The same section sets the upload sizes (`max_file_bytes`, `max_job_bytes`, `upload_chunk_bytes`; see Attachment and Uploads); `[quota]` the disk an agent may take (see Quota and disk).
 
 | Key | Default | What |
 |---|---|---|
@@ -486,7 +518,7 @@ The check is advisory: capabilities are what each agent says about itself.
 |---|---|
 | Connection drops during `POST /jobs` | Retry with the same `Idempotency-Key`. No duplicate. |
 | Connection drops during `wait` | Call again with the stored cursor. |
-| Upload interrupted | Upload the same name again. It replaces the partial file. |
+| Upload interrupted | One `PUT`: upload the same name again; it replaces the partial file. A resumable upload: `GET /uploads/{upload_id}` (or the same `POST /jobs/{id}/uploads`) and continue from `received`. |
 | Recipient offline | Job stays `sent`. Jobs are kept 30 days after `done`, `rejected`, `failed` or `answered`, or after delivery for a notice, message or report that expects no reply, and without limit while open. |
 | Unknown recipient | `404 not_found`, hint lists `GET /whoami` peers. |
 | Local `kb` missing or fails during `pull` | The job stays `received`, not linked. Next `pull` retries it. Nothing is lost. |

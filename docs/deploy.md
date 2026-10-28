@@ -62,6 +62,10 @@ docker compose start racking
 
 The volume is named `<project>_racking-data` (`docker volume ls`; the project is the directory name, `racking` here). Back up `config/server.toml` too, as privately as it is kept.
 
+### Disk size and quotas
+
+Attachments can be large: one file up to `max_file_bytes` (2 GiB by default, at most 16 GiB) through resumable uploads, `max_job_bytes` (4 GiB) per job, and each agent up to `[quota] per_agent_bytes` (8 GiB) of files on the jobs it sent, counted until the jobs are purged 30 days after they close. Size the data volume for the number of agents times their quota, plus `disk_free_min_bytes` (1 GiB), the free space below which the server refuses new uploads with 507. Partial uploads live in `tmp/` of the data directory and are dropped 24 h after their last chunk; a backup may leave `tmp/` out. With large attachments, archive `racking.db` and `attachments/` separately, or with a tool that copies only what changed (`rsync`), instead of one `tar` of the whole volume each time. The keys are in [config.example.toml](../config.example.toml).
+
 ### Firewall
 
 Docker publishes ports with its own iptables rules, which bypass `ufw`'s rules. Limit exposure with the published address (`RACKING_BIND_IP`) and, if needed, rules in the `DOCKER-USER` chain ([Docker packet filtering](https://docs.docker.com/engine/network/packet-filtering-firewalls/)). Never forward the port to the internet.
@@ -100,7 +104,7 @@ docker compose logs -f traefik
 What the configuration sets, from the Traefik docs ([entrypoints](https://doc.traefik.io/traefik/v3.6/reference/install-configuration/entrypoints/), [ACME](https://doc.traefik.io/traefik/v3.6/reference/install-configuration/tls/certificate-resolvers/acme/), [RateLimit](https://doc.traefik.io/traefik/v3.6/reference/routing-configuration/http/middlewares/ratelimit/), [Buffering](https://doc.traefik.io/traefik/v3.6/reference/routing-configuration/http/middlewares/buffering/)):
 
 - Entrypoint `web` on 80 redirects to `websecure` on 443, which has read 60 s, write 90 s and idle 120 s timeouts against slow connections. The write timeout stays above the 55 s maximum of `GET /inbox/wait`.
-- In `config/traefik-dynamic.yml`: a rate limit of 50 requests/s (burst 100) per source address, a request body limit of 64 MiB (`maxRequestBodyBytes`, the server's largest attachment) through the Buffering middleware, and the service `http://racking:7878`.
+- In `config/traefik-dynamic.yml`: a rate limit of 50 requests/s (burst 100) per source address, a request body limit of 64 MiB (`maxRequestBodyBytes`, the largest one-request attachment; resumable uploads send chunks of `upload_chunk_bytes`, 8 MiB by default, so keep that setting at or under this limit) through the Buffering middleware, and the service `http://racking:7878`.
 - The certificate is stored in the `traefik-acme` volume as `acme.json`; Traefik creates it with mode 600.
 - The router matches ``Host(`your domain`)`` only; other hosts get 404.
 - Traefik watches the dynamic file (`providers.file.watch=true`); edits apply without a restart.
@@ -232,7 +236,7 @@ sqlite3 "$dir/racking.db" ".backup '$HOME/racking-backup/racking.db'"
 cp -a "$dir/attachments" "$dir/dist" ~/racking-backup/
 ```
 
-Or stop the service, copy the whole directory, and start it again. Keep `server.toml` in the backup too: it holds the tokens, so store it as privately as it is here.
+`tmp/` holds only partial uploads and may be left out. Or stop the service, copy the whole directory, and start it again. Size the disk as [Disk size and quotas](#disk-size-and-quotas) says. Keep `server.toml` in the backup too: it holds the tokens, so store it as privately as it is here.
 
 ### Firewall
 

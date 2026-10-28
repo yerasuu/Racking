@@ -2,13 +2,14 @@
 //! attachment files under the data directory. Job content is stored as given
 //! and never interpreted.
 
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ValueRef};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
@@ -19,10 +20,12 @@ use sha2::{Digest, Sha256};
 mod admin;
 mod history;
 mod pairing;
+mod uploads;
 
 pub use admin::{AuditEntry, Managed};
 pub use history::{SearchQuery, ThreadQuery};
 pub use pairing::{Decision, Invite, InviteState, NewInvite, Redeem, bad_code};
+pub use uploads::{NewUpload, Opened, UploadRules, df_free_space};
 
 use crate::clock;
 use crate::config::SenderLimits;
@@ -45,9 +48,14 @@ pub mod limits {
     pub const PREVIEW_CHARS: usize = 200;
     pub const TAGS: usize = 16;
     pub const TAG_CHARS: usize = 40;
+    /// One `PUT /jobs/{id}/attachments/{name}`; bigger files go through resumable uploads.
     pub const FILE_BYTES: u64 = 64 * 1024 * 1024;
-    pub const JOB_FILE_BYTES: u64 = 256 * 1024 * 1024;
     pub const FILES_PER_JOB: usize = 16;
+    /// An upload session with no chunk for this long is dropped with its data.
+    pub const UPLOAD_IDLE_SECS: i64 = 24 * 3600;
+    /// Files under the data directory that no row points to are deleted once
+    /// this old, so a file whose row is being written is never taken for one.
+    pub const ORPHAN_AGE_SECS: u64 = 3600;
     /// One published `rack` binary; a release build is a few MiB.
     pub const DIST_BYTES: u64 = 32 * 1024 * 1024;
     pub const WAIT_DEFAULT_SECS: u64 = 25;
@@ -621,9 +629,17 @@ pub struct Store {
     /// One connection for all requests: `rusqlite::Connection` is not `Sync`,
     /// and two agents never make the lock a bottleneck.
     conn: Mutex<Connection>,
+    data_dir: PathBuf,
     files: PathBuf,
     tmp: PathBuf,
     changes: Changes,
+    /// `[limits]` upload sizes and `[quota]`.
+    rules: UploadRules,
+    free_space: uploads::FreeSpace,
+    free_space_warned: AtomicBool,
+    /// Upload sessions a request is writing right now: a set, since a session is
+    /// either in it or not, and the lock is held only to insert or remove an id.
+    writing: Mutex<HashSet<i64>>,
     tmp_counter: AtomicU64,
     last_purge: AtomicI64,
     /// `[limits] open_tasks_per_pair`, counted from the jobs table so it survives restarts.
@@ -644,6 +660,7 @@ impl Store {
         conn.execute_batch(SCHEMA)
             .and_then(|()| conn.execute_batch(admin::SCHEMA))
             .and_then(|()| conn.execute_batch(pairing::SCHEMA))
+            .and_then(|()| conn.execute_batch(uploads::SCHEMA))
             .map_err(|e| format!("cannot set up the schema: {e}"))?;
         add_reply_columns(&conn).map_err(|e| format!("cannot add the priority columns: {e}"))?;
         add_columns(&conn, HINT_COLUMNS).map_err(|e| format!("cannot add the model and capabilities columns: {e}"))?;
@@ -654,8 +671,13 @@ impl Store {
             .map_err(|e| format!("cannot add the group column: {e}"))?;
         Ok(Self {
             conn: Mutex::new(conn),
+            data_dir: data_dir.to_owned(),
             files,
             tmp,
+            rules: UploadRules::default(),
+            free_space: Arc::new(df_free_space),
+            free_space_warned: AtomicBool::new(false),
+            writing: Mutex::new(HashSet::new()),
             changes: Changes {
                 version: Mutex::new(0),
                 cv: Condvar::new(),
@@ -900,10 +922,14 @@ impl Store {
                 "Only a job still `sent` can be cancelled; send a comment to the recipient instead.",
             ));
         }
+        let uploads = Self::upload_ids_of_job(&tx, id)?;
         tx.execute("DELETE FROM jobs WHERE id = ?1", [id.get()])?;
         tx.commit()?;
         drop(conn);
         self.remove_job_files(id);
+        for upload in uploads {
+            self.remove_part(upload);
+        }
         self.changes.bump();
         Ok(())
     }
@@ -935,21 +961,20 @@ impl Store {
         let budget = {
             let conn = self.db();
             let job = load_job(&conn, id, View::Summary)?;
-            check_upload(&job, me, name)?
+            check_upload(&conn, &self.rules, &job, me, name, limits::FILE_BYTES)?
         };
         let tmp_path = self.tmp.join(format!(
             "{}-{}.part",
             std::process::id(),
             self.tmp_counter.fetch_add(1, Ordering::Relaxed)
         ));
-        let too_large = || too_large_for_job(budget);
-        let result = receive_file(&tmp_path, body, budget.max_bytes, too_large, claimed).and_then(|size| {
+        let result = receive_file(&tmp_path, body, budget.max_bytes, || budget.error(), claimed).and_then(|size| {
             let mut conn = self.db();
             let tx = conn.transaction()?;
             let job = load_job(&tx, id, View::Summary)?;
-            let budget = check_upload(&job, me, name)?;
+            let budget = check_upload(&tx, &self.rules, &job, me, name, limits::FILE_BYTES)?;
             if size > budget.max_bytes {
-                return Err(too_large_for_job(budget));
+                return Err(budget.error());
             }
             let dir = self.job_dir(id);
             fs::create_dir_all(&dir).map_err(|e| ApiError::internal("create the attachment directory", &e))?;
@@ -1268,19 +1293,26 @@ impl Store {
             return;
         }
         match self.purge(now) {
-            Ok(ids) => {
-                for id in &ids {
+            Ok(purged) => {
+                for id in &purged.jobs {
                     self.remove_job_files(*id);
                 }
-                if !ids.is_empty() {
-                    tracing::info!(target: "racking::store", jobs = ids.len(), "purged closed jobs");
+                for id in &purged.uploads {
+                    self.remove_part(*id);
+                }
+                if !purged.jobs.is_empty() || !purged.uploads.is_empty() {
+                    tracing::info!(target: "racking::store", jobs = purged.jobs.len(), uploads = purged.uploads.len(), "purged closed jobs and idle uploads");
                 }
             }
             Err(e) => tracing::warn!(target: "racking::store", error = %e.message, "purge failed"),
         }
+        self.sweep_orphans(Duration::from_secs(limits::ORPHAN_AGE_SECS));
     }
 
-    fn purge(&self, now: i64) -> ApiResult<Vec<JobId>> {
+    /// Deletes the rows past their retention; the caller removes their files.
+    /// The sessions of a purged job go with it (`ON DELETE CASCADE`) and the
+    /// orphan sweep removes their files.
+    fn purge(&self, now: i64) -> ApiResult<uploads::Purged> {
         let mut conn = self.db();
         let tx = conn.transaction()?;
         tx.execute(
@@ -1297,8 +1329,13 @@ impl Store {
             let rows = stmt.query_map([now - limits::CLOSED_JOB_TTL_SECS], |row| row.get(0).map(JobId::new))?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
+        let uploads = {
+            let mut stmt = tx.prepare("DELETE FROM uploads WHERE updated_at <= ?1 RETURNING id")?;
+            let rows = stmt.query_map([now - limits::UPLOAD_IDLE_SECS], |row| row.get(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
         tx.commit()?;
-        Ok(ids)
+        Ok(uploads::Purged { jobs: ids, uploads })
     }
 }
 
@@ -1360,13 +1397,61 @@ pub fn receive_file(
     Ok(size)
 }
 
-/// What an upload may still add to a job.
+/// What an upload may still add to a job, and the limit that sets it.
 #[derive(Clone, Copy)]
 struct Budget {
     max_bytes: u64,
+    bound: Bound,
 }
 
-fn check_upload(job: &Job, me: &AgentName, name: &AttachmentName) -> ApiResult<Budget> {
+#[derive(Clone, Copy)]
+enum Bound {
+    File(u64),
+    Job(u64),
+    Quota { used: u64, limit: u64 },
+}
+
+impl Budget {
+    /// The refusal of an upload larger than `max_bytes`, naming the limit it hit.
+    fn error(self) -> ApiError {
+        match self.bound {
+            Bound::File(limit) => ApiError::new(
+                Code::TooLarge,
+                format!("file is over the {limit} bytes this upload may carry"),
+                format!(
+                    "One PUT carries up to {} MiB; bigger files go through POST /jobs/{{id}}/uploads (`rack attach` \
+                     does it). GET /whoami lists the limits.",
+                    limits::FILE_BYTES >> 20
+                ),
+            ),
+            Bound::Job(limit) => ApiError::new(
+                Code::TooLarge,
+                format!("the job's files would pass its {limit} bytes"),
+                "Send the rest on another job, or pack and compress the files.",
+            ),
+            Bound::Quota { used, limit } => ApiError::new(
+                Code::OverQuota,
+                format!("your attachments would pass your quota: {used} of {limit} bytes used"),
+                "The quota counts the files of jobs you sent until they are purged (30 days after they close) and \
+                 your open uploads. Cancel jobs still sent, abort open uploads (DELETE /uploads/{id}), or ask the \
+                 owner to raise [quota] per_agent_bytes.",
+            ),
+        }
+    }
+}
+
+/// Checks that `me` may attach `name` to `job` now, and what it may add: the
+/// least of `per_file`, what the job has left and what `me`'s quota has left.
+/// Open uploads to the job count as its files already, and the file `name`
+/// replaces counts for neither.
+fn check_upload(
+    conn: &Connection,
+    rules: &UploadRules,
+    job: &Job,
+    me: &AgentName,
+    name: &AttachmentName,
+    per_file: u64,
+) -> ApiResult<Budget> {
     if !job.is_party(me) {
         return Err(not_yours(job));
     }
@@ -1391,34 +1476,44 @@ fn check_upload(job: &Job, me: &AgentName, name: &AttachmentName) -> ApiResult<B
             "Send the file on a new job (kind \"comment\" with reply_to).",
         ));
     }
+    let (pending, pending_bytes) = uploads::pending_on_job(conn, job.id, name.as_str())?;
     let others = job.attachments.iter().filter(|a| a.name != name.as_str());
-    let (count, used) = others.fold((0usize, 0u64), |(c, u), a| (c + 1, u + a.size.unsigned_abs()));
+    let (count, used) = others.fold((pending, pending_bytes), |(c, u), a| (c + 1, u + a.size.unsigned_abs()));
     if count >= limits::FILES_PER_JOB {
         return Err(ApiError::new(
             Code::TooLarge,
-            format!("job {} already has {} attachments", job.id, limits::FILES_PER_JOB),
             format!(
-                "At most {} files per job: pack them in an archive or a git bundle.",
+                "job {} already has {} attachments and open uploads",
+                job.id,
+                limits::FILES_PER_JOB
+            ),
+            format!(
+                "At most {} files per job: pack them in an archive (`rack attach JOB DIR` makes a .tar) or a git \
+                 bundle.",
                 limits::FILES_PER_JOB
             ),
         ));
     }
-    let left = limits::JOB_FILE_BYTES.saturating_sub(used);
-    Ok(Budget {
-        max_bytes: left.min(limits::FILE_BYTES),
-    })
-}
-
-fn too_large_for_job(budget: Budget) -> ApiError {
-    ApiError::new(
-        Code::TooLarge,
-        format!("upload is over the {} bytes this job can still take", budget.max_bytes),
-        format!(
-            "Limits: {} MiB per file, {} MiB per job. Split the file or send a git bundle.",
-            limits::FILE_BYTES >> 20,
-            limits::JOB_FILE_BYTES >> 20
+    let quota_used = Store::quota_used_except(conn, me, Some((job.id, name.as_str())))?;
+    let candidates = [
+        (per_file, Bound::File(per_file)),
+        (
+            rules.max_job_bytes.saturating_sub(used),
+            Bound::Job(rules.max_job_bytes),
         ),
-    )
+        (
+            rules.per_agent_bytes.saturating_sub(quota_used),
+            Bound::Quota {
+                used: quota_used,
+                limit: rules.per_agent_bytes,
+            },
+        ),
+    ];
+    let (max_bytes, bound) = candidates
+        .into_iter()
+        .min_by_key(|(left, _)| *left)
+        .unwrap_or((per_file, Bound::File(per_file)));
+    Ok(Budget { max_bytes, bound })
 }
 
 fn not_found(id: JobId) -> ApiError {
@@ -1860,7 +1955,11 @@ mod tests {
             )
             .expect("age jobs");
         let purged = s.purge(clock::now()).expect("purge");
-        assert_eq!(purged.len(), 3, "delivered jobs without a reply expected are closed");
+        assert_eq!(
+            purged.jobs.len(),
+            3,
+            "delivered jobs without a reply expected are closed"
+        );
     }
 
     #[test]

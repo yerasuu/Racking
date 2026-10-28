@@ -37,6 +37,8 @@ struct RawConfig {
     permissions: Option<RawPermissions>,
     #[serde(default)]
     limits: SenderLimits,
+    #[serde(default)]
+    quota: Quota,
 }
 
 #[derive(Deserialize)]
@@ -82,9 +84,20 @@ pub struct Config {
     pub agents: Vec<Agent>,
     pub send_rules: SendRules,
     pub limits: SenderLimits,
+    pub quota: Quota,
 }
 
-/// `[limits]`: per-sender guards against an agent that sends without end.
+const MIB: u64 = 1024 * 1024;
+const GIB: u64 = 1024 * MIB;
+/// The largest `max_file_bytes` a config may ask for: past it one upload holds
+/// the disk for hours on a LAN, and an archive split in parts is the better tool.
+pub const MAX_FILE_BYTES_CAP: u64 = 16 * GIB;
+/// Chunk sizes a config may ask for: small ones for tests, at most 64 MiB so one
+/// request never holds a connection for long.
+const CHUNK_BYTES_RANGE: std::ops::RangeInclusive<u64> = 1024..=64 * MIB;
+
+/// `[limits]`: per-sender guards against an agent that sends without end, and
+/// the sizes of attachments sent through resumable uploads.
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct SenderLimits {
@@ -92,6 +105,13 @@ pub struct SenderLimits {
     pub open_tasks_per_pair: u32,
     /// Jobs of any kind one sender may create per wall-clock minute.
     pub jobs_per_minute: u32,
+    /// One file sent through `POST /jobs/{id}/uploads`; the one-request
+    /// `PUT /jobs/{id}/attachments/{name}` keeps its own 64 MiB.
+    pub max_file_bytes: u64,
+    /// All the attachments of one job, however they were uploaded.
+    pub max_job_bytes: u64,
+    /// The largest chunk one `PUT /uploads/{id}` may carry.
+    pub upload_chunk_bytes: u64,
 }
 
 impl Default for SenderLimits {
@@ -99,6 +119,30 @@ impl Default for SenderLimits {
         Self {
             open_tasks_per_pair: 20,
             jobs_per_minute: 60,
+            max_file_bytes: 2 * GIB,
+            max_job_bytes: 4 * GIB,
+            upload_chunk_bytes: 8 * MIB,
+        }
+    }
+}
+
+/// `[quota]`: how much of the server's disk attachments may take.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Quota {
+    /// Bytes of attachments on the jobs one agent sent, plus its open uploads.
+    /// The sender is who fills the disk, so the sender pays, not the recipient.
+    pub per_agent_bytes: u64,
+    /// New uploads are refused (507) while the data directory's file system has
+    /// less than this free, counting the upload itself. 0 turns the check off.
+    pub disk_free_min_bytes: u64,
+}
+
+impl Default for Quota {
+    fn default() -> Self {
+        Self {
+            per_agent_bytes: 8 * GIB,
+            disk_free_min_bytes: GIB,
         }
     }
 }
@@ -198,6 +242,21 @@ impl Config {
         if raw.limits.open_tasks_per_pair == 0 || raw.limits.jobs_per_minute == 0 {
             return Err("limits: open_tasks_per_pair and jobs_per_minute must be at least 1".to_owned());
         }
+        if !(1..=MAX_FILE_BYTES_CAP).contains(&raw.limits.max_file_bytes) {
+            return Err(format!(
+                "limits: max_file_bytes must be 1 to {MAX_FILE_BYTES_CAP} (16 GiB)"
+            ));
+        }
+        if raw.limits.max_job_bytes == 0 {
+            return Err("limits: max_job_bytes must be at least 1".to_owned());
+        }
+        if !CHUNK_BYTES_RANGE.contains(&raw.limits.upload_chunk_bytes) {
+            return Err(format!(
+                "limits: upload_chunk_bytes must be {} to {}",
+                CHUNK_BYTES_RANGE.start(),
+                CHUNK_BYTES_RANGE.end()
+            ));
+        }
         let explicit = match &raw.permissions {
             Some(p) => send_lists(&p.send)?,
             None => BTreeMap::new(),
@@ -212,6 +271,7 @@ impl Config {
             agents,
             send_rules: SendRules::new(any_role || raw.permissions.is_some(), explicit),
             limits: raw.limits,
+            quota: raw.quota,
         })
     }
 }
@@ -418,6 +478,32 @@ mod tests {
         assert_eq!((c.limits.open_tasks_per_pair, c.limits.jobs_per_minute), (20, 5));
         assert!(cfg(&format!("{agents}[limits]\njobs_per_minute = 0\n")).is_err());
         assert!(cfg(&format!("{agents}[limits]\nbody_bytes = 9\n")).is_err());
+    }
+
+    #[test]
+    fn upload_limits_and_quota() {
+        let agents = format!("[agents.a]\ntoken = \"{T1}\"\n[agents.b]\ntoken = \"{T2}\"\n");
+        let c = cfg(&agents).expect("config");
+        assert_eq!(
+            (
+                c.limits.max_file_bytes,
+                c.limits.max_job_bytes,
+                c.limits.upload_chunk_bytes
+            ),
+            (2 * GIB, 4 * GIB, 8 * MIB)
+        );
+        assert_eq!((c.quota.per_agent_bytes, c.quota.disk_free_min_bytes), (8 * GIB, GIB));
+        let c = cfg(&format!(
+            "{agents}[limits]\nmax_file_bytes = 4096\nupload_chunk_bytes = 1024\n[quota]\nper_agent_bytes = 10\n\
+             disk_free_min_bytes = 0\n"
+        ))
+        .expect("config");
+        assert_eq!((c.limits.max_file_bytes, c.limits.upload_chunk_bytes), (4096, 1024));
+        assert_eq!((c.quota.per_agent_bytes, c.quota.disk_free_min_bytes), (10, 0));
+        assert!(cfg(&format!("{agents}[limits]\nmax_file_bytes = {}\n", 16 * GIB + 1)).is_err());
+        assert!(cfg(&format!("{agents}[limits]\nmax_file_bytes = 0\n")).is_err());
+        assert!(cfg(&format!("{agents}[limits]\nupload_chunk_bytes = 10\n")).is_err());
+        assert!(cfg(&format!("{agents}[quota]\nper_agent = 10\n")).is_err());
     }
 
     #[test]

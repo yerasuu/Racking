@@ -99,6 +99,92 @@ impl FromStr for AttachmentName {
     }
 }
 
+/// Upload session id: `u` followed by a positive integer. Stored as the integer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UploadId(i64);
+
+impl UploadId {
+    pub fn new(n: i64) -> Self {
+        Self(n)
+    }
+
+    pub fn get(self) -> i64 {
+        self.0
+    }
+}
+
+impl FromStr for UploadId {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.strip_prefix('u')
+            .filter(|digits| !digits.is_empty() && digits.len() <= 18 && digits.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|digits| digits.parse::<i64>().ok())
+            .filter(|n| *n > 0)
+            .map(Self)
+            .ok_or_else(|| format!("upload id `{}` must look like u42", truncate(s, 40)))
+    }
+}
+
+impl fmt::Display for UploadId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "u{}", self.0)
+    }
+}
+
+/// One chunk of an upload, from a `Content-Range: bytes FIRST-LAST/TOTAL` header
+/// as [RFC 9110 section 14.4](https://www.rfc-editor.org/rfc/rfc9110.html#name-content-range)
+/// defines it: `last` is inclusive, and a value with `last < first` or
+/// `total <= last` is invalid. Deviations, all refused with a 400: the range unit
+/// must be `bytes`, the complete length must be given (no `*`), and the
+/// `unsatisfied-range` form (`bytes */TOTAL`) is not a chunk. Section 14.5 lets a
+/// server that does not do partial PUT answer 400, which keeps the plain
+/// `PUT /jobs/{id}/attachments/{name}` free of the header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContentRange {
+    pub first: u64,
+    pub last: u64,
+    pub total: u64,
+}
+
+impl ContentRange {
+    /// Bytes in the chunk; never zero, since `last >= first`.
+    pub fn length(self) -> u64 {
+        self.last - self.first + 1
+    }
+}
+
+impl FromStr for ContentRange {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let bad = || {
+            format!(
+                "Content-Range `{}` must be `bytes FIRST-LAST/TOTAL` with FIRST <= LAST < TOTAL",
+                truncate(s, 60)
+            )
+        };
+        // 1*DIGIT in the RFC grammar: no sign, no spaces, and at most what fits a u64.
+        let number = |part: &str| {
+            Some(part)
+                .filter(|p| !p.is_empty() && p.len() <= 19 && p.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|p| p.parse::<u64>().ok())
+        };
+        let (range, total) = s
+            .strip_prefix("bytes ")
+            .and_then(|rest| rest.split_once('/'))
+            .ok_or_else(bad)?;
+        let (first, last) = range.split_once('-').ok_or_else(bad)?;
+        let (Some(first), Some(last), Some(total)) = (number(first), number(last), number(total)) else {
+            return Err(bad());
+        };
+        if last < first || total <= last {
+            return Err(bad());
+        }
+        Ok(Self { first, last, total })
+    }
+}
+
 /// Inbox position or update counter. Cursors are never negative.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Seq(i64);
@@ -494,6 +580,39 @@ pub fn truncate(s: &str, max: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_ranges_follow_rfc_9110() {
+        let r: ContentRange = "bytes 0-1023/4096".parse().expect("range");
+        assert_eq!((r.first, r.last, r.total, r.length()), (0, 1023, 4096, 1024));
+        let one: ContentRange = "bytes 4095-4095/4096".parse().expect("last byte");
+        assert_eq!(one.length(), 1);
+        for bad in [
+            "bytes 10-9/100",       // last-pos < first-pos
+            "bytes 0-100/100",      // complete-length <= last-pos
+            "bytes 0-99/*",         // unknown complete length
+            "bytes */100",          // unsatisfied-range
+            "items 0-9/100",        // other range unit
+            "bytes=0-9/100",        // Range syntax, not Content-Range
+            "bytes 0-9, 20-29/100", // more than one range
+            "bytes +0-9/100",
+            "bytes 0-9/100 ",
+            "bytes  0-9/100",
+            "bytes 0-99999999999999999999/100",
+            "",
+        ] {
+            assert!(bad.parse::<ContentRange>().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn upload_ids() {
+        assert_eq!("u42".parse::<UploadId>().map(UploadId::get), Ok(42));
+        assert_eq!(UploadId::new(7).to_string(), "u7");
+        for bad in ["42", "u", "u0", "u-1", "j4", "u4x"] {
+            assert!(bad.parse::<UploadId>().is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn agent_names() {

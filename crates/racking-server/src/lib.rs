@@ -163,7 +163,9 @@ pub fn start(config: &Config) -> Result<Running, String> {
 ///
 /// As `start`.
 pub fn start_with_clock(config: &Config, clock: Clock) -> Result<Running, String> {
-    let store = store::Store::open(&config.data_dir)?.with_open_task_limit(config.limits.open_tasks_per_pair);
+    let store = store::Store::open(&config.data_dir)?
+        .with_open_task_limit(config.limits.open_tasks_per_pair)
+        .with_upload_rules(store::UploadRules::new(&config.limits, &config.quota));
     let dist = dist::Dist::open(&config.data_dir)?;
     let app = Arc::new(api::App::new(config, store, dist, clock)?);
     if config.public_bind {

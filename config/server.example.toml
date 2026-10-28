@@ -42,3 +42,10 @@ token = "CHANGE-ME-windows-token"
 # [limits]
 # open_tasks_per_pair = 20
 # jobs_per_minute = 60
+# max_file_bytes = 2147483648      # one file through resumable uploads (max 16 GiB)
+# max_job_bytes = 4294967296       # all the files of one job
+# upload_chunk_bytes = 8388608
+# The /data volume must hold agents x per_agent_bytes plus the reserve.
+# [quota]
+# per_agent_bytes = 8589934592     # files of the jobs one agent sent, until purged
+# disk_free_min_bytes = 1073741824 # refuse uploads (507) below this much free space
