@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1
+
+- `rack link --pair` says which directions cannot send between workers and which `[permissions]` entry would allow them.
+- The policy hook's audit lines carry the sender's role.
+- Builds on newer Rust toolchains (`AtomicU64::fetch_update` deprecation); a test race fixed.
+
 ## 0.2.0
 
 Breaking for servers: see `tag-changelog/v0.2.0.md`.
