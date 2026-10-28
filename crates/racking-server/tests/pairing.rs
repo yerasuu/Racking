@@ -5,7 +5,8 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -553,6 +554,7 @@ struct Process {
     base: String,
     dir: PathBuf,
     config: PathBuf,
+    log: Option<JoinHandle<String>>,
 }
 
 impl Process {
@@ -584,18 +586,19 @@ impl Process {
             line.clear();
         }
         assert!(!base.is_empty(), "the server did not say where it listens");
-        // Keep reading the log in the background so the server never blocks on a full pipe.
-        let log = dir.join("server.log");
-        std::thread::spawn(move || {
+        // Keep reading the log in the background so the server never blocks on a full pipe;
+        // the thread ends at EOF, when the server has exited, and hands back what it read.
+        let log = std::thread::spawn(move || {
             let mut rest = String::new();
             let _ = lines.read_to_string(&mut rest);
-            let _ = std::fs::write(log, rest);
+            rest
         });
         Self {
             child,
             base,
             dir,
             config,
+            log: Some(log),
         }
     }
 
@@ -617,18 +620,23 @@ impl Process {
         resp.body_mut().read_json().expect("json")
     }
 
-    /// Stops the server and returns everything it logged.
+    /// Stops the server as Docker and systemd do (SIGTERM), waits for it to exit and returns
+    /// everything it logged. The log is complete only once the pipe is at EOF.
     fn stop(mut self) -> String {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let log = self.dir.join("server.log");
-        for _ in 0..50 {
-            if log.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
+        let status = Command::new("kill")
+            .args(["-TERM", "--", &self.child.id().to_string()])
+            .status()
+            .expect("kill");
+        assert!(status.success(), "kill -TERM failed");
+        let started = Instant::now();
+        while self.child.try_wait().expect("try_wait").is_none() {
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "the server did not exit on SIGTERM"
+            );
+            std::thread::sleep(Duration::from_millis(20));
         }
-        std::fs::read_to_string(log).unwrap_or_default()
+        self.log.take().expect("log reader").join().expect("log thread")
     }
 }
 
