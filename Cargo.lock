@@ -479,7 +479,7 @@ dependencies = [
 
 [[package]]
 name = "rack"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "racking-server",
  "serde",
@@ -491,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "racking-mcp"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "rack",
  "racking-server",
@@ -503,7 +503,7 @@ dependencies = [
 
 [[package]]
 name = "racking-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "rusqlite",
  "serde",
