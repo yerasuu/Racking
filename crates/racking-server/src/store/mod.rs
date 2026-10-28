@@ -302,6 +302,8 @@ pub struct NewJob {
     pub hops: u8,
     /// The job this one follows from, besides any `reply_to`; the sender must be one of its parties.
     pub parent: Option<JobId>,
+    /// The local-policy profile a task asks for, checked and lowercased; only the main agent's tasks carry one.
+    pub profile: Option<String>,
 }
 
 pub struct Attachment {
@@ -362,6 +364,7 @@ pub struct Job {
     pub from_role: Option<String>,
     pub hops: u8,
     pub parent: Option<JobId>,
+    pub profile: Option<String>,
     pub attachments: Vec<Attachment>,
 }
 
@@ -389,6 +392,7 @@ impl Job {
             "from_role": self.from_role,
             "hops": self.hops,
             "parent": self.parent.map(|j| j.to_string()),
+            "profile": self.profile,
         });
         if let Some(obj) = v.as_object_mut() {
             let mut insert = |k: &str, value: Value| obj.insert(k.to_owned(), value);
@@ -525,17 +529,17 @@ impl Changes {
 
 const JOB_COLUMNS: &str = "id, from_agent, to_agent, kind, title, body, length(CAST(body AS BLOB)), tags, origin, \
                            reply_to, outcome, reason, state, created_at, updated_at, seq, updated_seq, priority, \
-                           expects_reply, model, from_role, hops, parent";
+                           expects_reply, model, from_role, hops, parent, profile";
 /// The body column must agree with `Kind::inlines`, `limits::INLINE_BYTES` and `limits::PREVIEW_CHARS`.
 const SUMMARY_COLUMNS: &str = "id, from_agent, to_agent, kind, title, \
                                CASE WHEN kind IN ('message', 'notice') AND length(CAST(body AS BLOB)) <= 4096 \
                                THEN body ELSE substr(body, 1, 200) END, length(CAST(body AS BLOB)), \
                                tags, origin, reply_to, outcome, reason, state, created_at, updated_at, seq, updated_seq, \
-                               priority, expects_reply, model, from_role, hops, parent";
+                               priority, expects_reply, model, from_role, hops, parent, profile";
 /// The body column must agree with `limits::PREVIEW_CHARS`.
 const PREVIEW_COLUMNS: &str = "id, from_agent, to_agent, kind, title, substr(body, 1, 200), length(CAST(body AS BLOB)), \
                                tags, origin, reply_to, outcome, reason, state, created_at, updated_at, seq, updated_seq, \
-                               priority, expects_reply, model, from_role, hops, parent";
+                               priority, expects_reply, model, from_role, hops, parent, profile";
 
 const SCHEMA: &str = "
 PRAGMA journal_mode = WAL;
@@ -563,7 +567,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     model TEXT,
     from_role TEXT,
     hops INTEGER NOT NULL DEFAULT 0,
-    parent INTEGER
+    parent INTEGER,
+    profile TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS jobs_inbox ON jobs (to_agent, seq);
 CREATE INDEX IF NOT EXISTS jobs_outbox ON jobs (from_agent, updated_seq);
@@ -637,6 +642,7 @@ impl Store {
         add_reply_columns(&conn).map_err(|e| format!("cannot add the priority columns: {e}"))?;
         add_columns(&conn, HINT_COLUMNS).map_err(|e| format!("cannot add the model and capabilities columns: {e}"))?;
         add_columns(&conn, ROLE_COLUMNS).map_err(|e| format!("cannot add the role columns: {e}"))?;
+        add_columns(&conn, PROFILE_COLUMNS).map_err(|e| format!("cannot add the profile column: {e}"))?;
         Ok(Self {
             conn: Mutex::new(conn),
             files,
@@ -803,8 +809,9 @@ impl Store {
         let outcome = (new.kind == Kind::Result).then(|| new.outcome.unwrap_or(Outcome::Done).state().as_str());
         tx.execute(
             "INSERT INTO jobs (from_agent, to_agent, kind, title, body, tags, origin, reply_to, outcome, state, \
-             created_at, updated_at, seq, updated_seq, priority, expects_reply, model, from_role, hops, parent) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'sent', ?10, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+             created_at, updated_at, seq, updated_seq, priority, expects_reply, model, from_role, hops, parent, \
+             profile) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'sent', ?10, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 me.as_str(),
                 new.to.as_str(),
@@ -823,7 +830,8 @@ impl Store {
                 new.model,
                 new.from_role.as_str(),
                 hops,
-                new.parent.map(JobId::get)
+                new.parent.map(JobId::get),
+                new.profile
             ],
         )?;
         let id = JobId::new(tx.last_insert_rowid());
@@ -1519,6 +1527,8 @@ const ROLE_COLUMNS: &[(&str, &str, &str)] = &[
     ("jobs", "hops", "INTEGER NOT NULL DEFAULT 0"),
     ("jobs", "parent", "INTEGER"),
 ];
+/// Databases made before the profile field lack it; null means the job names no profile.
+const PROFILE_COLUMNS: &[(&str, &str, &str)] = &[("jobs", "profile", "TEXT")];
 
 /// Adds each `(table, column, declaration)` a database lacks. Every declaration
 /// is nullable or has a default, so old rows need no update.
@@ -1623,6 +1633,7 @@ fn job_from_row(row: &Row<'_>) -> rusqlite::Result<Job> {
         from_role: row.get(20)?,
         hops: row.get(21)?,
         parent: row.get::<_, Option<i64>>(22)?.map(JobId::new),
+        profile: row.get(23)?,
         attachments: Vec::new(),
     })
 }
@@ -1681,6 +1692,7 @@ mod tests {
             from_role: Role::Worker,
             hops: 0,
             parent: None,
+            profile: None,
         }
     }
 
@@ -1995,6 +2007,43 @@ mod tests {
 
         let inbox = s.inbox(&windows, Seq::new(0), None, 10).expect("inbox").to_json();
         assert_eq!(inbox["jobs"][1]["model"], "opus", "summaries carry it too");
+        drop(s);
+        Store::open(&dir.0).expect("opening twice is fine");
+    }
+
+    #[test]
+    fn old_databases_gain_the_profile_column() {
+        let dir = TempDir::new();
+        fs::create_dir_all(&dir.0).expect("dir");
+        let conn = Connection::open(dir.0.join("racking.db")).expect("db");
+        conn.execute_batch(
+            "CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, from_agent TEXT NOT NULL, \
+             to_agent TEXT NOT NULL, kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, \
+             tags TEXT NOT NULL, origin TEXT, reply_to INTEGER, outcome TEXT, reason TEXT, state TEXT NOT NULL, \
+             created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, seq INTEGER NOT NULL, \
+             updated_seq INTEGER NOT NULL, priority TEXT NOT NULL DEFAULT 'normal', \
+             expects_reply INTEGER NOT NULL DEFAULT 0, model TEXT, from_role TEXT, \
+             hops INTEGER NOT NULL DEFAULT 0, parent INTEGER) STRICT;
+             INSERT INTO jobs VALUES (1, 'linux', 'windows', 'task', 't', 'Racking-Profile: workdir', '[]', NULL, \
+             NULL, NULL, NULL, 'sent', 0, 0, 1, 1, 'normal', 1, NULL, 'main', 0, NULL);",
+        )
+        .expect("schema before the profile field");
+        drop(conn);
+        let s = Store::open(&dir.0).expect("open");
+        let (linux, windows) = (agent("linux"), agent("windows"));
+        let old = s.get_job(&windows, JobId::new(1)).expect("old job");
+        assert_eq!(old.profile, None);
+        assert_eq!(old.to_json(View::Full)["profile"], Value::Null, "null, never missing");
+        let new = NewJob {
+            profile: Some("app-test".to_owned()),
+            from_role: Role::Main,
+            ..task("windows")
+        };
+        let job = s.create_job(&linux, new).expect("job with a profile");
+        assert_eq!(job.to_json(View::Full)["profile"], "app-test");
+        let inbox = s.inbox(&windows, Seq::new(0), None, 10).expect("inbox").to_json();
+        assert_eq!(inbox["jobs"][1]["profile"], "app-test", "summaries carry it");
+        assert_eq!(inbox["jobs"][0]["profile"], Value::Null);
         drop(s);
         Store::open(&dir.0).expect("opening twice is fine");
     }

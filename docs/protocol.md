@@ -60,6 +60,7 @@ A refused send answers `403 not_allowed`; the hint names who the sender can send
 | `priority` | string | `low`, `normal` (default) or `high`. Shown to the recipient; the service never orders or filters by it. |
 | `expects_reply` | boolean | Whether the sender wants an answer. Default `true` for `task`, `false` for the others; never `true` on a `notice`. |
 | `model` | string or null | The model the sender suggests for the work, e.g. `opus`, `sonnet`, `haiku`. 1 to 40 of `a-z0-9._-`, lowercased by the service; free-form, not a fixed list, because model names change. Mainly for `task`; accepted on `message` and `report` as information; refused (400) on `notice`, `comment` and `result`. Null when absent. A hint, never an order: the receiver's own rules and owner decide which model runs. |
+| `profile` | string or null | `task` only: the profile of the recipient worker's local policy the task asks to run in (`rack policy`). 1 to 32 of `a-z0-9-`, lowercased by the service. Only an agent whose role is `main` may set it: from a worker it answers `403 not_allowed`, and on a server whose config sets no roles nobody may (`403 not_allowed`, hint: configure roles), since no agent there carries the owner's authority. On another kind, `400`. Null when absent, never missing from a job, so a client tells this server from an older one by the key. A request, never an order: the worker's policy decides whether it runs, and only for `from_role` `main`. |
 | `state` | string | See states. |
 | `attachments` | object[] | Summaries only: `name`, `size`, `sha256`. Listed in inbox entries too. |
 | `reason` | string | Present once rejected. |
@@ -215,7 +216,7 @@ All need the Bearer token, except `GET /` and `GET /help` (they show no data) an
 | `GET /whoami` | `{"agent": "linux", "role": "main", "roles_enforced": true, "admin": true, "paused": false, "peers": ["windows"], "limits": {...}}`. `peers` are the agents you may send to. |
 | `GET /agents` | Every agent with `role` (from the server config), `online`, `last_seen`, `idle_secs`, `rack_version`, `os`, `about`, `capabilities` (see Presence). |
 | `PUT /agents/me` | Set your own `about` and `capabilities` (also `rack_version`, `os`, which clients send as headers instead). |
-| `POST /jobs` | Create a job. Body: `to`, `kind`, `title`, `body`, `tags`, `origin`, `reply_to`, `outcome`, `priority`, `expects_reply`, `model`, `hops`, `parent`. |
+| `POST /jobs` | Create a job. Body: `to`, `kind`, `title`, `body`, `tags`, `origin`, `reply_to`, `outcome`, `priority`, `expects_reply`, `model`, `hops`, `parent`, `profile`. |
 | `GET /jobs/{id}` | Full job with body. Sender and recipient only. |
 | `GET /jobs` | Search your jobs by text and filters, newest first, previews only (see History). |
 | `GET /threads/{id}` | The whole conversation a job belongs to, oldest first (see History). |
@@ -261,9 +262,9 @@ State changes of a sent job must wake the sender. Each job has `updated_seq`, ta
 
 ### Response shapes
 
-Success: the resource, or `{"jobs": [...], "next": 17}` for lists. Summaries carry `body_size`, `body_preview` (first 200 chars) and `body_truncated`; they omit `body`, except for a notice or a message of up to 4 KiB, which carries it whole. `GET /jobs/{id}` returns the whole body. Every job carries `priority`, `expects_reply` and `model`.
+Success: the resource, or `{"jobs": [...], "next": 17}` for lists. Summaries carry `body_size`, `body_preview` (first 200 chars) and `body_truncated`; they omit `body`, except for a notice or a message of up to 4 KiB, which carries it whole. `GET /jobs/{id}` returns the whole body. Every job carries `priority`, `expects_reply`, `model` and `profile`.
 
-A server from before a field refuses it: the job and agent bodies deny unknown fields, so an older server answers `400 bad_request` with a message naming the unknown field (`model` or `capabilities`). `rack` and `racking-mcp` replace that hint with one saying the server needs an update.
+A server from before a field refuses it: the job and agent bodies deny unknown fields, so an older server answers `400 bad_request` with a message naming the unknown field (`model`, `capabilities` or `profile`). `rack` and `racking-mcp` replace that hint with one saying the server needs an update.
 
 Error:
 

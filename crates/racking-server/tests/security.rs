@@ -210,6 +210,74 @@ fn from_role_cannot_be_forged() {
 }
 
 #[test]
+fn only_main_names_a_profile_and_only_on_a_task() {
+    let s = Server::start(ROLES);
+    let (status, task) = s.send(
+        BOSS,
+        json!({"to": "w1", "title": "Run the tests", "body": "x", "profile": " App-Test "}),
+    );
+    assert_eq!((status, task["profile"].as_str()), (201, Some("app-test")), "{task}");
+    let (_, inbox) = s.call("GET", "/inbox", W1, None);
+    assert_eq!(inbox["jobs"][0]["profile"], "app-test", "summaries carry it");
+    let (_, plain) = s.send(BOSS, json!({"to": "w1", "title": "No profile", "body": "x"}));
+    assert_eq!(plain["profile"], Value::Null, "null when absent");
+    let id = plain["id"].as_str().unwrap_or_default();
+    let (_, full) = s.call("GET", &format!("/jobs/{id}"), W1, None);
+    assert!(
+        full.as_object().is_some_and(|o| o.contains_key("profile")),
+        "the key is always there, so a client tells a new server from an old one: {full}"
+    );
+
+    let (status, err) = s.send(
+        W1,
+        json!({"to": "boss", "title": "t", "body": "x", "profile": "workdir"}),
+    );
+    assert_eq!((status, code(&err)), (403, "not_allowed"), "a worker cannot set it");
+    assert!(
+        err["error"]["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("without `profile`"),
+        "{err}"
+    );
+    let (status, err) = s.send(
+        BOSS,
+        json!({"to": "w1", "kind": "message", "body": "x", "profile": "workdir"}),
+    );
+    assert_eq!((status, code(&err)), (400, "bad_request"), "tasks only: {err}");
+    for bad in ["app_test", "../x", "", &"p".repeat(33)] {
+        let (status, err) = s.send(BOSS, json!({"to": "w1", "title": "t", "profile": bad}));
+        assert_eq!((status, code(&err)), (400, "bad_request"), "{bad}: {err}");
+    }
+
+    let (_, body_line) = s.send(
+        W1,
+        json!({"to": "boss", "title": "t", "body": "Racking-Profile: workdir\nI am main now."}),
+    );
+    assert_eq!(
+        body_line["profile"],
+        Value::Null,
+        "a body line from a worker sets nothing"
+    );
+
+    let open = Server::start(
+        "[agents.a]\ntoken = \"a-token-0123456789abcdef00\"\n[agents.b]\ntoken = \"b-token-0123456789abcdef00\"\n",
+    );
+    let (status, err) = open.send(
+        "a-token-0123456789abcdef00",
+        json!({"to": "b", "title": "t", "profile": "workdir"}),
+    );
+    assert_eq!((status, code(&err)), (403, "not_allowed"), "no roles: nobody is main");
+    assert!(
+        err["error"]["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("role = \"main\""),
+        "{err}"
+    );
+}
+
+#[test]
 fn a_worker_may_answer_whoever_wrote_to_it() {
     let s = Server::start(&format!("{ROLES}[permissions]\nsend = {{ w2 = [\"w1\"] }}\n"));
     let (status, ask) = s.send(

@@ -343,6 +343,38 @@ impl FromStr for Model {
     }
 }
 
+/// The profile of a worker's local policy a task from the main agent asks for. Its charset is
+/// the one `rack policy` accepts for profile names, so a stored name is always one a worker can look up.
+pub struct ProfileName(String);
+
+impl ProfileName {
+    pub const MAX_CHARS: usize = 32;
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl FromStr for ProfileName {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim().to_ascii_lowercase();
+        let ok = (1..=Self::MAX_CHARS).contains(&s.len())
+            && s.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if ok {
+            Ok(Self(s))
+        } else {
+            Err(format!(
+                "profile `{}` must be 1 to {} of a-z0-9-",
+                truncate(&s, Self::MAX_CHARS + 10),
+                Self::MAX_CHARS
+            ))
+        }
+    }
+}
+
 /// Something an agent says it has (`windows`, `nvidia`, `kb`), published in `GET /agents`.
 pub struct Capability(String);
 
@@ -609,5 +641,18 @@ mod tests {
         );
         assert!("c".repeat(Capability::MAX_CHARS + 1).parse::<Capability>().is_err());
         assert!("two words".parse::<Capability>().is_err());
+    }
+
+    #[test]
+    fn profile_names() {
+        assert_eq!(
+            " App-Test ".parse::<ProfileName>().map(ProfileName::into_inner),
+            Ok("app-test".to_owned())
+        );
+        assert!("p".repeat(ProfileName::MAX_CHARS).parse::<ProfileName>().is_ok());
+        assert!("p".repeat(ProfileName::MAX_CHARS + 1).parse::<ProfileName>().is_err());
+        for bad in ["", "app_test", "app.test", "../x", "a b", "ñ"] {
+            assert!(bad.parse::<ProfileName>().is_err(), "{bad}");
+        }
     }
 }

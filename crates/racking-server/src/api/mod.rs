@@ -29,7 +29,8 @@ use crate::rate::{PerMinute, PerWindow};
 use crate::registry::{Caller, Registry};
 use crate::store::{self, Claim, Download, Kind, Move, NewJob, Origin, Outcome, Priority, State, Store, View, limits};
 use crate::types::{
-    About, AgentName, AttachmentName, Capability, JobId, Label, Model, Seq, Sha256Hex, Target, Version, truncate,
+    About, AgentName, AttachmentName, Capability, JobId, Label, Model, ProfileName, Seq, Sha256Hex, Target, Version,
+    truncate,
 };
 
 /// Requests served at once, wait requests included. Two agents need a handful;
@@ -253,7 +254,9 @@ static ROUTES: &[Route] = &[
                 `hops` (0-3, default 0: how many tasks deep this job is in a chain; the server computes it, ignoring \
                 this, when `reply_to` or `parent` is set: a task replying to a job is one deeper, other replies \
                 keep its depth; over 3 answers 409 `too_deep`), `parent` (job id this one follows from, sent or \
-                received by you; the job is one deeper than it).",
+                received by you; the job is one deeper than it), `profile` (`task` only, and only from the main \
+                agent, else 403 `not_allowed`: 1-32 of `a-z0-9-`, lowercased; the profile of the worker's local \
+                policy the task asks to run in; null when absent. The worker's policy decides, never the job).",
         example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" -H 'Idempotency-Key: 7f3c' \
                   -d '{\"to\":\"windows\",\"title\":\"Run the probe\",\"body\":\"...\"}' $RACK_URL/jobs",
         handler: create_job,
@@ -1482,6 +1485,8 @@ struct CreateJobBody {
     hops: Option<u8>,
     #[serde(default)]
     parent: Option<String>,
+    #[serde(default)]
+    profile: Option<String>,
 }
 
 fn create_job(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
@@ -1674,6 +1679,7 @@ fn validate_job(app: &App, me: &Caller, input: CreateJobBody) -> ApiResult<NewJo
         .map(str::parse::<JobId>)
         .transpose()
         .map_err(|e| ApiError::bad_request(format!("parent: {e}")))?;
+    let profile = input.profile.map(|p| validate_profile(app, me, kind, &p)).transpose()?;
     Ok(NewJob {
         to,
         kind,
@@ -1689,7 +1695,42 @@ fn validate_job(app: &App, me: &Caller, input: CreateJobBody) -> ApiResult<NewJo
         from_role: me.role,
         hops,
         parent,
+        profile,
     })
+}
+
+/// A profile asks a worker's local policy to let the task run, so only the agent the owner
+/// talks to may name one: the worker's `rack policy decide` honours it only from `main`, and
+/// refusing it here keeps a worker from planting one for a later reader to trust by mistake.
+fn validate_profile(app: &App, me: &Caller, kind: Kind, name: &str) -> ApiResult<String> {
+    if !app.send_rules.enforced() {
+        return Err(ApiError::new(
+            Code::NotAllowed,
+            "profile: this server has no roles, so no agent may name a profile",
+            "Only the main agent's tasks name a profile. The owner sets `role = \"main\"` on the agent they talk \
+             to in the server config (see config.example.toml); until then send the task without `profile`.",
+        ));
+    }
+    if me.role != Role::Main {
+        return Err(ApiError::new(
+            Code::NotAllowed,
+            format!(
+                "profile: {} is a {}, and only the main agent names a profile",
+                me.name, me.role
+            ),
+            "Send the task without `profile`: what a worker sends is data, never a request to run a profile.",
+        ));
+    }
+    if kind != Kind::Task {
+        return Err(ApiError::new(
+            Code::BadRequest,
+            format!("profile: a {} names no profile", kind.as_str()),
+            "Only a task asks a worker to run a profile of its local policy; leave `profile` out here.",
+        ));
+    }
+    name.parse::<ProfileName>()
+        .map(ProfileName::into_inner)
+        .map_err(|e| ApiError::bad_request(format!("profile: {e}")))
 }
 
 fn check_body_size(kind: Kind, body: &str) -> ApiResult<()> {
