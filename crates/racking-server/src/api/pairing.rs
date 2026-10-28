@@ -498,10 +498,48 @@ pub(super) fn create_link(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
     })?;
     app.links.insert(&a, &b);
     tracing::info!(target: "racking::pairing", actor = %me.name, a = %a, b = %b, "workers linked");
-    Ok(Reply::Json {
-        status: 201,
-        body: json!({"a": a.as_str(), "b": b.as_str(), "state": "confirmed", "via": "admin"}),
-    })
+    // A link is only one of the conditions of a send; the answer says what the whole rule gives, so the
+    // owner does not believe two linked workers can write to each other when [permissions] forbids it.
+    let (sends, hint) = match (app.registry.member(&a), app.registry.member(&b)) {
+        (Some(ma), Some(mb)) => {
+            let a_to_b = app.send_rules.may_send(&ma.party(), &mb.party(), &app.links);
+            let b_to_a = app.send_rules.may_send(&mb.party(), &ma.party(), &app.links);
+            let hint = [(&a, &b, a_to_b), (&b, &a, b_to_a)]
+                .into_iter()
+                .filter(|(_, _, ok)| !ok)
+                .map(|(from, to, _)| send_hint(app, from, to))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (json!({"a_to_b": a_to_b, "b_to_a": b_to_a}), hint)
+        }
+        _ => (Value::Null, String::new()),
+    };
+    let mut body = json!({"a": a.as_str(), "b": b.as_str(), "state": "confirmed", "via": "admin"});
+    if !sends.is_null() {
+        body["sends"] = sends;
+        if !hint.is_empty() {
+            body["hint"] = json!(hint);
+        }
+    }
+    Ok(Reply::Json { status: 201, body })
+}
+
+/// One line saying why `from` cannot send to `to` and which `[permissions] send` entry allows it.
+fn send_hint(app: &App, from: &AgentName, to: &AgentName) -> String {
+    let (why, listed) = match app.send_rules.explicit().get(from) {
+        Some(list) => (
+            format!("[permissions] send lists only some agents for {from}"),
+            list.iter().chain(std::iter::once(to)).collect::<Vec<_>>(),
+        ),
+        None => (
+            "the role rules allow a worker to write only to main".to_owned(),
+            vec![to],
+        ),
+    };
+    let names = listed.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ");
+    format!(
+        "{from} cannot send to {to}: {why}; set send = {{ {from} = [{names}] }} under [permissions] in the server config"
+    )
 }
 
 /// Removes a link. An agent that joined through an invite of the other agent

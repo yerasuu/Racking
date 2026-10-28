@@ -25,7 +25,7 @@ Without `NAME` the server proposes `agent-` and 4 random characters; the joiner 
 - `--yes-if-fingerprint WORDS` for scripted tests only: confirm when the fingerprint equals `WORDS` (spaces or dashes), deny otherwise, without asking. Never use it to link a real machine: it skips the human check this command exists for.
 - `--list` the invites still open or waiting for a confirmation, never their codes.
 - `--cancel ID` void an open invite; its code stops working at once.
-- `--pair A B` link two existing worker agents, so they may send to each other (the role rules and `[permissions]` still apply). It is an explicit act of the owner and goes to the audit log. The main agent is linked only through invites.
+- `--pair A B` link two existing worker agents. It only links: it does not grant sending between workers, because the role rules let a worker write only to main unless `[permissions] send` in the server config names the pair. When a direction is still refused, the command prints a `note:` line on stderr for it and still exits 0; add the entry it names, e.g. `send = { A = ["B"] }` under `[permissions]`, and restart the server. It is an explicit act of the owner and goes to the audit log. The main agent is linked only through invites.
 
 ## Examples
 
@@ -44,6 +44,7 @@ rack link --pair mac pc
 - Once redeemed: `redeemed by mac (worker): os linux, rack 0.1.3, from 192.168.1.30`, then `fingerprint: ...` and the question.
 - `confirmed: linked with mac`, or `denied: mac and its token are deleted`.
 - `--list`: one line per invite: id, name, role, state, and when it expires or until when it can be confirmed.
+- `--pair`: `linked A and B`, then on stderr one line per refused direction: `note: A cannot send to B: the role rules allow a worker to write only to main; set send = { A = ["B"] } under [permissions] in the server config`. A server older than this note prints nothing extra.
 
 ## Errors
 

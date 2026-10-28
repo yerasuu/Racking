@@ -298,7 +298,7 @@ All need the Bearer token, except `GET /` and `GET /help` (they show no data) an
 | `GET /admin/invites/{id}` | Admin agents only: one invite; `timeout` blocks while it is `open`. |
 | `DELETE /admin/invites/{id}` | Admin agents only: void an open invite. |
 | `POST /admin/invites/{id}/confirm`, `.../deny` | Admin agents only: the fingerprints matched, or not. |
-| `POST /admin/links` | Admin agents only: `{"a", "b"}` links two worker agents. |
+| `POST /admin/links` | Admin agents only: `{"a", "b"}` links two worker agents. Answers 201 `{"a", "b", "state", "via", "sends": {"a_to_b", "b_to_a"}, "hint"}`: `sends` is what the whole send rule (`SendRules::may_send`) gives after the link, and `hint` (only when a direction is false) has one line per refused direction naming the `[permissions] send` entry that would allow it. A link alone does not let workers send to each other. |
 | `DELETE /admin/links/{a}/{b}` | Admin agents only: remove a stored link; a joiner of that link loses its token. |
 
 Results and comments are jobs too: `POST /jobs` with `kind` `result` and `reply_to`. There is no separate endpoint.

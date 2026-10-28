@@ -208,8 +208,15 @@ pub fn cancel(c: &Client, id: i64) -> Result<()> {
 }
 
 pub fn pair(c: &Client, a: &str, b: &str) -> Result<()> {
-    let _: Value = c.post("/admin/links", Some(&json!({"a": a, "b": b})))?;
+    let made: Value = c.post("/admin/links", Some(&json!({"a": a, "b": b})))?;
     println!("linked {a} and {b}");
+    // A link does not grant sending between workers; the server's hint says which `[permissions]` entry
+    // does. A server older than the field sends none, and then there is nothing to add.
+    if made["sends"]["a_to_b"] == false || made["sends"]["b_to_a"] == false {
+        for line in made["hint"].as_str().unwrap_or_default().lines() {
+            eprintln!("note: {line}");
+        }
+    }
     Ok(())
 }
 

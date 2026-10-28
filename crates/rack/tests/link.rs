@@ -28,7 +28,8 @@ impl Env {
         fs::create_dir_all(&root).expect("root");
         let config = racking_server::Config::parse(&format!(
             "bind = \"127.0.0.1:0\"\ndata_dir = {:?}\n[agents.linux]\ntoken = \"{LINUX}\"\nrole = \"main\"\n\
-             admin = true\n[agents.windows]\ntoken = \"{WINDOWS}\"\n",
+             admin = true\n[agents.windows]\ntoken = \"{WINDOWS}\"\n\
+             [agents.pc2]\ntoken = \"pc2-token-0123456789abcdef\"\n",
             root.join("data").display().to_string()
         ))
         .expect("config");
@@ -293,4 +294,51 @@ fn wait_for_fingerprint(mut child: Child) -> (Child, String) {
     // The rest is read once the process ends.
     child.stdout = Some(out.into_inner());
     (child, fingerprint)
+}
+
+#[test]
+fn pair_says_when_the_workers_still_cannot_send() {
+    let env = Env::new_named("pair");
+    let out = env.admin(&["link", "--pair", "windows", "pc2"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "linked windows and pc2\n");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(
+            "note: windows cannot send to pc2: the role rules allow a worker to write only to main; \
+             set send = { windows = [\"pc2\"] } under [permissions] in the server config"
+        ) && err.contains("note: pc2 cannot send to windows"),
+        "{err}"
+    );
+}
+
+/// A server from before the `sends` field answers only the old fields.
+#[test]
+fn pair_prints_no_note_for_a_server_without_the_field() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("addr"));
+    let fake = std::thread::spawn(move || {
+        let (mut conn, _) = listener.accept().expect("accept");
+        let mut buf = [0u8; 4096];
+        let _ = conn.read(&mut buf);
+        let body = r#"{"a":"windows","b":"pc2","state":"confirmed","via":"admin"}"#;
+        let _ = write!(
+            conn,
+            "HTTP/1.1 201 Created\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+    });
+    let out = Command::new(env!("CARGO_BIN_EXE_rack"))
+        .args(["link", "--pair", "windows", "pc2"])
+        .env("RACK_URL", &url)
+        .env("RACK_TOKEN", LINUX)
+        .env_remove("RACK_CONFIG")
+        .stdin(Stdio::null())
+        .output()
+        .expect("rack");
+    fake.join().expect("fake server");
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "linked windows and pc2\n");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
 }

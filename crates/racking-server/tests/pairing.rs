@@ -716,3 +716,41 @@ fn owner_bootstrap_invite_and_nothing_secret_in_the_log() {
         assert!(!contains(&db, secret), "a code or token is in the database");
     }
 }
+
+fn send(s: &Server, from: &str, to: &str) -> u16 {
+    s.call(
+        "POST",
+        "/jobs",
+        from,
+        Some(json!({"to": to, "kind": "message", "body": "x"})),
+    )
+    .0
+}
+
+#[test]
+fn admin_link_says_whether_the_workers_may_send() {
+    let s = Server::start(ROLES);
+    let w1 = s.linked("w1x", "worker");
+    s.linked("w2x", "worker");
+    let (status, made) = s.call("POST", "/admin/links", BOSS, Some(json!({"a": "w1x", "b": "w2x"})));
+    assert_eq!(status, 201, "{made}");
+    assert_eq!(made["state"], "confirmed");
+    assert_eq!(made["sends"], json!({"a_to_b": false, "b_to_a": false}));
+    let hint = made["hint"].as_str().unwrap_or_default();
+    assert!(hint.contains("send = { w1x = [\"w2x\"] }"), "{hint}");
+    assert!(hint.contains("send = { w2x = [\"w1x\"] }"), "{hint}");
+    assert_eq!(send(&s, &w1, "w2x"), 403);
+    drop(s);
+
+    let config = format!("{ROLES}[permissions]\nsend = {{ w2x = [\"w1x\"] }}\n");
+    let s = Server::start(&config);
+    let w1 = s.linked("w1x", "worker");
+    let w2 = s.linked("w2x", "worker");
+    let (_, made) = s.call("POST", "/admin/links", BOSS, Some(json!({"a": "w1x", "b": "w2x"})));
+    assert_eq!(made["sends"], json!({"a_to_b": false, "b_to_a": true}));
+    let hint = made["hint"].as_str().unwrap_or_default();
+    assert!(hint.contains("send = { w1x = [\"w2x\"] }"), "{hint}");
+    assert!(!hint.contains("w2x cannot"), "{hint}");
+    assert_eq!(send(&s, &w2, "w1x"), 201);
+    assert_eq!(send(&s, &w1, "w2x"), 403);
+}

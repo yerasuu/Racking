@@ -783,7 +783,9 @@ static ROUTES: &[Route] = &[
         auth: true,
         body: BodyKind::Json,
         summary: "Admin agents only: link two worker agents, an explicit act of the owner recorded in the audit \
-                  log. The main agent is linked only through invites. Answers 201.",
+                  log. The main agent is linked only through invites. A link alone does not let workers send to each other: \
+                  the answer has `sends` (`a_to_b`, `b_to_a`) and, when one is false, a `hint` naming the \
+                  `[permissions] send` entry. Answers 201.",
         query: &[],
         input: "`a` and `b`: two existing, confirmed worker agents.",
         example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" -d '{\"a\":\"mac\",\"b\":\"pc\"}' \
