@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::net::{self, Cidr};
 use crate::policy::{Role, SendRules};
 use crate::types::AgentName;
 
@@ -17,6 +18,10 @@ const MIN_TOKEN_LEN: usize = 24;
 struct RawConfig {
     #[serde(default = "default_bind")]
     bind: String,
+    #[serde(default)]
+    allow_public_bind: bool,
+    #[serde(default)]
+    allow_from: Option<Vec<String>>,
     data_dir: PathBuf,
     agents: BTreeMap<String, RawAgent>,
     #[serde(default)]
@@ -49,6 +54,11 @@ fn default_bind() -> String {
 /// A checked configuration: at least two agents, valid names, distinct real tokens.
 pub struct Config {
     pub bind: SocketAddr,
+    /// Set when `bind` is neither loopback nor private and the owner said so with
+    /// `allow_public_bind = true`; the server then warns at every start.
+    pub public_bind: bool,
+    /// Peers that may connect at all; any other gets 403 before authentication.
+    pub allow_from: Vec<Cidr>,
     pub data_dir: PathBuf,
     pub agents: Vec<Agent>,
     pub send_rules: SendRules,
@@ -91,7 +101,23 @@ impl Config {
 
     pub fn parse(text: &str) -> Result<Self, String> {
         let raw: RawConfig = toml::from_str(text).map_err(|e| e.to_string())?;
-        let bind = raw.bind.parse().map_err(|e| format!("bind `{}`: {e}", raw.bind))?;
+        let bind: SocketAddr = raw.bind.parse().map_err(|e| format!("bind `{}`: {e}", raw.bind))?;
+        let public_bind = !net::is_local(bind.ip());
+        if public_bind && !raw.allow_public_bind {
+            return Err(format!(
+                "bind `{bind}` is not a loopback or private LAN address; Racking is LAN only. Bind the machine's \
+                 LAN address, or set allow_public_bind = true if the owner really wants this"
+            ));
+        }
+        let allow_from = match &raw.allow_from {
+            Some(list) => list
+                .iter()
+                .map(String::as_str)
+                .map(str::parse)
+                .collect::<Result<Vec<Cidr>, String>>(),
+            None => net::DEFAULT_ALLOW_FROM.iter().copied().map(str::parse).collect(),
+        }
+        .map_err(|e: String| format!("allow_from: {e}"))?;
         if raw.agents.len() < 2 {
             return Err("at least two agents are needed under [agents.NAME]".to_owned());
         }
@@ -142,6 +168,8 @@ impl Config {
         };
         Ok(Self {
             bind,
+            public_bind,
+            allow_from,
             data_dir: raw.data_dir,
             agents,
             send_rules: SendRules::new(any_role || raw.permissions.is_some(), explicit),
@@ -182,6 +210,58 @@ mod tests {
             "[agents.linux]\ntoken = \"{T1}\"\n[agents.windows]\ntoken = \"{T2}\"\n"
         ));
         assert_eq!(c.map(|c| c.bind.to_string()), Ok("127.0.0.1:7878".to_owned()));
+    }
+
+    #[test]
+    fn public_binds_need_the_owner_s_word() {
+        let agents = format!("[agents.a]\ntoken = \"{T1}\"\n[agents.b]\ntoken = \"{T2}\"\n");
+        let at = |bind: &str, extra: &str| {
+            Config::parse(&format!("bind = \"{bind}\"\n{extra}data_dir = \"/tmp/x\"\n{agents}"))
+        };
+        assert!(at("192.168.1.20:7878", "").is_ok_and(|c| !c.public_bind));
+        assert!(at("[fe80::1]:7878", "").is_ok());
+        let err = at("0.0.0.0:7878", "").err().unwrap_or_default();
+        assert!(err.contains("allow_public_bind"), "{err}");
+        assert!(at("203.0.113.5:7878", "").is_err());
+        assert!(at("0.0.0.0:7878", "allow_public_bind = true\n").is_ok_and(|c| c.public_bind));
+    }
+
+    #[test]
+    fn allow_from_defaults_to_lan_and_loopback() {
+        let agents = format!("[agents.a]\ntoken = \"{T1}\"\n[agents.b]\ntoken = \"{T2}\"\n");
+        let c = cfg(&agents).expect("config");
+        let allowed = |ip: &str| {
+            let ip = ip.parse().unwrap_or_else(|e| panic!("{e}"));
+            c.allow_from.iter().any(|b| b.contains(ip))
+        };
+        assert!(allowed("127.0.0.1") && allowed("192.168.4.4") && allowed("10.9.9.9") && allowed("::1"));
+        assert!(allowed("fe80::abcd"));
+        assert!(!allowed("8.8.8.8") && !allowed("2001:db8::1"));
+        let only = Config::parse(&format!(
+            "allow_from = [\"10.0.0.0/8\"]\ndata_dir = \"/tmp/x\"\n{agents}"
+        ))
+        .expect("config");
+        assert_eq!(only.allow_from.len(), 1);
+        assert!(
+            Config::parse(&format!(
+                "allow_from = [\"10.0.0.0/40\"]\ndata_dir = \"/tmp/x\"\n{agents}"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn the_example_config_parses_once_tokens_are_filled_in() {
+        let example = include_str!("../../../config.example.toml")
+            .replace("CHANGE-ME-linux-token", T1)
+            .replace("CHANGE-ME-windows-token", T2);
+        let c = Config::parse(&example).expect("config.example.toml");
+        assert!(c.send_rules.enforced());
+        assert!(!c.public_bind);
+        assert!(
+            Config::parse(include_str!("../../../config.example.toml")).is_err(),
+            "placeholders refused"
+        );
     }
 
     #[test]

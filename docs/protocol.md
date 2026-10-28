@@ -161,9 +161,17 @@ Delivery: an inbox answer that lists a notice, message or report still `sent` mo
 
 Any request with a valid token counts as activity, a blocked wait included. Any request may also carry `X-Rack-Version: 0.1.0` and `X-Rack-Os: linux`; the service records them as the caller's `rack_version` and `os`, and ignores a missing or invalid value (over 40 chars or outside the charset) without failing the request. `rack` and `racking-mcp` send both on every request, so presence costs no extra request. `last_seen`, `rack_version` and `os` are kept in memory and written to the database at most once a minute per agent, so presence costs no write per request; a server restart forgets at most the last minute. `PUT /agents/me` with `{"about", "rack_version", "os", "capabilities"}` sets the caller's own entry (clients use it for `about` and `capabilities`), never another agent's: a field left out or null is kept, an empty string clears it, `capabilities` replaces the whole list and `[]` clears it, and the answer is the entry. `rack_version`, `os`, `about` and `capabilities` are written by that agent: data, like a job body. The service checks only their shape, never whether they are true. Tokens and the `admin` flag are never shown.
 
+## LAN only
+
+Before routing or authentication, the server checks the peer address of the TCP connection against `allow_from` in its config, a list of addresses or CIDR blocks (`192.168.0.0/16`, `fe80::/10`, `::1`). A peer outside it gets `403 peer_not_allowed` on every route, `GET /help` included, and the server logs the peer address (never a token). The default is loopback and the private and link-local ranges: `127.0.0.0/8`, `::1/128`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `fc00::/7`, `fe80::/10`. An IPv4 peer seen on an IPv6 socket (`::ffff:a.b.c.d`) counts as that IPv4 address.
+
+`X-Forwarded-For` and similar headers are ignored: any client can write them. Behind a reverse proxy the peer is the proxy, so `allow_from` then admits or refuses the proxy, not the clients behind it; filter at the proxy too.
+
+`bind` must be a loopback, private or link-local address. Any other (a public address, or `0.0.0.0`/`::`, which listen on every interface) makes the server refuse to start, unless the config sets `allow_public_bind = true`; the server then logs a warning at every start.
+
 ## Endpoints
 
-All need the Bearer token, except `GET /` and `GET /help` (they show no data).
+All need the Bearer token, except `GET /` and `GET /help` (they show no data). All need a peer inside `allow_from`.
 
 | Method and path | Purpose |
 |---|---|
@@ -222,6 +230,7 @@ Error:
 |---|---|---|
 | 400 | `bad_request` | Malformed JSON or field out of range. `message` names the field. |
 | 401 | `no_token` / `bad_token` | Missing or unknown token. Hint: ask the owner for a token. |
+| 403 | `peer_not_allowed` | Your address is outside `allow_from` (see LAN only). Checked before the token. |
 | 403 | `not_yours` | Job belongs to other agents. |
 | 403 | `not_admin` | Publishing a `rack` binary needs an agent with `admin = true`. |
 | 403 | `not_allowed` | Your role or `[permissions]` do not let you send to that agent. Hint: who you can send to. |
@@ -397,5 +406,5 @@ The check is advisory: capabilities are what each agent says about itself.
 
 - Language and storage layout (#15, #7).
 - Whether MCP adapter exposes `wait` as a tool with a fixed short timeout (#17).
-- LAN-only enforcement (#12).
+- TLS: none. On the LAN, tokens and jobs travel in clear (see SECURITY.md).
 - Per-agent peer rules: settled by roles and `[permissions]` (see Roles).

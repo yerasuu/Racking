@@ -413,3 +413,30 @@ fn the_brake_stops_workers_but_keeps_delivering() {
     let (_, inbox) = s.call("GET", "/inbox", W1, None);
     assert_eq!(inbox["paused"], false);
 }
+
+#[test]
+fn peers_outside_allow_from_are_refused_before_the_token() {
+    let s = Server::start(&format!("allow_from = [\"10.0.0.0/8\", \"fe80::/10\"]\n{ROLES}"));
+    let (status, err) = s.call("GET", "/whoami", BOSS, None);
+    assert_eq!(
+        (status, code(&err)),
+        (403, "peer_not_allowed"),
+        "a valid token does not help"
+    );
+    let (status, err) = s.call("GET", "/whoami", "not-a-token", None);
+    assert_eq!(
+        (status, code(&err)),
+        (403, "peer_not_allowed"),
+        "checked before authentication"
+    );
+    let resp = s
+        .http
+        .get(format!("{}/help", s.base))
+        .header("X-Forwarded-For", "10.1.2.3")
+        .call()
+        .expect("http");
+    assert_eq!(resp.status().as_u16(), 403, "X-Forwarded-For is ignored, even on /help");
+
+    let open = Server::start(&format!("allow_from = [\"127.0.0.1\"]\n{ROLES}"));
+    assert_eq!(open.call("GET", "/whoami", BOSS, None).0, 200);
+}

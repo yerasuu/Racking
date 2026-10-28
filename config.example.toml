@@ -6,6 +6,15 @@
 # Loopback by default. Set the machine's LAN address (e.g. "192.168.1.20:7878")
 # only once the owner decides the service should be reachable on the network.
 bind = "127.0.0.1:7878"
+# A bind that is not loopback, private or link-local (a public address, or
+# 0.0.0.0 / ::, which listen everywhere) is refused unless this is true.
+# allow_public_bind = false
+
+# Peer addresses that may connect at all; others get 403 before their token is
+# read. X-Forwarded-For is ignored: behind a proxy, the peer is the proxy.
+# Default: loopback and the private and link-local ranges, as below.
+# allow_from = ["127.0.0.0/8", "::1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+#               "169.254.0.0/16", "fc00::/7", "fe80::/10"]
 
 # SQLite database and attachment files live here.
 data_dir = "/var/lib/racking"

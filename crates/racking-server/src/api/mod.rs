@@ -18,6 +18,7 @@ use crate::clock::Clock;
 use crate::config::Config;
 use crate::dist::{self, Dist, Slot};
 use crate::error::{ApiError, ApiResult, Code};
+use crate::net::Cidr;
 use crate::policy::{Role, SendRules};
 use crate::presence::{self, Flush, InfoUpdate, Presence, Software};
 use crate::rate::PerMinute;
@@ -558,6 +559,8 @@ pub struct App {
     send_rules: SendRules,
     presence: Presence,
     per_minute: PerMinute,
+    /// `allow_from`: checked on every request before routing and authentication.
+    allow_from: Vec<Cidr>,
     /// The emergency brake, mirrored from the store so a request reads it without a query.
     paused: AtomicBool,
     in_flight: AtomicUsize,
@@ -591,6 +594,7 @@ impl App {
             send_rules,
             presence,
             per_minute,
+            allow_from: config.allow_from.clone(),
             paused: AtomicBool::new(paused),
             in_flight: AtomicUsize::new(0),
         })
@@ -699,7 +703,9 @@ pub fn handle(app: &App, mut request: Request) {
     let in_flight = app.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
     let method = request.method().to_string();
     let url = request.url().to_owned();
-    let (status, agent, response) = if in_flight > MAX_IN_FLIGHT {
+    let (status, agent, response) = if let Err(err) = check_peer(app, &request) {
+        (err.code.status(), None, error_response(&err).boxed())
+    } else if in_flight > MAX_IN_FLIGHT {
         let err = ApiError::new(Code::RateLimited, "too many requests in flight", "Retry-After: 1");
         (
             err.code.status(),
@@ -740,6 +746,26 @@ pub fn handle(app: &App, mut request: Request) {
         status,
         ms = started.elapsed().as_millis() as u64,
     );
+}
+
+/// The LAN-only guard, before routing and authentication: a peer outside
+/// `allow_from` learns nothing but the refusal. The peer is the TCP address;
+/// `X-Forwarded-For` is ignored, since any client can write it.
+fn check_peer(app: &App, request: &Request) -> ApiResult<()> {
+    let peer = request.remote_addr().map(|a| a.ip());
+    if peer.is_some_and(|ip| app.allow_from.iter().any(|block| block.contains(ip))) {
+        return Ok(());
+    }
+    tracing::warn!(
+        target: "racking::http",
+        peer = %peer.map_or_else(|| "unknown".to_owned(), |ip| ip.to_string()),
+        "refused a peer outside allow_from"
+    );
+    Err(ApiError::new(
+        Code::PeerNotAllowed,
+        "your address may not use this server",
+        "Racking is LAN only: the owner lists the allowed networks in `allow_from` of the server config.",
+    ))
 }
 
 fn serve(app: &App, request: &mut Request, agent_out: &mut Option<AgentName>) -> ApiResult<Reply> {

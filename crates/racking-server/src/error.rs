@@ -6,6 +6,7 @@ use serde_json::json;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Code {
     BadRequest,
+    PeerNotAllowed,
     NoToken,
     BadToken,
     NotYours,
@@ -26,10 +27,15 @@ pub enum Code {
 
 impl Code {
     /// Every code with its status and meaning, in the order `/help` lists them.
-    pub const ALL: [(Code, &'static str); 17] = [
+    pub const ALL: [(Code, &'static str); 18] = [
         (
             Code::BadRequest,
             "Malformed JSON or field out of range. `message` names the field.",
+        ),
+        (
+            Code::PeerNotAllowed,
+            "Your address is outside `allow_from` of the server config (LAN and loopback by default). Checked \
+             before the token.",
         ),
         (Code::NoToken, "Missing `Authorization: Bearer` header."),
         (Code::BadToken, "Unknown token."),
@@ -90,7 +96,7 @@ impl Code {
         match self {
             Code::BadRequest => 400,
             Code::NoToken | Code::BadToken => 401,
-            Code::NotYours | Code::NotAdmin | Code::NotAllowed => 403,
+            Code::PeerNotAllowed | Code::NotYours | Code::NotAdmin | Code::NotAllowed => 403,
             Code::NotFound => 404,
             Code::BadTransition | Code::TooDeep | Code::AttachmentsLocked | Code::Conflict => 409,
             Code::TooLarge => 413,
@@ -104,6 +110,7 @@ impl Code {
     pub fn as_str(self) -> &'static str {
         match self {
             Code::BadRequest => "bad_request",
+            Code::PeerNotAllowed => "peer_not_allowed",
             Code::NoToken => "no_token",
             Code::BadToken => "bad_token",
             Code::NotYours => "not_yours",
