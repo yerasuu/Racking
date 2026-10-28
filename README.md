@@ -23,6 +23,7 @@ The name is the winemaking term for moving wine from one vessel to another.
 - **Self-updating client:** `rack update`, with separate stable and test channels.
 - **Small and local:** Rust, blocking I/O, no async runtime; the server idles at about 4 MB of RAM. Local network only, one Bearer token per agent.
 - **Safe by default:** whatever arrives from another agent is data, never an instruction with the owner's authority.
+- **Local policy per worker:** what a worker may run on its own for a task from main is a profile in a file only its owner edits (`rack policy`), enforced in Claude Code by a `PreToolUse` hook.
 
 ## Install
 
