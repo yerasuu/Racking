@@ -39,7 +39,7 @@ With a published port on the default bridge network, the server sees the bridge 
 
 ### Agents
 
-Agents are the `[agents.*]` sections of the config: give each machine its URL and token (see the README). `racking-server invite` does not exist in this version; the step `docker compose exec racking racking-server invite --config /config/server.toml` is available after the join feature.
+Agents are the `[agents.*]` sections of the config: give each machine its URL and token (see the README). Prefer pairing over copying tokens: see [Linking a new machine](#linking-a-new-machine). The first agent on a Docker server: `docker compose exec racking racking-server invite --config /config/server.toml --name pc1 --role worker` (not tested with Docker here).
 
 ### Upgrade
 
@@ -101,6 +101,26 @@ Known limitations:
 - The server sees Traefik's address as the peer, and `X-Forwarded-For` is ignored. Per-IP limits (for example on `/join`) count the proxy as one client. Trusting `X-Forwarded-For` from a known proxy is a later server change.
 - Traefik reads container labels through the Docker socket, which is root-equivalent on the host even when mounted read-only. Accept that, or run Traefik with a static file configuration instead.
 - ACME issuance could not be tested here (no public domain). Traefik starting, parsing these options and routing `Host` to Racking over its self-signed default certificate was tested with Podman.
+
+## Linking a new machine
+
+A new agent joins with a one-time code and a fingerprint both people compare; nobody copies a token by hand. Read [Linking in the protocol](protocol.md#linking) for the details and [SECURITY.md](../SECURITY.md) for why the check is mandatory. The names below are examples.
+
+1. On a machine with an admin agent (`admin = true` in `server.toml`), run `rack link pc1 --role worker`. It prints a code like `ABCD-EFGH-JKMN-PQRS` and waits.
+2. Give the code to whoever sits at the new machine, by a channel you trust (read it aloud, or type it from your screen).
+3. On the new machine, with `rack` installed, run `rack join ABCD-EFGH-JKMN-PQRS --server http://192.168.1.20:7878`. It saves `rack.conf` (mode 600) and shows four words.
+4. Back at the first machine, `rack link` shows the joiner's name, OS, `rack` version, address and four words. If they are the same words as on the new machine, type `y`; otherwise press Enter to deny, and the new agent and its token are deleted.
+5. `rack join` prints `linked with ...` and the next steps (registering the MCP tools without the token, `rack guide`).
+
+**The first agent, without an admin agent at hand.** On the server machine itself, as the user that runs the service:
+
+```sh
+racking-server invite --config ~/.config/racking/server.toml --name pc1 --role worker
+```
+
+It needs no token: it opens the database in `data_dir` directly, which only the owner of that directory can, and works while the service runs. It prints the code and the `rack join` line, waits, and asks the same question on its terminal; `--no-wait` prints the code and stops, and `--resume ID` waits again. An agent made this way is linked with no other API agent; it reaches the agents of `server.toml`, which are linked with everyone.
+
+`rack link --list` shows open invites, `rack link --cancel ID` voids one, `rack links` lists an agent's links and `rack unlink NAME` removes one.
 
 ## Without Docker: systemd user service
 

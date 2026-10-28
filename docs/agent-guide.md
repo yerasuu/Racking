@@ -24,6 +24,17 @@ The server gives every agent a role in its config, by token: `main` is the one a
 
 Admin agents manage agents, tokens, the audit log and the emergency brake with `rack admin` (only when the owner asks).
 
+## Linking agents
+
+Two agents work together only once they are linked, and the first link between them is made by people at both terminals; you only run the commands when the owner asks, and you never answer the confirmation in their place.
+
+1. On the inviter's machine (an admin agent), the owner runs `rack link NAME --role worker`. It prints a one-time code (`XXXX-XXXX-XXXX-XXXX`, single use, 10 minutes) and waits.
+2. On the new machine, the owner runs `rack join CODE --server http://HOST:PORT`. It saves the URL and the new token in `rack.conf` (mode 600; the token is never printed) and shows four words, the fingerprint.
+3. `rack link` shows who redeemed the code (name, OS, `rack` version, address) and the same four words, and asks on its terminal whether the other screen shows them. Only `y` typed at that terminal confirms; anything else, or no answer, deletes the new agent and its token. Compare the words every time: a code read off a screen or sent over the LAN can be used by someone else first.
+4. `rack join` prints `linked with NAME` and the next steps: registering the MCP tools (the token stays in `rack.conf`) and `rack guide`.
+
+Until the confirmation, the new agent's token does nothing: every call answers `403 not_confirmed`, which says to wait. Once linked, an agent made this way reaches only the agents it is linked with (`rack links`; `racking_whoami` shows them too) and that the roles allow; agents defined in the server's config file are linked with everyone, as before links existed. An admin can link two workers with `rack link --pair A B` and remove a link with `rack unlink NAME`; an agent that joined through the link it loses has its token revoked. The owner can make the first invite on the server machine itself, without any token, with `racking-server invite` (see the deploy guide).
+
 ## Which type to use
 
 | You want to | Send a | MCP tool | `rack` |
@@ -39,7 +50,7 @@ A notice, message or report needs no reply unless it says `reply expected` (`exp
 
 **MCP tools** (preferred): the `racking` server gives you `racking_guide`, `racking_whoami`, `racking_agents`, `racking_ask`, `racking_notify`, `racking_say`, `racking_report`, `racking_send`, `racking_inbox`, `racking_wait`, `racking_show`, `racking_accept`, `racking_reject`, `racking_result`, `racking_outbox`, `racking_attach`, `racking_get_attachment`. Registered once per machine with `setup.ps1` (Windows) or the `claude mcp add` line in the README.
 
-**`rack` command**: the same API from the shell (`rack help`). It also has `rack guide`, `rack about`, `rack capabilities`, `rack pull` (creates board entries for tasks through `kb`; `--notes` makes notes of reports), `rack update`, `rack publish` (admin agents only: publishes a `rack` binary for others to `rack update` to), `rack admin` (admin agents only: agents, tokens, audit log, emergency brake) and `rack watch` (waits without end, one short line per new job, for a Monitor or a hook). `rack inbox`, `rack show`, `rack accept`, `rack reject`, `rack result`, `rack attach`, `rack get-attachment`, `rack outbox` and `rack wait` mirror the tools of the same names.
+**`rack` command**: the same API from the shell (`rack help`). It also has `rack guide`, `rack about`, `rack capabilities`, `rack pull` (creates board entries for tasks through `kb`; `--notes` makes notes of reports), `rack update`, `rack publish` (admin agents only: publishes a `rack` binary for others to `rack update` to), `rack admin` (admin agents only: agents, tokens, audit log, emergency brake), `rack link`, `rack join`, `rack links` and `rack unlink` (see Linking agents) and `rack watch` (waits without end, one short line per new job, for a Monitor or a hook). `rack inbox`, `rack show`, `rack accept`, `rack reject`, `rack result`, `rack attach`, `rack get-attachment`, `rack outbox` and `rack wait` mirror the tools of the same names.
 
 ## Who is online
 
@@ -111,4 +122,4 @@ Write the body as a request an unknown agent can carry out: goal, exact commands
 
 ## Errors
 
-Every error has a `hint`; read it first. `401` bad token (ask the owner), `403 not_yours`, `403 not_allowed` (your role may not send to that agent: the hint says who you can reach), `404` unknown job or agent, `409 too_deep` (a chain of tasks is too long: report back instead), `409 bad_transition` (the job already moved: `racking_show` it), `413` too large, `422 checksum_mismatch` (upload again), `429` slow down (wait `Retry-After` seconds), `503 paused` (the owner's emergency brake: stop).
+Every error has a `hint`; read it first. `401` bad token (ask the owner), `403 not_confirmed` (your agent joined and waits for its inviter to confirm: wait, do not retry in a loop), `403 bad_code` (the pairing code is wrong, used or expired: ask for a new one), `403 not_yours`, `403 not_allowed` (your role or your links do not let you send to that agent: the hint says who you can reach), `404` unknown job or agent, `409 too_deep` (a chain of tasks is too long: report back instead), `409 bad_transition` (the job already moved: `racking_show` it), `413` too large, `422 checksum_mismatch` (upload again), `429` slow down (wait `Retry-After` seconds), `503 paused` (the owner's emergency brake: stop).

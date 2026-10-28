@@ -2,6 +2,7 @@
 //! per job, so agents can read it cheaply.
 
 mod listen;
+mod pairing;
 mod pull;
 mod state;
 mod update;
@@ -79,6 +80,16 @@ Config: RACK_URL and RACK_TOKEN, or RACK_CONFIG=FILE, or the default file
   rack admin agents | add NAME ROLE | rotate NAME | remove NAME | audit [--limit N] [--before ID]
             | pause | resume              admin agents: manage agents and tokens without a restart,
                                                  read the audit log, pull or release the emergency brake
+  rack link [NAME] [--role worker|main] [--ttl SECS] [--no-wait] [--yes-if-fingerprint WORDS]
+            | --resume ID | --list | --cancel ID | --pair A B
+                                                 admin agents: invite an agent with a one-time code,
+                                                 wait for it, confirm the fingerprint on this terminal
+  rack join CODE --server URL [--name N] [--config-dir DIR] [--force] | --resume
+                                                 join a server with a code from `rack link`: saves
+                                                 rack.conf, waits for the inviter's confirmation
+  rack links                                     the agents this one is linked with
+  rack unlink NAME [OTHER]                       admin agents: remove a link; an agent that joined
+                                                 through it loses its token
   rack version                                   (also --version, -V)
   rack help [COMMAND]                            this text, or the help of one command (same as `rack COMMAND --help`)
 
@@ -283,6 +294,11 @@ fn run(all_args: &[String]) -> Result<()> {
         "update" => self_update(rest),
         "publish" => publish(rest),
         "admin" => admin(&connect()?, rest),
+        "link" => link(&connect()?, rest),
+        // Before `connect()`: a machine that joins has no credentials yet.
+        "join" => join(rest),
+        "links" => links(&connect()?, rest),
+        "unlink" => unlink(&connect()?, rest),
         other => Err(RackError::Usage(format!("unknown command `{other}`"))),
     }
 }
@@ -1047,6 +1063,111 @@ fn admin_agent_line(a: &Value) -> String {
         None => line.push_str(", never used"),
     }
     line
+}
+
+/// `rack link`: one command for the inviter's side of a pairing.
+fn link(c: &Client, args: &[String]) -> Result<()> {
+    let opts = Opts::parse(
+        args,
+        &["role", "ttl", "resume", "cancel", "yes-if-fingerprint"],
+        &["list", "no-wait", "pair"],
+    )?;
+    let positive = |name: &str| -> Result<i64> {
+        opts.number(name)?
+            .filter(|n| *n > 0)
+            .ok_or_else(|| RackError::Usage(format!("--{name} needs an invite id, as `rack link --list` shows it")))
+    };
+    let creating = opts.value("role").is_some() || opts.value("ttl").is_some() || opts.flag("no-wait");
+    let modes = [
+        opts.flag("list"),
+        opts.value("cancel").is_some(),
+        opts.value("resume").is_some(),
+        opts.flag("pair"),
+    ];
+    let words: Vec<&str> = opts.positional.iter().map(String::as_str).collect();
+    match (modes, words.as_slice()) {
+        ([false, false, false, false], [] | [_]) => {
+            let name = words.first().map(|n| admin_name(n)).transpose()?;
+            let role = opts.value("role").unwrap_or("worker");
+            if !matches!(role, "worker" | "main") {
+                return Err(RackError::Usage("--role is worker or main".to_owned()));
+            }
+            pairing::invite(
+                c,
+                name,
+                role,
+                opts.number("ttl")?,
+                opts.flag("no-wait"),
+                opts.value("yes-if-fingerprint"),
+            )
+        }
+        _ if creating => Err(RackError::Usage(
+            "--role, --ttl and --no-wait go with a new invite only".to_owned(),
+        )),
+        ([true, false, false, false], []) => pairing::list_invites(c),
+        ([false, true, false, false], []) => pairing::cancel(c, positive("cancel")?),
+        ([false, false, true, false], []) => {
+            pairing::wait_and_decide(c, positive("resume")?, opts.value("yes-if-fingerprint"))
+        }
+        ([false, false, false, true], [a, b]) => pairing::pair(c, admin_name(a)?, admin_name(b)?),
+        _ => Err(RackError::Usage(
+            "expected [NAME] [--role R], or one of --resume ID, --list, --cancel ID, --pair A B".to_owned(),
+        )),
+    }
+}
+
+/// `rack join`: the joiner's side. It needs no credentials: it is how a machine gets them.
+fn join(args: &[String]) -> Result<()> {
+    let opts = Opts::parse(args, &["server", "name", "config-dir"], &["force", "resume"])?;
+    if opts.flag("resume") {
+        if !opts.positional.is_empty() || !opts.values.is_empty() || opts.flag("force") {
+            return Err(RackError::Usage(
+                "--resume takes nothing else; with another config dir, set RACK_CONFIG=DIR/rack.conf".to_owned(),
+            ));
+        }
+        let conf = std::env::var_os("RACK_CONFIG").map(PathBuf::from);
+        return pairing::resume_join(&connect()?, conf.as_deref(), conf.is_none());
+    }
+    let [code] = opts.positionals(1, "CODE (from `rack link` on the inviter's machine)")? else {
+        return Err(RackError::Usage("expected CODE".to_owned()));
+    };
+    let server = opts
+        .value("server")
+        .ok_or_else(|| RackError::Usage("--server URL is required, e.g. http://192.168.1.20:7878".to_owned()))?;
+    let name = opts.value("name").map(admin_name).transpose()?;
+    let (dir, default_dir) = match opts.value("config-dir") {
+        Some(d) => (PathBuf::from(d), false),
+        None => (config::default_dir()?, true),
+    };
+    pairing::join(&pairing::JoinArgs {
+        code,
+        server,
+        name,
+        dir,
+        default_dir,
+        force: opts.flag("force"),
+    })
+}
+
+fn links(c: &Client, args: &[String]) -> Result<()> {
+    Opts::parse(args, &[], &[])?.positionals(0, "no arguments")?;
+    pairing::links(c)
+}
+
+fn unlink(c: &Client, args: &[String]) -> Result<()> {
+    let opts = Opts::parse(args, &[], &[])?;
+    match opts.positional.as_slice() {
+        [other] => {
+            let me: Value = c.get("/whoami")?;
+            pairing::unlink(
+                c,
+                admin_name(me["agent"].as_str().unwrap_or_default())?,
+                admin_name(other)?,
+            )
+        }
+        [a, b] => pairing::unlink(c, admin_name(a)?, admin_name(b)?),
+        _ => Err(RackError::Usage("expected NAME, or two names A B".to_owned())),
+    }
 }
 
 /// Prints a token the server shows only once: on stdout alone, so it can be piped, and the warning on stderr.

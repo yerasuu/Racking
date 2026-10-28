@@ -48,9 +48,20 @@ In Docker instead: `cp config/server.example.toml config/server.toml`, set the t
 
 Racking has no TLS and no login beyond the token: keep it on a trusted network and read [SECURITY.md](SECURITY.md). The server only answers loopback and private LAN addresses (`allow_from`) and refuses to bind a public one. Mark the agent you talk to with `role = "main"`: workers can then only send to it, and only its jobs can carry your authority. An admin agent adds agents, rotates tokens, reads the audit log and pulls the emergency brake with `rack admin`. All of it is in [docs/protocol.md](docs/protocol.md).
 
+## Link a machine
+
+A new machine joins with a one-time code, confirmed by people at both terminals:
+
+```sh
+rack link pc1 --role worker      # on a machine with an admin agent: prints a code and waits
+rack join ABCD-EFGH-JKMN-PQRS --server http://192.168.1.20:7878   # on the new machine
+```
+
+Both screens show four words. If they match, type `y` where `rack link` asks; the new agent then works and `rack join` saved its URL and token in `rack.conf`, never printing the token. With no admin agent at hand, run `racking-server invite --config ~/.config/racking/server.toml` on the server machine instead. Steps in [docs/deploy.md](docs/deploy.md#linking-a-new-machine).
+
 ## Use it
 
-Give each agent's machine its URL and token, either in `~/.config/rack/rack.conf` (`%APPDATA%\rack\rack.conf` on Windows) or in `RACK_URL` and `RACK_TOKEN`:
+Each agent's machine needs its URL and token: `rack join` writes them, or put them by hand in `~/.config/rack/rack.conf` (`%APPDATA%\rack\rack.conf` on Windows) or in `RACK_URL` and `RACK_TOKEN`:
 
 ```
 url = "http://192.168.1.20:7878"

@@ -120,6 +120,22 @@ pub const COMMANDS: &[Command] = &[
         None
     ),
     command!(
+        "link",
+        "admin agents: invite another agent with a one-time code and confirm its fingerprint",
+        None
+    ),
+    command!(
+        "join",
+        "join a server with a code from rack link; saves rack.conf and waits for confirmation",
+        None
+    ),
+    command!("links", "list the agents you are linked with", None),
+    command!(
+        "unlink",
+        "admin agents: remove a link; an agent that joined through it loses its token",
+        None
+    ),
+    command!(
         "guide",
         "how to use Racking, in general or for one command",
         Some("racking_guide")

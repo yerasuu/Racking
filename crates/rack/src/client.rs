@@ -376,6 +376,11 @@ impl Client {
         )))
     }
 
+    /// The server URL, without a trailing slash.
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base)
     }
