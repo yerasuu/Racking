@@ -8,7 +8,9 @@ mod clock;
 pub mod config;
 mod dist;
 mod error;
+mod invite;
 mod net;
+mod pairing;
 mod policy;
 mod presence;
 mod rate;
@@ -24,6 +26,7 @@ use std::thread::JoinHandle;
 pub use api::guide;
 pub use clock::Clock;
 pub use config::Config;
+pub use pairing::{Bootstrap, Redeemed, Waited};
 
 /// A started server. Dropping it leaves the server running; call `stop` to end it.
 pub struct Running {

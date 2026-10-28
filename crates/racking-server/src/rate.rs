@@ -1,27 +1,40 @@
-//! Jobs per sender per minute, counted in memory: a restart forgets at most one
-//! minute of counts, which is fine for a guard against runaway agents.
+//! Counts per key in fixed wall-clock windows, in memory: jobs per sender per
+//! minute, and failed pairing codes per peer address. A restart forgets at most
+//! one window of counts, which is fine for guards against runaway or guessing peers.
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{PoisonError, RwLock};
 
 use crate::clock::Clock;
 use crate::types::AgentName;
 
-/// A fixed window per wall-clock minute and sender.
-pub struct PerMinute {
+/// Jobs per sender per minute.
+pub type PerMinute = PerWindow<AgentName>;
+
+/// A fixed window of `window` seconds per key.
+pub struct PerWindow<K> {
     limit: u32,
+    window: i64,
     clock: Clock,
-    /// Each window packs the minute in the high 32 bits and the count in the low
-    /// 32, so one atomic update moves to a new minute and counts at once. The map
-    /// is written only the first time a sender sends, so reads dominate.
-    windows: RwLock<HashMap<AgentName, AtomicU64>>,
+    /// Each window packs its number in the high 32 bits and the count in the low
+    /// 32, so one atomic update moves to a new window and counts at once. The map
+    /// is written only the first time a key counts, so reads dominate.
+    windows: RwLock<HashMap<K, AtomicU64>>,
 }
 
-impl PerMinute {
+impl PerWindow<AgentName> {
     pub fn new(limit: u32, clock: Clock) -> Self {
+        Self::with_window(limit, 60, clock)
+    }
+}
+
+impl<K: Hash + Eq + Clone> PerWindow<K> {
+    pub fn with_window(limit: u32, window: i64, clock: Clock) -> Self {
         Self {
             limit,
+            window,
             clock,
             windows: RwLock::new(HashMap::new()),
         }
@@ -31,26 +44,26 @@ impl PerMinute {
         self.limit
     }
 
-    /// Counts one job for `sender`. When its minute is full, returns the seconds
-    /// until the next one and counts nothing.
-    pub fn admit(&self, sender: &AgentName) -> Result<(), u64> {
+    /// Counts one for `key`. When its window is full, returns the seconds until
+    /// the next one and counts nothing.
+    pub fn admit(&self, key: &K) -> Result<(), u64> {
         let now = self.clock.now();
-        // Truncating the minute only matters when two windows 2^32 minutes apart meet.
-        let minute = now.div_euclid(60) as u32;
+        // Truncating the window number only matters when two windows 2^32 windows apart meet.
+        let current = now.div_euclid(self.window) as u32;
         let take = |packed: u64| {
-            let (m, count) = ((packed >> 32) as u32, packed as u32);
-            if m != minute {
-                Some(u64::from(minute) << 32 | 1)
+            let (w, count) = ((packed >> 32) as u32, packed as u32);
+            if w != current {
+                Some(u64::from(current) << 32 | 1)
             } else if count < self.limit {
                 Some(packed + 1)
             } else {
                 None
             }
         };
-        let full = || now.rem_euclid(60).abs_diff(60);
+        let full = || now.rem_euclid(self.window).abs_diff(self.window);
         {
             let windows = self.windows.read().unwrap_or_else(PoisonError::into_inner);
-            if let Some(w) = windows.get(sender) {
+            if let Some(w) = windows.get(key) {
                 return w
                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, take)
                     .map(drop)
@@ -58,10 +71,20 @@ impl PerMinute {
             }
         }
         let mut windows = self.windows.write().unwrap_or_else(PoisonError::into_inner);
-        let w = windows.entry(sender.clone()).or_insert_with(|| AtomicU64::new(0));
+        let w = windows.entry(key.clone()).or_insert_with(|| AtomicU64::new(0));
         w.fetch_update(Ordering::Relaxed, Ordering::Relaxed, take)
             .map(drop)
             .map_err(|_| full())
+    }
+
+    /// The seconds until `key`'s window ends while it is full, without counting.
+    pub fn blocked(&self, key: &K) -> Option<u64> {
+        let now = self.clock.now();
+        let current = now.div_euclid(self.window) as u32;
+        let windows = self.windows.read().unwrap_or_else(PoisonError::into_inner);
+        let packed = windows.get(key)?.load(Ordering::Relaxed);
+        let (w, count) = ((packed >> 32) as u32, packed as u32);
+        (w == current && count >= self.limit).then(|| now.rem_euclid(self.window).abs_diff(self.window))
     }
 }
 
@@ -87,5 +110,20 @@ mod tests {
         assert_eq!(rate.admit(&a), Ok(()), "a new minute starts over");
         assert_eq!(rate.admit(&a), Ok(()));
         assert_eq!(rate.admit(&a), Err(60));
+    }
+
+    #[test]
+    fn longer_windows_block_until_they_end() {
+        let clock = Clock::manual(900);
+        let peers = PerWindow::with_window(2, 900, clock.clone());
+        let ip: std::net::IpAddr = [192, 168, 1, 9].into();
+        assert_eq!(peers.blocked(&ip), None);
+        assert_eq!(peers.admit(&ip), Ok(()));
+        assert_eq!(peers.blocked(&ip), None);
+        assert_eq!(peers.admit(&ip), Ok(()));
+        clock.advance(100);
+        assert_eq!(peers.blocked(&ip), Some(800));
+        clock.advance(800);
+        assert_eq!(peers.blocked(&ip), None, "a new window starts over");
     }
 }

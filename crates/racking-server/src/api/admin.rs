@@ -17,7 +17,7 @@ use crate::types::{AgentName, truncate};
 
 /// Records one audit row. A failure is logged and does not undo the action,
 /// which has already happened by then.
-fn record(app: &App, actor: &AgentName, action: &str, target: Option<&str>, result: &str) {
+pub(super) fn record(app: &App, actor: &str, action: &str, target: Option<&str>, result: &str) {
     let entry = AuditEntry {
         actor,
         action,
@@ -30,12 +30,12 @@ fn record(app: &App, actor: &AgentName, action: &str, target: Option<&str>, resu
 }
 
 /// The caller, if it is an admin; a refusal is audited, since probing the admin API is worth knowing about.
-fn admin<'c>(app: &App, call: &'c Call<'_>, action: &str, target: Option<&str>) -> ApiResult<&'c Caller> {
+pub(super) fn admin<'c>(app: &App, call: &'c Call<'_>, action: &str, target: Option<&str>) -> ApiResult<&'c Caller> {
     let me = call.caller()?;
     if me.admin {
         return Ok(me);
     }
-    record(app, &me.name, action, target, Code::NotAdmin.as_str());
+    record(app, me.name.as_str(), action, target, Code::NotAdmin.as_str());
     tracing::warn!(target: "racking::admin", agent = %me.name, action, "refused admin call");
     Err(ApiError::new(
         Code::NotAdmin,
@@ -45,13 +45,19 @@ fn admin<'c>(app: &App, call: &'c Call<'_>, action: &str, target: Option<&str>) 
 }
 
 /// Runs an account change and audits how it ended, by error code when it failed.
-fn audited<T>(app: &App, me: &Caller, action: &str, target: &str, run: impl FnOnce() -> ApiResult<T>) -> ApiResult<T> {
+pub(super) fn audited<T>(
+    app: &App,
+    me: &Caller,
+    action: &str,
+    target: &str,
+    run: impl FnOnce() -> ApiResult<T>,
+) -> ApiResult<T> {
     let result = run();
     let outcome = match &result {
         Ok(_) => "ok",
         Err(e) => e.code.as_str(),
     };
-    record(app, &me.name, action, Some(target), outcome);
+    record(app, me.name.as_str(), action, Some(target), outcome);
     tracing::info!(target: "racking::admin", actor = %me.name, action, target, result = outcome);
     result
 }
@@ -74,6 +80,7 @@ pub(super) fn list_agents(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
                 "source": a.source.as_str(),
                 "token_created_at": a.token_created_at.map(clock::rfc3339),
                 "last_used": app.presence.last_seen(&a.name).map(clock::rfc3339),
+                "pending": a.pending,
             })
         })
         .collect();
@@ -99,6 +106,13 @@ pub(super) fn create_agent(app: &App, call: &mut Call<'_>) -> ApiResult<Reply> {
         .parse()
         .map_err(|e: String| ApiError::bad_request(format!("role: {e}")))?;
     let issued = audited(app, me, "agent.add", name.as_str(), || {
+        if app.store.name_reserved(&name, app.clock.now())? {
+            return Err(ApiError::new(
+                Code::Conflict,
+                format!("an open invite will make an agent named {name}"),
+                "Pick another name, or cancel that invite (DELETE /admin/invites/{id}).",
+            ));
+        }
         app.accounts().create(&name, role)
     })?;
     Ok(Reply::Json {

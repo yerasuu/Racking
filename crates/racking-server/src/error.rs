@@ -23,11 +23,13 @@ pub enum Code {
     RateLimited,
     Internal,
     Paused,
+    InviteRefused,
+    NotConfirmed,
 }
 
 impl Code {
     /// Every code with its status and meaning, in the order `/help` lists them.
-    pub const ALL: [(Code, &'static str); 18] = [
+    pub const ALL: [(Code, &'static str); 20] = [
         (
             Code::BadRequest,
             "Malformed JSON or field out of range. `message` names the field.",
@@ -49,8 +51,18 @@ impl Code {
         ),
         (
             Code::NotAllowed,
-            "Your role or the `[permissions]` of the server config do not let you send to that agent. The hint \
-             names who you can send to.",
+            "Your role, your links or the `[permissions]` of the server config do not let you send to that agent. \
+             The hint names who you can send to.",
+        ),
+        (
+            Code::InviteRefused,
+            "`POST /join`: the pairing code is unknown, used, expired or voided (one answer for all four). Five \
+             wrong codes void every open invite.",
+        ),
+        (
+            Code::NotConfirmed,
+            "Your agent joined with a code, but its inviter has not confirmed the fingerprint yet. Only `GET \
+             /join/status` works until then.",
         ),
         (
             Code::NotFound,
@@ -77,7 +89,8 @@ impl Code {
         ),
         (
             Code::Conflict,
-            "Admin API: the agent name is taken, or a second main agent was asked for.",
+            "Admin API: the agent name is taken (by an agent or a pending invite), a second main agent was asked \
+             for, or an invite is not in the state the call needs.",
         ),
         (
             Code::RateLimited,
@@ -96,7 +109,12 @@ impl Code {
         match self {
             Code::BadRequest => 400,
             Code::NoToken | Code::BadToken => 401,
-            Code::PeerNotAllowed | Code::NotYours | Code::NotAdmin | Code::NotAllowed => 403,
+            Code::PeerNotAllowed
+            | Code::NotYours
+            | Code::NotAdmin
+            | Code::NotAllowed
+            | Code::InviteRefused
+            | Code::NotConfirmed => 403,
             Code::NotFound => 404,
             Code::BadTransition | Code::TooDeep | Code::AttachmentsLocked | Code::Conflict => 409,
             Code::TooLarge => 413,
@@ -127,6 +145,8 @@ impl Code {
             Code::Internal => "internal",
             Code::Paused => "paused",
             Code::Conflict => "conflict",
+            Code::InviteRefused => "bad_code",
+            Code::NotConfirmed => "not_confirmed",
         }
     }
 }

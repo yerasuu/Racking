@@ -2,9 +2,11 @@
 //! idempotency, and the Markdown guide generated from the same table.
 
 mod admin;
+mod pairing;
 
 use std::fmt::Write as _;
 use std::io::Read;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -18,10 +20,11 @@ use crate::clock::Clock;
 use crate::config::Config;
 use crate::dist::{self, Dist, Slot};
 use crate::error::{ApiError, ApiResult, Code};
+use crate::invite::{FAILURE_WINDOW_SECS, MAX_FAILURES};
 use crate::net::Cidr;
-use crate::policy::{Role, SendRules};
+use crate::policy::{Links, Role, SendRules};
 use crate::presence::{self, Flush, InfoUpdate, Presence, Software};
-use crate::rate::PerMinute;
+use crate::rate::{PerMinute, PerWindow};
 use crate::registry::{Caller, Registry};
 use crate::store::{self, Claim, Download, Kind, Move, NewJob, Origin, Outcome, Priority, State, Store, View, limits};
 use crate::types::{
@@ -139,6 +142,43 @@ static ROUTES: &[Route] = &[
         input: "",
         example: "curl -s $RACK_URL/help",
         handler: help,
+        secret: false,
+    },
+    Route {
+        method: Method::Post,
+        path: "/join",
+        auth: false,
+        body: BodyKind::Json,
+        summary: "Redeem a pairing code (see Linking): the only route besides the guide that needs no token. \
+                  Answers 201 with your new agent's `token`, shown this once, and a `fingerprint` of four words \
+                  that your inviter's screen shows too. The agent is pending: every route but `GET /join/status` \
+                  answers 403 `not_confirmed` until the inviter compares the words and confirms. A code that is \
+                  unknown, used, expired or voided answers 403 `bad_code`, the same for all four; five wrong codes \
+                  void every open invite and lock your address out for 15 minutes (429).",
+        query: &[],
+        input: "`code` (`XXXX-XXXX-XXXX-XXXX`; case, dashes and spaces do not matter), `name` (optional: \
+                `[a-z0-9][a-z0-9-]{0,31}`; refused when the invite names another agent), `os` and `rack_version` \
+                (optional, 1-40 of `A-Za-z0-9._-` and spaces; shown to the inviter).",
+        example: "curl -s -d '{\"code\":\"ABCD-EFGH-JKMN-PQRS\",\"os\":\"linux\"}' $RACK_URL/join",
+        handler: pairing::join,
+        secret: true,
+    },
+    Route {
+        method: Method::Get,
+        path: "/join/status",
+        auth: false,
+        body: BodyKind::None,
+        summary: "With the token `POST /join` gave you: `{\"state\", \"name\", \"role\", \"inviter\", \
+                  \"fingerprint\", \"confirm_by\"}`, where `state` is `pending`, `confirmed` (linked with \
+                  `inviter`; the token now works everywhere) or `denied` (the token is dead). Works while pending \
+                  and after a denial.",
+        query: &[(
+            "timeout",
+            "seconds to block while `pending`, default 0, values above 55 are cut to 55",
+        )],
+        input: "",
+        example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" \"$RACK_URL/join/status?timeout=25\"",
+        handler: pairing::join_status,
         secret: false,
     },
     Route {
@@ -387,6 +427,22 @@ static ROUTES: &[Route] = &[
     },
     Route {
         method: Method::Get,
+        path: "/agent-links",
+        auth: true,
+        body: BodyKind::None,
+        summary: "The agents you are linked with (see Linking): `{\"agent\", \"source\", \"links\": [{\"agent\", \
+                  \"role\", \"state\", \"via\", \"created_at\", \"confirmed_at\"}]}`. `via` is `invite`, `admin`, or \
+                  `config` for an agent of the config file, which is linked with everyone. `state` is `confirmed`, \
+                  or `pending` while a joiner waits for confirmation. Not to be confused with `/links`, the board \
+                  entries of jobs.",
+        query: &[],
+        input: "",
+        example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" $RACK_URL/agent-links",
+        handler: pairing::my_links,
+        secret: false,
+    },
+    Route {
+        method: Method::Get,
         path: "/dist/manifest",
         auth: true,
         body: BodyKind::None,
@@ -502,6 +558,122 @@ static ROUTES: &[Route] = &[
         secret: false,
     },
     Route {
+        method: Method::Post,
+        path: "/admin/invites",
+        auth: true,
+        body: BodyKind::Json,
+        summary: "Admin agents only: invite another agent (see Linking). Answers 201 with `id`, the agent `name`, \
+                  `expires_at` and the one-time `code`, shown this once: only a salted SHA-256 of it is stored. \
+                  Never replayed for an `Idempotency-Key`.",
+        query: &[],
+        input: "`role` (`worker`, or `main` when no agent or open invite is main and the config sets roles), \
+                `name` (optional; not taken by an agent or an open invite; the server proposes `agent-` and 4 \
+                random chars when absent), `ttl_secs` (1 to 3600, default 600).",
+        example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" -d '{\"role\":\"worker\",\"name\":\"mac\"}' \
+                  $RACK_URL/admin/invites",
+        handler: pairing::create_invite,
+        secret: true,
+    },
+    Route {
+        method: Method::Get,
+        path: "/admin/invites",
+        auth: true,
+        body: BodyKind::None,
+        summary: "Admin agents only: the invites still open or waiting for a confirmation: `{\"invites\": [{\"id\", \
+                  \"name\", \"role\", \"inviter\", \"state\", \"failures\", \"created_at\", \"expires_at\", \
+                  \"redeemed_at\", \"confirm_by\", \"peer\", \"os\", \"rack_version\", \"fingerprint\"}]}`. Never \
+                  a code.",
+        query: &[],
+        input: "",
+        example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" $RACK_URL/admin/invites",
+        handler: pairing::list_invites,
+        secret: false,
+    },
+    Route {
+        method: Method::Get,
+        path: "/admin/invites/{id}",
+        auth: true,
+        body: BodyKind::None,
+        summary: "Admin agents only: one invite, as listed. `state` is `open`, `expired`, `voided`, `redeemed` \
+                  (the joiner's `peer`, `os`, `rack_version` and `fingerprint` are filled in: compare it with the \
+                  joiner's screen before `confirm_by`), `confirmed` or `denied`.",
+        query: &[(
+            "timeout",
+            "seconds to block while the invite is `open`, default 0, values above 55 are cut to 55",
+        )],
+        input: "",
+        example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" \"$RACK_URL/admin/invites/3?timeout=25\"",
+        handler: pairing::get_invite,
+        secret: false,
+    },
+    Route {
+        method: Method::Delete,
+        path: "/admin/invites/{id}",
+        auth: true,
+        body: BodyKind::None,
+        summary: "Admin agents only: void an open invite; its code stops working at once.",
+        query: &[],
+        input: "",
+        example: "curl -s -X DELETE -H \"Authorization: Bearer $RACK_TOKEN\" $RACK_URL/admin/invites/3",
+        handler: pairing::cancel_invite,
+        secret: false,
+    },
+    Route {
+        method: Method::Post,
+        path: "/admin/invites/{id}/confirm",
+        auth: true,
+        body: BodyKind::None,
+        summary: "Admin agents only: the fingerprints matched. The joiner's agent starts working and is linked \
+                  with the inviter. Only for a `redeemed` invite before its `confirm_by`; after it the joiner is \
+                  denied (409).",
+        query: &[],
+        input: "",
+        example: "curl -s -X POST -H \"Authorization: Bearer $RACK_TOKEN\" $RACK_URL/admin/invites/3/confirm",
+        handler: pairing::confirm_invite,
+        secret: false,
+    },
+    Route {
+        method: Method::Post,
+        path: "/admin/invites/{id}/deny",
+        auth: true,
+        body: BodyKind::None,
+        summary: "Admin agents only: the fingerprints differ, or the joiner is unknown. Its agent and token are \
+                  deleted at once.",
+        query: &[],
+        input: "",
+        example: "curl -s -X POST -H \"Authorization: Bearer $RACK_TOKEN\" $RACK_URL/admin/invites/3/deny",
+        handler: pairing::deny_invite,
+        secret: false,
+    },
+    Route {
+        method: Method::Post,
+        path: "/admin/links",
+        auth: true,
+        body: BodyKind::Json,
+        summary: "Admin agents only: link two worker agents, an explicit act of the owner recorded in the audit \
+                  log. The main agent is linked only through invites. Answers 201.",
+        query: &[],
+        input: "`a` and `b`: two existing, confirmed worker agents.",
+        example: "curl -s -H \"Authorization: Bearer $RACK_TOKEN\" -d '{\"a\":\"mac\",\"b\":\"pc\"}' \
+                  $RACK_URL/admin/links",
+        handler: pairing::create_link,
+        secret: false,
+    },
+    Route {
+        method: Method::Delete,
+        path: "/admin/links/{a}/{b}",
+        auth: true,
+        body: BodyKind::None,
+        summary: "Admin agents only: remove a stored link. An agent that joined through the other's invite loses \
+                  its token too (`revoked` names it); its jobs are kept. Agents of the config file are never \
+                  removed, and their implicit links cannot be removed.",
+        query: &[],
+        input: "",
+        example: "curl -s -X DELETE -H \"Authorization: Bearer $RACK_TOKEN\" $RACK_URL/admin/links/linux/mac",
+        handler: pairing::delete_link,
+        secret: false,
+    },
+    Route {
         method: Method::Get,
         path: "/admin/audit",
         auth: true,
@@ -559,6 +731,11 @@ pub struct App {
     send_rules: SendRules,
     presence: Presence,
     per_minute: PerMinute,
+    links: Links,
+    /// Wrong pairing codes per peer address.
+    join_failures: PerWindow<IpAddr>,
+    /// The time of invites and of presence; tests move it instead of sleeping.
+    clock: Clock,
     /// `allow_from`: checked on every request before routing and authentication.
     allow_from: Vec<Cidr>,
     /// The emergency brake, mirrored from the store so a request reads it without a query.
@@ -586,7 +763,9 @@ impl App {
         if paused {
             tracing::warn!(target: "racking::admin", "the emergency brake is on: workers cannot send until POST /admin/resume");
         }
-        let presence = Presence::new(names.iter(), store.load_agents()?, clock);
+        let presence = Presence::new(names.iter(), store.load_agents()?, clock.clone());
+        let links = Links::new(store.confirmed_links()?);
+        let join_failures = PerWindow::with_window(MAX_FAILURES, FAILURE_WINDOW_SECS, clock.clone());
         Ok(Self {
             store,
             dist,
@@ -594,6 +773,9 @@ impl App {
             send_rules,
             presence,
             per_minute,
+            links,
+            join_failures,
+            clock,
             allow_from: config.allow_from.clone(),
             paused: AtomicBool::new(paused),
             in_flight: AtomicUsize::new(0),
@@ -617,6 +799,7 @@ impl App {
             registry: &self.registry,
             store: &self.store,
             presence: &self.presence,
+            links: &self.links,
             roles_enforced: self.send_rules.enforced(),
         }
     }
@@ -630,13 +813,13 @@ impl App {
         }
     }
 
-    /// The agents `me` may start a job for, by the send rules.
+    /// The agents `me` may start a job for, by the send rules and links.
     fn peers_of(&self, me: &Caller) -> Vec<String> {
         self.registry
-            .roles()
+            .members()
             .into_iter()
-            .filter(|(name, role)| name != &me.name && self.send_rules.may_send(&me.name, me.role, name, *role))
-            .map(|(name, _)| name.to_string())
+            .filter(|m| m.name != me.name && self.send_rules.may_send(&me.party(), &m.party(), &self.links))
+            .map(|m| m.name.to_string())
             .collect()
     }
 }
@@ -782,7 +965,13 @@ fn serve(app: &App, request: &mut Request, agent_out: &mut Option<AgentName>) ->
 
     let query = parse_query(query_text, route)?;
     let caller = if route.auth {
-        Some(authenticate(app, request)?)
+        let caller = authenticate(app, request)?;
+        // A joiner's token does nothing until its inviter confirms; the store has the last word.
+        Some(if caller.pending {
+            app.settle_pending(caller)?
+        } else {
+            caller
+        })
     } else {
         None
     };
@@ -1061,6 +1250,12 @@ pub fn guide() -> String {
          `[permissions] send` lists who a sender may reach. A reply (`reply_to`) always goes back to the other \
          party of its job. A config with no role and no `[permissions]` lets every agent send to every other, as \
          before roles existed.\n\n\
+         ## Linking\n\nA new agent joins with a one-time code from an admin agent (`POST /admin/invites`, `rack \
+         link`): `POST /join` with the code answers its token and a fingerprint of four words, and the agent stays \
+         pending (403 `not_confirmed`) until the inviter, who sees the same words, confirms with `POST \
+         /admin/invites/{{id}}/confirm` within 10 minutes. An agent made this way may start jobs only for agents \
+         it is linked with (its inviter, or a worker an admin linked it to with `POST /admin/links`), and only as \
+         the roles allow; agents of the config file are linked with everyone. `GET /agent-links` lists yours.\n\n\
          Set `RACK_URL` (e.g. `http://127.0.0.1:7878`) and `RACK_TOKEN` to run the examples.\n\n\
          ## Kinds\n\n- `notice`: a heads-up, up to 1 KiB, no files, never answered.\n\
          - `message`: conversation text up to 64 KiB, may carry files; answer it with another message.\n\
@@ -1244,7 +1439,7 @@ fn validate_job(app: &App, me: &Caller, input: CreateJobBody) -> ApiResult<NewJo
     if to == me.name {
         return Err(ApiError::bad_request("to: you cannot send a job to yourself"));
     }
-    let Some(to_role) = app.registry.role_of(&to) else {
+    let Some(recipient) = app.registry.member(&to) else {
         let peers = app.peers_of(me).join(", ");
         return Err(ApiError::new(
             Code::NotFound,
@@ -1254,13 +1449,22 @@ fn validate_job(app: &App, me: &Caller, input: CreateJobBody) -> ApiResult<NewJo
     };
     // A reply goes to the other party of a job that already exists, which the store
     // checks; refusing it here would leave a permitted sender without its answer.
-    if input.reply_to.is_none() && !app.send_rules.may_send(&me.name, me.role, &to, to_role) {
+    // A pending recipient is the exception: it may read nothing, replies included.
+    let refused = if input.reply_to.is_none() {
+        !app.send_rules.may_send(&me.party(), &recipient.party(), &app.links)
+    } else {
+        recipient.pending
+    };
+    if refused {
         let peers = app.peers_of(me);
         let hint = if peers.is_empty() {
-            "You may send to no agent; only replies (reply_to) to jobs sent to you go out.".to_owned()
+            "You may send to no agent; only replies (reply_to) to jobs sent to you go out. Agents made through \
+             the API reach only those they are linked with (GET /agent-links)."
+                .to_owned()
         } else {
             format!(
-                "You can send to: {}. Ask the owner if this needs to change.",
+                "You can send to: {}. Agents made through the API reach only those they are linked with (GET \
+                 /agent-links); ask the owner if this needs to change.",
                 peers.join(", ")
             )
         };

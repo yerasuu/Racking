@@ -171,11 +171,14 @@ Before routing or authentication, the server checks the peer address of the TCP 
 
 ## Endpoints
 
-All need the Bearer token, except `GET /` and `GET /help` (they show no data). All need a peer inside `allow_from`.
+All need the Bearer token, except `GET /` and `GET /help` (they show no data) and `POST /join` (it takes a pairing code instead; see Linking). `GET /join/status` takes the token `POST /join` gave, while its agent is pending and even after a denial. All need a peer inside `allow_from`.
 
 | Method and path | Purpose |
 |---|---|
 | `GET /` , `GET /help` | Markdown guide. |
+| `POST /join` | Redeem a pairing code: `{"code", "name"?, "os"?, "rack_version"?}`. Answers the new agent's `token` (once) and the `fingerprint`; the agent is pending. |
+| `GET /join/status` | With the joiner's token: `pending`, `confirmed` or `denied`; `timeout` blocks while pending. |
+| `GET /agent-links` | The agents you are linked with (see Linking). |
 | `GET /whoami` | `{"agent": "linux", "role": "main", "roles_enforced": true, "admin": true, "paused": false, "peers": ["windows"], "limits": {...}}`. `peers` are the agents you may send to. |
 | `GET /agents` | Every agent with `role` (from the server config), `online`, `last_seen`, `idle_secs`, `rack_version`, `os`, `about`, `capabilities` (see Presence). |
 | `PUT /agents/me` | Set your own `about` and `capabilities` (also `rack_version`, `os`, which clients send as headers instead). |
@@ -203,6 +206,13 @@ All need the Bearer token, except `GET /` and `GET /help` (they show no data). A
 | `DELETE /admin/agents/{name}` | Admin agents only: remove an API agent; its token stops at once, its jobs stay. |
 | `GET /admin/audit` | Admin agents only: the audit log, newest first, paged with `limit` and `before`. |
 | `POST /admin/pause`, `POST /admin/resume` | Admin agents only: pull or release the emergency brake. |
+| `POST /admin/invites` | Admin agents only: `{"role", "name"?, "ttl_secs"?}` makes an invite; the answer carries its `code`, once. |
+| `GET /admin/invites` | Admin agents only: invites still open or waiting for a confirmation. Never a code. |
+| `GET /admin/invites/{id}` | Admin agents only: one invite; `timeout` blocks while it is `open`. |
+| `DELETE /admin/invites/{id}` | Admin agents only: void an open invite. |
+| `POST /admin/invites/{id}/confirm`, `.../deny` | Admin agents only: the fingerprints matched, or not. |
+| `POST /admin/links` | Admin agents only: `{"a", "b"}` links two worker agents. |
+| `DELETE /admin/links/{a}/{b}` | Admin agents only: remove a stored link; a joiner of that link loses its token. |
 
 Results and comments are jobs too: `POST /jobs` with `kind` `result` and `reply_to`. There is no separate endpoint.
 
@@ -233,10 +243,12 @@ Error:
 | 403 | `peer_not_allowed` | Your address is outside `allow_from` (see LAN only). Checked before the token. |
 | 403 | `not_yours` | Job belongs to other agents. |
 | 403 | `not_admin` | Publishing a `rack` binary needs an agent with `admin = true`. |
-| 403 | `not_allowed` | Your role or `[permissions]` do not let you send to that agent. Hint: who you can send to. |
+| 403 | `not_allowed` | Your role, your links or `[permissions]` do not let you send to that agent. Hint: who you can send to. |
+| 403 | `bad_code` | `POST /join`: the code is unknown, used, expired or voided; one answer for all four. |
+| 403 | `not_confirmed` | Your agent joined and waits for its inviter's confirmation; only `GET /join/status` works. The hint carries the fingerprint. |
 | 404 | `not_found` | No such job, attachment, agent or published binary. |
 | 409 | `bad_transition` | State move not allowed, e.g. accepting a message or replying to a notice. |
-| 409 | `conflict` | Admin API: the name is taken, or a second main agent was asked for. |
+| 409 | `conflict` | Admin API: the name is taken (by an agent or an open invite), a second main agent was asked for, or an invite is not in the state the call needs. |
 | 409 | `too_deep` | The job would be over 3 `hops` deep. Hint: report back to whoever started the chain instead. |
 | 409 | `attachments_locked` | Job already received, or a notice (no files). |
 | 413 | `too_large` | Body or file over the limit (64 KiB, notice 1 KiB, report 1 MiB). Hint names the limit. |
@@ -272,6 +284,28 @@ An agent with `admin = true` in the config file manages agents and the brake wit
 
 - `/inbox` and `/inbox/wait` still deliver, and every inbox and outbox answer carries a top-level `"paused": true`; every answer to an authenticated request carries the header `X-Racking-Paused: 1`; `GET /whoami` shows `"paused": true`. Clients should stop acting on jobs.
 - `POST /jobs` from a worker answers `503 paused`. The main agent and admin agents can still send (to tell the others what happened). In a config without roles every agent is a worker, so only admins send.
+
+## Linking
+
+The system rests on a bilateral link (#46): the first connection between two agents is made from the terminals of both, with a code the server makes, and a person confirms it after comparing a fingerprint on both screens. Only then can the new agent work.
+
+**Invite.** An admin agent calls `POST /admin/invites {"role": "worker", "name": "mac", "ttl_secs": 600}` (`rack link mac --role worker`). The answer carries `id`, `name`, `expires_at` and the `code`, shown once: 16 symbols from the operating system's random source in four groups, `XXXX-XXXX-XXXX-XXXX`, from an alphabet without `0`, `O`, `1`, `I` and `L` (31 symbols, so 16 x log2(31) = 79.3 bits). The server stores only SHA-256 of a 16-byte per-invite salt followed by the code. A code works once, until `expires_at` (default 600 s, at most 3600). Without `name`, the server proposes `agent-` and 4 random symbols, and the joiner may ask for its own; names follow the agent-name rules and may not be taken by an agent or another open invite. The role rules of decision #44 apply: at most one main agent, counting open invites, and a main only on a server whose config sets roles.
+
+**Join.** On the other machine, `POST /join {"code", "name"?, "os"?, "rack_version"?}` (`rack join CODE --server URL`) with no token, behind `allow_from` like every route. The code is hashed with the salt of every live invite and compared in constant time, without stopping at a match. An unknown, used, expired or voided code gets the same `403 bad_code`; each counts as a failure against every open invite (a wrong code names no invite) and against the peer address. Five failures void every open invite, and the address gets `429 rate_limited` for 15 minutes. A valid code creates the agent through the same code path as `POST /admin/agents`, in a **pending** state, and answers `201` with `token` (once), `fingerprint`, `inviter` and `confirm_by`.
+
+**Fingerprint.** Four words from a built-in list of 256 short English words, one per byte of SHA-256(`racking-fingerprint-v1`, 0, the invite id as 8 big-endian bytes, the agent name, 0, the first 8 bytes of SHA-256 of the token). Both the joiner and the inviter see it. If someone else redeemed the code first, their name or token differs, so the inviter sees words that the real joiner's screen does not show (and the real joiner gets `bad_code`). 32 bits are enough because nobody can choose them: they follow from a token the server picks after the code is used.
+
+**Pending.** A pending agent's token answers `403 not_confirmed` on every route but `GET /join/status`, and no agent can send to it. `GET /join/status?timeout=25` answers `{"state": "pending" | "confirmed" | "denied", "name", "role", "inviter", "fingerprint", "confirm_by"}`; it finds the joiner by the token's hash, so it still answers `denied` once the agent is gone.
+
+**Confirm.** The inviter waits with `GET /admin/invites/{id}?timeout=25` until `state` is `redeemed`, which adds the joiner's `peer` address (as the server sees it), `os`, `rack_version` and `fingerprint`. After comparing the words, `POST /admin/invites/{id}/confirm` activates the agent and the link; `POST /admin/invites/{id}/deny` deletes the agent and its token at once. With no answer within 600 s of the join (`confirm_by`), the server denies it. `rack link` asks the question on its terminal (`/dev/tty`, never stdin), so a script piping `y` cannot answer it.
+
+**Links.** Table `agent_links` (`agent_a`, `agent_b` in name order, `state` `pending` or `confirmed`, `origin` `invite` or `admin`, `created_at`, `confirmed_at`); the table of board entries is already called `links`. A confirmed invite links the inviter with the joiner. `POST /admin/links {"a", "b"}` links two existing worker agents, an explicit act of the owner, audited; the main agent is linked only through invites. A job that is not a reply is allowed only when both agents are confirmed, linked, and the role rules (with `[permissions]`) allow it; this is one check, `SendRules::may_send`. Replies keep the reply rules, except that nothing reaches a pending agent. `GET /agent-links` lists the caller's links: `{"agent", "source", "links": [{"agent", "role", "state", "via", "created_at", "confirmed_at"}]}`.
+
+**Compatibility.** Agents of the config file count as linked with every other agent, as before links existed, and agents made with `POST /admin/agents` keep working with them; links constrain only agents made through the API. `DELETE /admin/links/{a}/{b}` removes a stored link: an API agent that joined through an invite of the other agent loses its token (as `DELETE /admin/agents/{name}`), its jobs are kept; config-file agents are never removed. Removing an API agent removes its links, so a later agent of the same name inherits none.
+
+**Bootstrap.** `racking-server invite --config FILE [--role worker|main] [--name N]`, run on the server machine, opens the database directly (no token: whoever can open the data directory controls the server anyway), makes an invite with no inviter agent, prints the code, waits and asks the confirmation question on its terminal; the running server picks the answer up on the joiner's next request. The new agent has no stored link, so it reaches the agents of the config file only.
+
+**Audit.** `invite.create`, `invite.cancel`, `invite.confirm`, `invite.deny` (`timeout` when the server denied it), `join` (actor: the new agent, or the peer address for a wrong code), `invite.void` (`too_many_failures`), `link.add`, `link.remove`. The actor of a bootstrap invite is `owner`. Never a code or a token.
 
 ## Distribution of `rack`
 

@@ -36,11 +36,14 @@ pub struct Managed {
     pub role: String,
     pub digest: [u8; 32],
     pub token_created_at: i64,
+    /// Joined with a code and still waiting for its inviter's confirmation.
+    pub pending: bool,
 }
 
-/// One audit row: who did what to whom, and how it ended. Never a body or a token.
+/// One audit row: who did what to whom, and how it ended. Never a body, a code or a token.
 pub struct AuditEntry<'a> {
-    pub actor: &'a AgentName,
+    /// An agent name; the peer address for a failed join, `owner` for `racking-server invite`.
+    pub actor: &'a str,
     pub action: &'a str,
     pub target: Option<&'a str>,
     pub result: &'a str,
@@ -50,7 +53,11 @@ impl Store {
     pub fn managed_agents(&self) -> Result<Vec<Managed>, String> {
         let conn = self.db();
         let mut stmt = conn
-            .prepare("SELECT name, role, token_sha256, token_created_at FROM managed_agents ORDER BY created_at, name")
+            .prepare(
+                "SELECT name, role, token_sha256, token_created_at, EXISTS (SELECT 1 FROM invites i \
+                 WHERE i.name = managed_agents.name AND i.state = 'redeemed') \
+                 FROM managed_agents ORDER BY created_at, name",
+            )
             .map_err(|e| format!("cannot read the managed_agents table: {e}"))?;
         let rows = stmt
             .query_map([], |row| {
@@ -59,6 +66,7 @@ impl Store {
                     role: row.get(1)?,
                     digest: row.get(2)?,
                     token_created_at: row.get(3)?,
+                    pending: row.get(4)?,
                 })
             })
             .map_err(|e| format!("cannot read the managed_agents table: {e}"))?;
@@ -83,23 +91,24 @@ impl Store {
         Ok(())
     }
 
-    /// Forgets the agent and its token; its jobs stay, as the protocol keeps them for both parties.
+    /// Forgets the agent, its token and its links, so a later agent of the same name
+    /// inherits none; its jobs stay, as the protocol keeps them for both parties.
     pub fn delete_managed(&self, name: &AgentName) -> ApiResult<()> {
-        self.db()
-            .execute("DELETE FROM managed_agents WHERE name = ?1", [name.as_str()])?;
+        let mut conn = self.db();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM managed_agents WHERE name = ?1", [name.as_str()])?;
+        tx.execute(
+            "DELETE FROM agent_links WHERE agent_a = ?1 OR agent_b = ?1",
+            [name.as_str()],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn audit(&self, entry: &AuditEntry<'_>) -> ApiResult<()> {
         self.db().execute(
             "INSERT INTO audit (at, actor, action, target, result) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                clock::now(),
-                entry.actor.as_str(),
-                entry.action,
-                entry.target,
-                entry.result
-            ],
+            params![clock::now(), entry.actor, entry.action, entry.target, entry.result],
         )?;
         Ok(())
     }

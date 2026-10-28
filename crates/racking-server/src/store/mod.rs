@@ -17,8 +17,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 mod admin;
+mod pairing;
 
 pub use admin::{AuditEntry, Managed};
+pub use pairing::{Decision, Invite, InviteState, NewInvite, Redeem, bad_code};
 
 use crate::clock;
 use crate::config::SenderLimits;
@@ -601,6 +603,7 @@ impl Store {
             .map_err(|e| e.to_string())?;
         conn.execute_batch(SCHEMA)
             .and_then(|()| conn.execute_batch(admin::SCHEMA))
+            .and_then(|()| conn.execute_batch(pairing::SCHEMA))
             .map_err(|e| format!("cannot set up the schema: {e}"))?;
         add_reply_columns(&conn).map_err(|e| format!("cannot add the priority columns: {e}"))?;
         add_columns(&conn, HINT_COLUMNS).map_err(|e| format!("cannot add the model and capabilities columns: {e}"))?;

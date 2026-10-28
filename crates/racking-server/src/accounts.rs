@@ -6,9 +6,9 @@ use std::fmt;
 
 use crate::clock;
 use crate::error::{ApiError, ApiResult, Code};
-use crate::policy::Role;
+use crate::policy::{Links, Role};
 use crate::presence::Presence;
-use crate::registry::{self, Registry};
+use crate::registry::{self, Registry, Standing};
 use crate::store::Store;
 use crate::types::{AgentName, hex};
 
@@ -43,6 +43,7 @@ pub struct Accounts<'a> {
     pub registry: &'a Registry,
     pub store: &'a Store,
     pub presence: &'a Presence,
+    pub links: &'a Links,
     /// Off for a config from before roles: there, the API may not make a main agent,
     /// since nothing would limit who that agent's workers may send to.
     pub roles_enforced: bool,
@@ -51,19 +52,38 @@ pub struct Accounts<'a> {
 impl Accounts<'_> {
     /// Creates an agent with a new token, usable at once and without a restart.
     pub fn create(&self, name: &AgentName, role: Role) -> ApiResult<Issued> {
+        self.issue(name, role, Standing::Active, |digest, now| {
+            self.store.insert_managed(name, role, digest, now)
+        })
+    }
+
+    /// Creates an agent that may do nothing but ask for its standing until its
+    /// inviter confirms it. `persist` stores it, given the token's SHA-256 and the
+    /// time, while the registry is locked against a second agent of the same name.
+    pub fn create_pending(
+        &self,
+        name: &AgentName,
+        role: Role,
+        persist: impl FnOnce(&[u8; 32], i64) -> ApiResult<()>,
+    ) -> ApiResult<Issued> {
+        self.issue(name, role, Standing::Pending, persist)
+    }
+
+    fn issue(
+        &self,
+        name: &AgentName,
+        role: Role,
+        standing: Standing,
+        persist: impl FnOnce(&[u8; 32], i64) -> ApiResult<()>,
+    ) -> ApiResult<Issued> {
         if role == Role::Main && !self.roles_enforced {
-            return Err(ApiError::new(
-                Code::Conflict,
-                "roles are not configured on this server, so no agent may be made main here",
-                "Set `role` on the agents of the config file first, or create this one as a worker.",
-            ));
+            return Err(main_needs_roles());
         }
         let token = new_token()?;
         let digest = registry::digest(token.as_str());
         let now = clock::now();
-        self.registry.insert(name, role, digest, now, || {
-            self.store.insert_managed(name, role, &digest, now)
-        })?;
+        self.registry
+            .insert(name, role, digest, now, standing, || persist(&digest, now))?;
         self.presence.add(name);
         Ok(Issued {
             name: name.clone(),
@@ -87,12 +107,28 @@ impl Accounts<'_> {
         })
     }
 
-    /// Revokes an API agent's token and forgets the agent; its jobs are kept.
+    /// Revokes an API agent's token and forgets the agent and its links; its jobs are kept.
     pub fn revoke(&self, name: &AgentName) -> ApiResult<()> {
         self.registry.remove(name, || self.store.delete_managed(name))?;
-        self.presence.remove(name);
+        self.forget(name);
         Ok(())
     }
+
+    /// Drops from memory an API agent the store already deleted, such as a denied joiner.
+    pub fn forget(&self, name: &AgentName) {
+        // An agent already gone from the registry is the outcome wanted, so `NotFound` is fine here.
+        let _ = self.registry.remove(name, || Ok(()));
+        self.presence.remove(name);
+        self.links.forget(name);
+    }
+}
+
+pub fn main_needs_roles() -> ApiError {
+    ApiError::new(
+        Code::Conflict,
+        "roles are not configured on this server, so no agent may be made main here",
+        "Set `role` on the agents of the config file first, or create this one as a worker.",
+    )
 }
 
 /// `TOKEN_BYTES` from the OS random source, as lowercase hex.
@@ -105,13 +141,13 @@ fn new_token() -> ApiResult<Token> {
 /// The server runs on Unix only (see SECURITY.md), where `/dev/urandom` never
 /// blocks once the kernel pool is seeded at boot and needs no extra crate.
 #[cfg(unix)]
-fn os_random(buf: &mut [u8]) -> std::io::Result<()> {
+pub fn os_random(buf: &mut [u8]) -> std::io::Result<()> {
     use std::io::Read;
     std::fs::File::open("/dev/urandom")?.read_exact(buf)
 }
 
 #[cfg(not(unix))]
-fn os_random(_buf: &mut [u8]) -> std::io::Result<()> {
+pub fn os_random(_buf: &mut [u8]) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "issuing tokens needs Unix (/dev/urandom); run racking-server on Linux",
@@ -130,6 +166,7 @@ mod tests {
         store: Store,
         registry: Registry,
         presence: Presence,
+        links: Links,
     }
 
     impl Fixture {
@@ -150,6 +187,7 @@ mod tests {
                 store,
                 registry,
                 presence,
+                links: Links::new([]),
             }
         }
 
@@ -158,6 +196,7 @@ mod tests {
                 registry: &self.registry,
                 store: &self.store,
                 presence: &self.presence,
+                links: &self.links,
                 roles_enforced: true,
             }
         }
@@ -245,7 +284,7 @@ mod tests {
         let rotated = a.rotate(&name("mac")).expect("rotate");
         f.store
             .audit(&AuditEntry {
-                actor: &name("boss"),
+                actor: "boss",
                 action: "agent.rotate",
                 target: Some("mac"),
                 result: "ok",

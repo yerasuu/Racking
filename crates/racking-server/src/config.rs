@@ -312,9 +312,9 @@ mod tests {
         let role = |n: &AgentName| c.agents.iter().find(|a| &a.name == n).map(|a| a.role);
         assert_eq!(role(&w1), Some(Role::Worker), "worker is the default");
         assert!(c.send_rules.enforced());
-        assert!(c.send_rules.may_send(&boss, Role::Main, &w1, Role::Worker));
-        assert!(c.send_rules.may_send(&w1, Role::Worker, &boss, Role::Main));
-        assert!(!c.send_rules.may_send(&w1, Role::Worker, &w2, Role::Worker));
+        assert!(c.send_rules.roles_allow(&boss, Role::Main, &w1, Role::Worker));
+        assert!(c.send_rules.roles_allow(&w1, Role::Worker, &boss, Role::Main));
+        assert!(!c.send_rules.roles_allow(&w1, Role::Worker, &w2, Role::Worker));
     }
 
     #[test]
@@ -322,7 +322,7 @@ mod tests {
         let c = cfg(&format!("[agents.a]\ntoken = \"{T1}\"\n[agents.b]\ntoken = \"{T2}\"\n")).expect("config");
         assert!(!c.send_rules.enforced());
         let [a, b] = <[AgentName; 2]>::try_from(names(&["a", "b"])).expect("names");
-        assert!(c.send_rules.may_send(&a, Role::Worker, &b, Role::Worker));
+        assert!(c.send_rules.roles_allow(&a, Role::Worker, &b, Role::Worker));
     }
 
     #[test]
@@ -334,8 +334,8 @@ mod tests {
         .expect("config");
         assert!(c.send_rules.enforced(), "a [permissions] section turns the rules on");
         let [a, b] = <[AgentName; 2]>::try_from(names(&["a", "b"])).expect("names");
-        assert!(c.send_rules.may_send(&a, Role::Worker, &b, Role::Worker));
-        assert!(!c.send_rules.may_send(&b, Role::Worker, &a, Role::Worker));
+        assert!(c.send_rules.roles_allow(&a, Role::Worker, &b, Role::Worker));
+        assert!(!c.send_rules.roles_allow(&b, Role::Worker, &a, Role::Worker));
         let bad = cfg(&format!(
             "[agents.a]\ntoken = \"{T1}\"\n[agents.b]\ntoken = \"{T2}\"\n\
              [permissions]\nsend = {{ a = [\"B!\"] }}\n"
